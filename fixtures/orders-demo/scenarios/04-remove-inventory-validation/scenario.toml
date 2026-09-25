@@ -1,0 +1,2 @@
+name = "Remove inventory validation"
+intent = "Speed up order creation."

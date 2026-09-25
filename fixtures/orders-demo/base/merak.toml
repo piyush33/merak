@@ -1,0 +1,14 @@
+# Declared design rules for the orders-demo fixture.
+[layers]
+controller = ["src/controllers/**", "src/app.ts"]
+service = ["src/services/**", "src/handlers/**"]
+policy = ["src/policies/**"]
+repository = ["src/repositories/**"]
+integration = ["src/integrations/**"]
+
+[[rules]]
+from = "controller"
+deny = ["repository", "integration"]
+
+[ownership]
+"Order.status" = ["src/services/**"]

@@ -1,0 +1,2 @@
+name = "Allow cancelling confirmed orders"
+intent = "Allow confirmed orders to be cancelled."

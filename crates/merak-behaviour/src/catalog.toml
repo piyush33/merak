@@ -1,0 +1,104 @@
+# Default effect catalog: which external APIs mean which behavioural effect.
+#
+# `api` patterns match Merak's canonical external names:
+#   `<module>.<export>` for imports       e.g. `axios.post()`
+#   `<module>.<Class>#` for instances     e.g. `@prisma/client.PrismaClient#.order.update()`
+#   `name()` for globals                  e.g. `fetch()`
+# `*` matches one segment; `{a,b}` expands to alternatives.
+#
+# Value specs: `seg:N` (segment N of the matched name, negative from the end),
+# `arg:N` (constant string of argument N), `host:N` (host of the URL in argument N),
+# `opt:N.key|DEFAULT` (property of an object argument), `lit:VALUE`.
+# Add `:upper` to upper-case the result.
+#
+# Seeded from CodeQL's JavaScript framework models (ClientRequests, NoSQL,
+# NodeJSLib, Express, EventEmitter); extend per project in merak.toml.
+
+# ---- databases -------------------------------------------------------------
+[[effect]]
+api = "@prisma/client.PrismaClient#.*.{create,createMany,update,updateMany,upsert,delete,deleteMany}()"
+kind = "db_write"
+target = "seg:2"
+
+[[effect]]
+api = "@prisma/client.PrismaClient#.*.{findUnique,findUniqueOrThrow,findFirst,findFirstOrThrow,findMany,count,aggregate,groupBy}()"
+kind = "db_read"
+target = "seg:2"
+
+[[effect]]
+api = "{typeorm,mongoose,sequelize}.*#.{save,insert,update,delete,remove,upsert,create,destroy,updateOne,updateMany,deleteOne,deleteMany,insertMany}()"
+kind = "db_write"
+target = "seg:1"
+
+[[effect]]
+api = "{typeorm,mongoose,sequelize}.*#.{find,findOne,findBy,findOneBy,findAll,findByPk,count}()"
+kind = "db_read"
+target = "seg:1"
+
+[[effect]]
+api = "{pg,mysql,mysql2,mssql}.*#.{query,execute}()"
+kind = "db_query"
+target = "seg:0"
+
+# ---- outbound HTTP ---------------------------------------------------------
+[[effect]]
+api = "{fetch(),node-fetch(),undici.fetch()}"
+kind = "http"
+target = "host:0"
+method = "opt:1.method|GET"
+
+[[effect]]
+api = "axios.{get,post,put,patch,delete,head,request}()"
+kind = "http"
+target = "host:0"
+method = "seg:1:upper"
+
+[[effect]]
+api = "{got,superagent}.{get,post,put,patch,delete}()"
+kind = "http"
+target = "host:0"
+method = "seg:-1:upper"
+
+# ---- events / queues / caches ----------------------------------------------
+[[effect]]
+api = "{node:events,events}.EventEmitter#.emit()"
+kind = "event_emit"
+target = "arg:0"
+
+[[effect]]
+api = "{bullmq,bull}.Queue#.add()"
+kind = "queue"
+target = "arg:0"
+
+[[effect]]
+api = "{ioredis,ioredis.Redis}#.{set,setex,del,hset,hdel,expire,incr,decr,lpush,rpush}()"
+kind = "cache_write"
+target = "lit:redis"
+
+[[effect]]
+api = "{ioredis,ioredis.Redis}#.{get,hget,hgetall,exists,lrange}()"
+kind = "cache_read"
+target = "lit:redis"
+
+# ---- filesystem ------------------------------------------------------------
+[[effect]]
+api = "{fs,node:fs,fs/promises,node:fs/promises,fs.promises}.{writeFile,writeFileSync,appendFile,appendFileSync,unlink,unlinkSync,rm,rmSync,mkdir,mkdirSync,rename,renameSync}()"
+kind = "fs_write"
+target = "arg:0"
+
+[[effect]]
+api = "{fs,node:fs,fs/promises,node:fs/promises}.{readFile,readFileSync,readdir,readdirSync,stat,statSync}()"
+kind = "fs_read"
+target = "arg:0"
+
+# ---- subscriptions & entry points ------------------------------------------
+[[subscribe]]
+api = "{node:events,events}.EventEmitter#.{on,once,addListener,prependListener}()"
+event = "arg:0"
+handler_arg = 1
+
+[[route]]
+api = "{express.Router(),express()}.{get,post,put,patch,delete,all}()"
+method = "seg:-1:upper"
+path = "arg:0"
+handler_arg = -1

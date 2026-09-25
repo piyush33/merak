@@ -1,0 +1,11 @@
+{
+  "ops": [
+    { "kind": "ENTITY_ADDED", "subject": "src/handlers/refund.handler.ts::registerRefundHandler" },
+    { "kind": "ENTITY_ADDED", "subject": "src/handlers/refund.handler.ts::registerRefundHandler.on(\"OrderCancelled\")" },
+    { "kind": "EVENT_HANDLER_ADDED", "subject": "OrderCancelled" },
+    { "kind": "DEPENDENCY_ADDED", "subject": "src/handlers/refund.handler.ts → src/services/payment.service.ts" },
+    { "kind": "DEPENDENCY_REMOVED", "subject": "src/services/order.service.ts → src/services/payment.service.ts" },
+    { "kind": "EFFECT_MADE_ASYNC", "subject": "src/services/order.service.ts::OrderService.cancelOrder",
+      "before": "http POST payments.example.com (sync)", "after": "http POST payments.example.com (async via OrderCancelled)" }
+  ]
+}

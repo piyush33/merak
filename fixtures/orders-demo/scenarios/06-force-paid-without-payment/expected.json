@@ -1,0 +1,8 @@
+{
+  "ops": [
+    { "kind": "ENTITY_ADDED", "subject": "src/services/order.service.ts::OrderService.forceMarkPaid" },
+    { "kind": "STATE_TRANSITION_SOURCE_WIDENED", "subject": "Order.status → PAID",
+      "before": "{CONFIRMED}", "after": "{*, CONFIRMED}" },
+    { "kind": "INVARIANT_VIOLATED", "subject": "Order.status := PAID ⇒ Order.paymentId is set" }
+  ]
+}

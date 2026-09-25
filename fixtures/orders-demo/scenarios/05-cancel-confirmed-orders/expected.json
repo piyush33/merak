@@ -1,0 +1,6 @@
+{
+  "ops": [
+    { "kind": "STATE_TRANSITION_SOURCE_WIDENED", "subject": "Order.status → CANCELLED",
+      "before": "{PENDING}", "after": "{CONFIRMED, PENDING}" }
+  ]
+}

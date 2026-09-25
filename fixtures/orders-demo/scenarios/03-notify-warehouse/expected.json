@@ -1,0 +1,8 @@
+{
+  "ops": [
+    { "kind": "ENTITY_ADDED", "subject": "src/integrations/warehouse.ts::notifyWarehouse" },
+    { "kind": "DEPENDENCY_ADDED", "subject": "src/services/order.service.ts → src/integrations/warehouse.ts" },
+    { "kind": "EFFECT_ADDED", "subject": "src/services/order.service.ts::OrderService.cancelOrder",
+      "after": "http POST warehouse.example.com (sync)" }
+  ]
+}

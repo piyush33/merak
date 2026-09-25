@@ -1,0 +1,9 @@
+{
+  "ops": [
+    { "kind": "ENTITY_MOVED", "subject": "src/repositories/order.repository.ts::OrderRepository",
+      "after": "src/repositories/orders.repository.ts::OrderRepository" },
+    { "kind": "ENTITY_ADDED", "subject": "src/services/order.service.ts::OrderService.releaseAndRefund" },
+    { "kind": "PURE_REFACTOR", "subject": "*" }
+  ],
+  "forbid_layers": ["behaviour", "design"]
+}

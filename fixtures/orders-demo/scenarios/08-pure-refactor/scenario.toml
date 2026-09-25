@@ -1,0 +1,3 @@
+name = "Rename repository file and extract a helper"
+intent = "Refactor only; no behaviour change."
+delete = ["src/repositories/order.repository.ts"]

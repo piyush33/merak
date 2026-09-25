@@ -1,0 +1,2 @@
+name = "Manager cancel endpoint that bypasses the service"
+intent = "Allow managers to cancel orders."

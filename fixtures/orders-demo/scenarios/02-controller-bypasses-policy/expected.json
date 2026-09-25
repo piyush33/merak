@@ -1,0 +1,38 @@
+{
+  "ops": [
+    {
+      "kind": "ENTITY_ADDED",
+      "subject": "src/controllers/order.controller.ts::OrderController.managerCancel"
+    },
+    {
+      "kind": "ENTITY_ADDED",
+      "subject": "src/app.ts::buildRouter.post(\"/orders/:id/manager-cancel\")"
+    },
+    {
+      "kind": "ENTRYPOINT_ADDED",
+      "subject": "POST /orders/:id/manager-cancel"
+    },
+    {
+      "kind": "DEPENDENCY_ADDED",
+      "subject": "src/controllers/order.controller.ts → src/repositories/order.repository.ts"
+    },
+    {
+      "kind": "STATE_TRANSITION_SOURCE_WIDENED",
+      "subject": "Order.status → CANCELLED",
+      "before": "{PENDING}",
+      "after": "{*, PENDING}"
+    },
+    {
+      "kind": "LAYER_VIOLATION_INTRODUCED",
+      "subject": "controller → repository"
+    },
+    {
+      "kind": "OWNERSHIP_VIOLATION_INTRODUCED",
+      "subject": "Order.status"
+    },
+    {
+      "kind": "INVARIANT_VIOLATED",
+      "subject": "Order.status := CANCELLED requires User.role ∈ {ADMIN}"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+[package]
+name = "merak-transition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+merak-ir.workspace = true
+merak-behaviour.workspace = true
+serde.workspace = true
+serde_json.workspace = true

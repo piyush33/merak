@@ -1,0 +1,2 @@
+name = "Admin tool to force an order to PAID"
+intent = "Support needs a way to mark stuck orders as paid."

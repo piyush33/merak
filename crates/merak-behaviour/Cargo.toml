@@ -1,0 +1,15 @@
+[package]
+name = "merak-behaviour"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+merak-ir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+globset.workspace = true
+
+[dev-dependencies]
+merak-front-ts.workspace = true

@@ -1,0 +1,2 @@
+name = "Notify the warehouse on cancellation"
+intent = "When an order is cancelled, tell the warehouse to release the items."

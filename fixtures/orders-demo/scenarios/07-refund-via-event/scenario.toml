@@ -1,0 +1,2 @@
+name = "Move refund to an event handler"
+intent = "Decouple refunds from the cancellation request."

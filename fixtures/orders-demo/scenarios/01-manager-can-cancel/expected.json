@@ -1,0 +1,6 @@
+{
+  "ops": [
+    { "kind": "AUTH_WIDENED", "subject": "src/policies/order.policy.ts::OrderPolicy.canCancel",
+      "before": "User.role ∈ {ADMIN}", "after": "User.role ∈ {ADMIN, MANAGER}" }
+  ]
+}
