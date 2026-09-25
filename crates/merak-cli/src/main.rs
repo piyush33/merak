@@ -27,6 +27,9 @@ enum Cmd {
         range: Option<String>,
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Analyze only this subdirectory of the repository (git mode).
+        #[arg(long, default_value = "")]
+        root: String,
         #[arg(long)]
         before: Option<PathBuf>,
         #[arg(long)]
@@ -43,17 +46,19 @@ fn main() -> Result<()> {
             let m = model(&source::from_dir(&dir)?)?;
             println!("{}", serde_json::to_string_pretty(&m)?);
         }
-        Cmd::Diff { range, repo, before, after, json } => {
+        Cmd::Diff { range, repo, root, before, after, json } => {
+            let t = std::time::Instant::now();
             let (a, b, label) = match (range, before, after) {
                 (_, Some(x), Some(y)) => (source::from_dir(&x)?, source::from_dir(&y)?, format!("{} → {}", x.display(), y.display())),
                 (Some(r), None, None) => {
                     let (base, head) = r.split_once("..").unwrap_or((r.as_str(), ""));
-                    let a = source::from_git(&repo, base, "")?;
-                    let b = if head.is_empty() { source::from_dir(&repo)? } else { source::from_git(&repo, head, "")? };
+                    let a = source::from_git(&repo, base, &root)?;
+                    let b = if head.is_empty() { source::from_dir(&repo.join(&root))? } else { source::from_git(&repo, head, &root)? };
                     (a, b, r.clone())
                 }
                 _ => anyhow::bail!("give a revision range `base..head`, or both --before and --after"),
             };
+            merak_cli::timing("load", t);
             let t = merak_cli::diff(&a, &b)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&t)?);

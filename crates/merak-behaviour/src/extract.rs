@@ -106,9 +106,11 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, env: &Env, f: &ir::Function) ->
             subscriptions: vec![],
             routes: vec![],
             unknowns: vec![],
+            call_shapes: vec![],
         },
     };
     w.stmts(&f.body, true);
+    w.decorators(f);
     if is_predicate_fn(f) {
         let returns: Vec<&Expr> = f
             .body
@@ -145,7 +147,19 @@ struct Walker<'a, 'p> {
 
 impl Walker<'_, '_> {
     fn stmts(&mut self, stmts: &[Stmt], top: bool) {
-        for s in stmts {
+        for (i, s) in stmts.iter().enumerate() {
+            // At function top level, a trailing `if (c) { … }` (no else, no exit inside)
+            // is the same as `if (!c) return; …`: record the guard, walk the body as top level.
+            if let (true, true, Stmt::If { test, then, otherwise, loc }) = (top, i + 1 == stmts.len(), s) {
+                if otherwise.is_empty() && !matches!(then.last(), Some(Stmt::Throw(..) | Stmt::Return(..))) {
+                    self.expr(test, loc);
+                    let requires = self.pred(test);
+                    let requires = self.with_domain(requires);
+                    self.e.guards.push(GuardFact { requires, on_fail: OnFail::Return, loc: loc.clone() });
+                    self.stmts(then, true);
+                    continue;
+                }
+            }
             self.stmt(s, top);
         }
     }
@@ -268,12 +282,19 @@ impl Walker<'_, '_> {
 
     fn call(&mut self, c: &ir::Call) {
         let loc = &c.loc;
+        let shape = self.call_shape(c);
         match self.ix.resolve_call(self.env, &c.callee) {
             Callee::Internal(target) => {
+                self.e.call_shapes.push(CallShape { shape, target: Some(target.clone()), loc: loc.clone() });
                 self.e.calls.push(CallFact { target, loc: loc.clone(), conditional: self.depth > 0 });
             }
-            Callee::External(api) => self.external_call(&api, c),
+            Callee::External(api) => {
+                if !self.external_call(&api, c) {
+                    self.e.call_shapes.push(CallShape { shape, target: None, loc: loc.clone() });
+                }
+            }
             Callee::Unresolved(text) => {
+                self.e.call_shapes.push(CallShape { shape, target: None, loc: loc.clone() });
                 self.e.unknowns.push(Unknown { question: format!("unresolved call `{text}`"), loc: loc.clone() });
             }
         }
@@ -285,7 +306,84 @@ impl Walker<'_, '_> {
         }
     }
 
-    fn external_call(&mut self, api: &str, c: &ir::Call) {
+    /// `target(args)`: the target by short name (stable across moves), constant
+    /// arguments by value, object literals by key (and constant value), the rest `_`.
+    fn call_shape(&self, c: &ir::Call) -> String {
+        let target = match self.ix.resolve_call(self.env, &c.callee) {
+            Callee::Internal(id) => id.rsplit("::").next().unwrap_or(&id).to_string(),
+            // Fluent chains by root and last method, so inserting a `.where()`
+            // changes one shape rather than every later link of the chain.
+            Callee::External(canon) => match canon.trim_end_matches("()").split("().").collect::<Vec<_>>().as_slice() {
+                [root, .., last] => format!("{root}()…{last}"),
+                _ => canon.trim_end_matches("()").to_string(),
+            },
+            Callee::Unresolved(text) => text,
+        };
+        let arg = |a: &Expr| match (self.ix.const_str(self.env, a), a) {
+            (Some(v), _) => format!("{v:?}"),
+            (None, Expr::Object(props)) => {
+                let mut keys: Vec<String> = props
+                    .iter()
+                    .map(|(k, v)| match self.ix.const_str(self.env, v) {
+                        Some(v) => format!("{k}={v:?}"),
+                        None => k.clone(),
+                    })
+                    .collect();
+                keys.sort();
+                format!("{{{}}}", keys.join(", "))
+            }
+            _ => "_".to_string(),
+        };
+        format!("{target}({})", c.args.iter().map(arg).collect::<Vec<_>>().join(", "))
+    }
+
+    /// Canonical name of a decorator or call target, for catalog matching.
+    fn api_name(&self, callee: &Expr) -> Option<String> {
+        match self.ix.resolve_call(self.env, callee) {
+            Callee::External(canon) => Some(canon),
+            Callee::Internal(id) => Some(format!("{id}()")),
+            Callee::Unresolved(_) => None,
+        }
+    }
+
+    /// Routes and subscriptions declared by decorators on the function (and its class).
+    fn decorators(&mut self, f: &ir::Function) {
+        let handler = f.id.clone();
+        for d in &f.decorators {
+            let Some(api) = self.api_name(&d.callee) else { continue };
+            let site = Site { segments: catalog::split_segments(&api), walker: self, call: d };
+            if let Some(rule) = self.cat.route_for(&api, true) {
+                let method = catalog::eval_spec(&rule.method, &site).unwrap_or_else(|| "?".into());
+                let path = catalog::eval_spec(&rule.path, &site);
+                let prefix = rule.prefix.as_ref().map(|p| self.class_decorator_arg(f, p));
+                let path = match (prefix, path) {
+                    (Some(None), _) | (_, None) => "<dynamic>".to_string(),
+                    (Some(Some(pre)), Some(p)) => join_route(&pre, &p),
+                    (None, Some(p)) => join_route("", &p),
+                };
+                self.e.routes.push(Route { method, path, handler: handler.clone(), loc: d.loc.clone() });
+            } else if let Some(rule) = self.cat.subscription_for(&api, true) {
+                let event = catalog::eval_spec(&rule.event, &site).unwrap_or_else(|| "<dynamic>".into());
+                self.e.subscriptions.push(Subscription { event, handler: handler.clone(), loc: d.loc.clone() });
+            }
+        }
+    }
+
+    /// Argument 0 of the enclosing class's decorator matching `pattern`: `Some("")` when
+    /// there is no such decorator or it has no argument, `None` when it is not a constant.
+    fn class_decorator_arg(&self, f: &ir::Function, pattern: &str) -> Option<String> {
+        let class = f.class.as_ref().and_then(|c| self.ix.class(&format!("{}::{c}", self.e.module)));
+        let found = class.and_then(|c| c.decorators.iter().find(|d| self.api_name(&d.callee).is_some_and(|a| catalog::api_matches(pattern, &a))));
+        let Some(d) = found else { return Some(String::new()) };
+        match d.args.first() {
+            None => Some(String::new()),
+            Some(Expr::Object(props)) => props.iter().find(|(k, _)| k == "path").and_then(|(_, v)| self.ix.const_str(self.env, v)),
+            Some(a) => self.ix.const_str(self.env, a),
+        }
+    }
+
+    /// Record what a catalogued external call means; `false` if the catalog does not know it.
+    fn external_call(&mut self, api: &str, c: &ir::Call) -> bool {
         enum Found {
             Effect(EffectKey, bool),
             Subscribe(String, i32),
@@ -299,13 +397,13 @@ impl Walker<'_, '_> {
                 let method = rule.method.as_ref().and_then(|m| catalog::eval_spec(m, &site));
                 let dynamic = target.is_none();
                 Found::Effect(EffectKey { kind: rule.kind.clone(), target: target.unwrap_or_else(|| "<dynamic>".into()), method }, dynamic)
-            } else if let Some(rule) = self.cat.subscription_for(api) {
-                Found::Subscribe(catalog::eval_spec(&rule.event, &site).unwrap_or_else(|| "<dynamic>".into()), rule.handler_arg)
-            } else if let Some(rule) = self.cat.route_for(api) {
+            } else if let Some(rule) = self.cat.subscription_for(api, false) {
+                Found::Subscribe(catalog::eval_spec(&rule.event, &site).unwrap_or_else(|| "<dynamic>".into()), rule.handler_arg.unwrap_or(-1))
+            } else if let Some(rule) = self.cat.route_for(api, false) {
                 Found::Route(
                     catalog::eval_spec(&rule.method, &site).unwrap_or_else(|| "?".into()),
                     catalog::eval_spec(&rule.path, &site).unwrap_or_else(|| "<dynamic>".into()),
-                    rule.handler_arg,
+                    rule.handler_arg.unwrap_or(-1),
                 )
             } else {
                 Found::Nothing
@@ -328,8 +426,9 @@ impl Walker<'_, '_> {
                     self.e.routes.push(Route { method, path, handler, loc: c.loc.clone() });
                 }
             }
-            Found::Nothing => {}
+            Found::Nothing => return false,
         }
+        true
     }
 
     /// Resolve the handler argument of a subscription/route call to an entity id.
@@ -358,17 +457,32 @@ impl Walker<'_, '_> {
 
     fn pred(&self, e: &Expr) -> Pred {
         match e {
-            Expr::Binary { op: op @ (ir::BinOp::Eq | ir::BinOp::NotEq), left, right } => {
-                let (subject, value) = match (self.ix.const_str(self.env, left), self.ix.const_str(self.env, right)) {
-                    (None, Some(v)) => (self.subject(left), v),
-                    (Some(v), None) => (self.subject(right), v),
-                    _ => return Pred::Opaque { text: render(e), negated: false },
+            Expr::Binary { op, left, right } if *op != ir::BinOp::Other => {
+                let sym = match op {
+                    ir::BinOp::Eq => "==",
+                    ir::BinOp::NotEq => "!=",
+                    ir::BinOp::Lt => "<",
+                    ir::BinOp::LtEq => "<=",
+                    ir::BinOp::Gt => ">",
+                    ir::BinOp::GtEq => ">=",
+                    ir::BinOp::Other => unreachable!(),
                 };
-                let values = BTreeSet::from([value]);
-                if *op == ir::BinOp::Eq {
-                    Pred::In { field: subject, values }
-                } else {
-                    Pred::NotIn { field: subject, values }
+                let (lc, rc) = (self.ix.const_str(self.env, left), self.ix.const_str(self.env, right));
+                // Put the constant (if any) on the right: `0 < n` is `n > 0`.
+                let (subject, sym, value) = match (lc, rc) {
+                    (None, Some(v)) => (self.subject(left), sym, v),
+                    (Some(v), None) => (self.subject(right), flip(sym), v),
+                    _ => return Pred::compare(self.subject(left), sym, self.subject(right)),
+                };
+                let set = |v: &str| BTreeSet::from([v.to_string()]);
+                // A size is never negative: `n > 0`, `n >= 1`, `n != 0` all mean `n ∉ {0}`.
+                let is_size = subject.ends_with(".length") || subject.ends_with(".size");
+                match (sym, value.as_str()) {
+                    ("==", _) => Pred::In { field: subject, values: set(&value) },
+                    ("!=", _) => Pred::NotIn { field: subject, values: set(&value) },
+                    (">", "0") | (">=", "1") if is_size => Pred::NotIn { field: subject, values: set("0") },
+                    ("<", "1") | ("<=", "0") if is_size => Pred::In { field: subject, values: set("0") },
+                    _ => Pred::compare(subject, sym, value),
                 }
             }
             Expr::Logical { op: ir::LogicOp::And, left, right } => Pred::And(vec![self.pred(left), self.pred(right)]).simplify(),
@@ -387,7 +501,12 @@ impl Walker<'_, '_> {
                 }
                 match self.ix.resolve_call(self.env, &c.callee) {
                     Callee::Internal(entity) => Pred::Call { entity, negated: false },
-                    _ => Pred::Opaque { text: render(e), negated: false },
+                    // By canonical name, so `semver.satisfies(v)` and `satisfies(v)` agree.
+                    Callee::External(canon) => {
+                        let args = c.args.iter().map(render).collect::<Vec<_>>().join(", ");
+                        Pred::Opaque { text: format!("{}({args})", canon.trim_end_matches("()")), negated: false }
+                    }
+                    Callee::Unresolved(_) => Pred::Opaque { text: render(e), negated: false },
                 }
             }
             Expr::Member { .. } | Expr::Ident(_) => Pred::Truthy(self.subject(e)),
@@ -433,5 +552,22 @@ impl CallSite for Site<'_, '_, '_> {
             }
             _ => None,
         }
+    }
+}
+
+/// `/prefix/path`, with duplicate and trailing slashes removed.
+fn join_route(prefix: &str, path: &str) -> String {
+    let segs: Vec<&str> = prefix.split('/').chain(path.split('/')).filter(|s| !s.is_empty()).collect();
+    format!("/{}", segs.join("/"))
+}
+
+/// The operator with its operands swapped: `a < b` ⇔ `b > a`.
+fn flip(op: &str) -> &str {
+    match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        other => other,
     }
 }

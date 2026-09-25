@@ -40,6 +40,16 @@ api = "{pg,mysql,mysql2,mssql}.*#.{query,execute}()"
 kind = "db_query"
 target = "seg:0"
 
+[[effect]]
+api = "kysely.{Kysely,Transaction}#.{insertInto,replaceInto,updateTable,deleteFrom,mergeInto}()"
+kind = "db_write"
+target = "arg:0"
+
+[[effect]]
+api = "kysely.{Kysely,Transaction}#.selectFrom()"
+kind = "db_read"
+target = "arg:0"
+
 # ---- outbound HTTP ---------------------------------------------------------
 [[effect]]
 api = "{fetch(),node-fetch(),undici.fetch()}"
@@ -97,8 +107,19 @@ api = "{node:events,events}.EventEmitter#.{on,once,addListener,prependListener}(
 event = "arg:0"
 handler_arg = 1
 
+# Decorator forms: no `handler_arg`, the decorated method is the handler.
+[[subscribe]]
+api = "@nestjs/event-emitter.OnEvent()"
+event = "arg:0"
+
 [[route]]
 api = "{express.Router(),express()}.{get,post,put,patch,delete,all}()"
 method = "seg:-1:upper"
 path = "arg:0"
 handler_arg = -1
+
+[[route]]
+api = "@nestjs/common.{Get,Post,Put,Patch,Delete,All,Head,Options}()"
+method = "seg:-1:upper"
+path = "arg:0|"
+prefix = "@nestjs/common.Controller()"

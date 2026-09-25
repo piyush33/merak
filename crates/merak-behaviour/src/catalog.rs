@@ -15,9 +15,11 @@ pub struct Catalog {
     pub route: Vec<RouteRule>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct EffectRule {
     pub api: String,
+    #[serde(skip)]
+    pub pattern: ApiPattern,
     pub kind: String,
     pub target: String,
     #[serde(default)]
@@ -27,16 +29,27 @@ pub struct EffectRule {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscribeRule {
     pub api: String,
+    #[serde(skip)]
+    pub pattern: ApiPattern,
     pub event: String,
-    pub handler_arg: i32,
+    /// Argument holding the handler; omitted for decorators (the decorated method is the handler).
+    #[serde(default)]
+    pub handler_arg: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteRule {
     pub api: String,
+    #[serde(skip)]
+    pub pattern: ApiPattern,
     pub method: String,
     pub path: String,
-    pub handler_arg: i32,
+    /// Argument holding the handler; omitted for decorators (the decorated method is the handler).
+    #[serde(default)]
+    pub handler_arg: Option<i32>,
+    /// For decorator routes: the class decorator whose argument 0 prefixes `path`.
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 /// What a value spec can ask about a call site.
@@ -49,7 +62,9 @@ pub trait CallSite {
 
 impl Catalog {
     pub fn default_catalog() -> Catalog {
-        toml::from_str(DEFAULT).expect("built-in catalog.toml is valid")
+        let mut c: Catalog = toml::from_str(DEFAULT).expect("built-in catalog.toml is valid");
+        c.compile();
+        c
     }
 
     /// Default catalog plus project rules (same schema) from `merak.toml`'s `[catalog]`.
@@ -60,19 +75,29 @@ impl Catalog {
             c.subscribe.extend(e.subscribe);
             c.route.extend(e.route);
         }
+        c.compile();
         c
     }
 
+    fn compile(&mut self) {
+        self.effect.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
+        self.subscribe.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
+        self.route.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
+    }
+
     pub fn effect_for(&self, api: &str) -> Option<&EffectRule> {
-        self.effect.iter().find(|r| api_matches(&r.api, api))
+        let segs: Vec<&str> = api.split('.').collect();
+        self.effect.iter().find(|r| r.pattern.matches_segments(&segs))
     }
 
-    pub fn subscription_for(&self, api: &str) -> Option<&SubscribeRule> {
-        self.subscribe.iter().find(|r| api_matches(&r.api, api))
+    /// Call-form subscription (`emitter.on('x', handler)`), or decorator form when `decorator`.
+    pub fn subscription_for(&self, api: &str, decorator: bool) -> Option<&SubscribeRule> {
+        self.subscribe.iter().find(|r| r.handler_arg.is_none() == decorator && r.pattern.matches(api))
     }
 
-    pub fn route_for(&self, api: &str) -> Option<&RouteRule> {
-        self.route.iter().find(|r| api_matches(&r.api, api))
+    /// Call-form route (`router.get('/x', handler)`), or decorator form when `decorator`.
+    pub fn route_for(&self, api: &str, decorator: bool) -> Option<&RouteRule> {
+        self.route.iter().find(|r| r.handler_arg.is_none() == decorator && r.pattern.matches(api))
     }
 }
 
@@ -91,11 +116,27 @@ pub fn expand_braces(pattern: &str) -> Vec<String> {
 }
 
 pub fn api_matches(pattern: &str, api: &str) -> bool {
-    let segs = split_segments(api);
-    expand_braces(pattern).iter().any(|p| {
-        let ps = split_segments(p);
-        ps.len() == segs.len() && ps.iter().zip(&segs).all(|(p, s)| segment_matches(p, s))
-    })
+    ApiPattern::new(pattern).matches(api)
+}
+
+/// A catalog `api` pattern with its `{a,b}` groups expanded and split into segments.
+#[derive(Debug, Clone, Default)]
+pub struct ApiPattern {
+    alternatives: Vec<Vec<String>>,
+}
+
+impl ApiPattern {
+    pub fn new(pattern: &str) -> Self {
+        ApiPattern { alternatives: expand_braces(pattern).iter().map(|p| split_segments(p)).collect() }
+    }
+
+    pub fn matches(&self, api: &str) -> bool {
+        self.matches_segments(&api.split('.').collect::<Vec<_>>())
+    }
+
+    fn matches_segments(&self, segs: &[&str]) -> bool {
+        self.alternatives.iter().any(|ps| ps.len() == segs.len() && ps.iter().zip(segs).all(|(p, s)| segment_matches(p, s)))
+    }
 }
 
 fn segment_matches(p: &str, s: &str) -> bool {
@@ -153,8 +194,11 @@ mod tests {
         assert_eq!(c.effect_for("axios.post()").unwrap().kind, "http");
         assert_eq!(c.effect_for("fetch()").unwrap().kind, "http");
         assert!(c.effect_for("JSON.stringify()").is_none());
-        assert!(c.route_for("express.Router().post()").is_some());
-        assert!(c.subscription_for("node:events.EventEmitter#.on()").is_some());
+        assert!(c.route_for("express.Router().post()", false).is_some());
+        assert!(c.route_for("@nestjs/common.Post()", true).is_some());
+        assert!(c.route_for("@nestjs/common.Post()", false).is_none());
+        assert!(c.subscription_for("node:events.EventEmitter#.on()", false).is_some());
+        assert!(c.subscription_for("@nestjs/event-emitter.OnEvent()", true).is_some());
     }
 
     #[test]

@@ -139,6 +139,20 @@ pub struct Entity {
     pub subscriptions: Vec<Subscription>,
     pub routes: Vec<Route>,
     pub unknowns: Vec<Unknown>,
+    /// Every call as `target(argument shape)`. Covers what the typed facts above do
+    /// not, so a transition never calls an entity unchanged when its calls changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_shapes: Vec<CallShape>,
+}
+
+/// A call not classified by the catalog, as `target(argument shape)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallShape {
+    pub shape: String,
+    /// The called entity, for program-internal calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub loc: Loc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

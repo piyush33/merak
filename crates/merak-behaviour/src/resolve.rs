@@ -78,26 +78,32 @@ impl<'p> Index<'p> {
         self.program.modules.get(path)
     }
 
-    /// Resolve a relative import specifier to a module path in the program.
+    /// Resolve an import specifier to a module path in the program: relative
+    /// specifiers first, then the aliases in scope (tsconfig `paths` / `baseUrl`).
     pub fn resolve_module(&self, from: &str, spec: &str) -> Option<String> {
-        if !spec.starts_with('.') {
-            return None;
+        if spec.starts_with('.') {
+            let dir = from.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            return self.probe(&join(dir, spec));
         }
-        let dir = from.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let mut parts: Vec<&str> = if dir.is_empty() { vec![] } else { dir.split('/').collect() };
-        for seg in spec.split('/') {
-            match seg {
-                "." | "" => {}
-                ".." => {
-                    parts.pop();
+        // Innermost scope wins; within a scope, the longest matching prefix.
+        let mut aliases: Vec<_> = self.program.aliases.iter().filter(|a| a.scope.is_empty() || from.starts_with(&format!("{}/", a.scope))).collect();
+        aliases.sort_by_key(|a| std::cmp::Reverse((a.scope.len(), a.pattern.split('*').next().unwrap_or("").len())));
+        for a in aliases {
+            let Some(star) = match_alias(&a.pattern, spec) else { continue };
+            for t in &a.targets {
+                if let Some(m) = self.probe(&t.replacen('*', star, 1)) {
+                    return Some(m);
                 }
-                s => parts.push(s),
             }
         }
-        let base = parts.join("/");
+        None
+    }
+
+    /// The program module a (normalised, extension-optional) path refers to.
+    fn probe(&self, base: &str) -> Option<String> {
         let stem = base.trim_end_matches(".js").trim_end_matches(".jsx");
         let candidates = [
-            base.clone(),
+            base.to_string(),
             format!("{stem}.ts"),
             format!("{stem}.tsx"),
             format!("{stem}.js"),
@@ -143,8 +149,8 @@ impl<'p> Index<'p> {
                 }
             }
             None => Some(Symbol::External(match imp.imported.as_str() {
-                "default" | "*" => imp.source.clone(),
-                n => format!("{}.{}", imp.source, n),
+                "default" | "*" => package_alias(&imp.source).to_string(),
+                n => format!("{}.{}", package_alias(&imp.source), n),
             })),
         }
     }
@@ -171,12 +177,20 @@ impl<'p> Index<'p> {
     pub fn field_type(&self, ty: &Ty, field: &str) -> Ty {
         match ty {
             Ty::Class(id) => {
-                let Some(c) = self.class(id) else { return Ty::Unknown };
-                let module = id.split("::").next().unwrap_or("");
-                match c.fields.get(field) {
-                    Some(t) => self.resolve_type(module, t),
-                    None => Ty::Unknown,
+                // Own fields first, then (program-internal) superclasses.
+                let mut cur = id.clone();
+                for _ in 0..16 {
+                    let Some(c) = self.class(&cur) else { break };
+                    let module = cur.split("::").next().unwrap_or("").to_string();
+                    if let Some(t) = c.fields.get(field) {
+                        return self.resolve_type(&module, t);
+                    }
+                    match c.extends.as_ref().and_then(|b| self.resolve_symbol(&module, b)) {
+                        Some(Symbol::Class(base)) => cur = base,
+                        _ => break,
+                    }
                 }
+                Ty::Unknown
             }
             Ty::Record { name, module } => match self.record_fields(module, name).and_then(|f| f.get(field).cloned()) {
                 Some(t) => self.resolve_type(module, &t),
@@ -473,5 +487,36 @@ pub fn render(e: &Expr) -> String {
         Expr::Conditional { test, then, otherwise } => format!("{} ? {} : {}", render(test), render(then), render(otherwise)),
         Expr::Assign { target, value, .. } => format!("{} = {}", render(target), render(value)),
         Expr::Opaque(t) => t.clone(),
+    }
+}
+
+fn join(dir: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in rel.split('/') {
+        match seg {
+            "." | "" => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+/// Match `spec` against a tsconfig-style pattern; returns what `*` captured
+/// (empty for an exact, star-less match).
+fn match_alias<'s>(pattern: &str, spec: &'s str) -> Option<&'s str> {
+    match pattern.split_once('*') {
+        None => (pattern == spec).then_some(""),
+        Some((pre, post)) => spec.strip_prefix(pre)?.strip_suffix(post).filter(|_| spec.len() >= pre.len() + post.len()),
+    }
+}
+
+/// Packages that are drop-in builds of another package share its canonical name.
+fn package_alias(spec: &str) -> &str {
+    match spec {
+        "lodash-es" => "lodash",
+        other => other,
     }
 }

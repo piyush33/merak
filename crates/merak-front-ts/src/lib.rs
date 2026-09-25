@@ -20,9 +20,96 @@ pub fn lower_program(files: &BTreeMap<String, String>) -> ir::Program {
     for (path, text) in files {
         if is_supported(path) {
             program.modules.insert(path.clone(), lower_module(path, text));
+        } else if is_project_config(path) {
+            program.aliases.extend(path_aliases(path, text));
         }
     }
     program
+}
+
+/// `tsconfig.json` / `jsconfig.json` at any depth.
+pub fn is_project_config(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name == "tsconfig.json" || name == "jsconfig.json"
+}
+
+/// Import aliases declared by a tsconfig's `compilerOptions.paths` and `baseUrl`.
+/// `extends` is not followed.
+pub fn path_aliases(config_path: &str, text: &str) -> Vec<ir::PathAlias> {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else { return vec![] };
+    let Some(opts) = json.get("compilerOptions") else { return vec![] };
+    let scope = config_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("").to_string();
+    let base = join_path(&scope, opts.get("baseUrl").and_then(|b| b.as_str()).unwrap_or("."));
+    let mut out = vec![];
+    if let Some(paths) = opts.get("paths").and_then(|p| p.as_object()) {
+        for (pattern, targets) in paths {
+            let targets = targets.as_array().into_iter().flatten().filter_map(|t| t.as_str()).map(|t| join_path(&base, t)).collect();
+            out.push(ir::PathAlias { scope: scope.clone(), pattern: pattern.clone(), targets });
+        }
+    }
+    if opts.get("baseUrl").is_some() {
+        // Bare specifiers resolve against baseUrl (after `paths`).
+        out.push(ir::PathAlias { scope: scope.clone(), pattern: "*".into(), targets: vec![join_path(&base, "*")] });
+    }
+    out
+}
+
+/// Join a repository-relative directory and a relative path, normalising `.` / `..`.
+fn join_path(dir: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in rel.split('/') {
+        match seg {
+            "." | "" => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+/// Remove `//` and `/* */` comments and trailing commas, so JSONC parses as JSON.
+fn strip_jsonc(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let (mut i, mut in_str) = (0, false);
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c);
+            if c == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 1;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else if c == b'"' {
+            in_str = true;
+            out.push(b'"');
+        } else if b[i..].starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        } else if b[i..].starts_with(b"/*") {
+            i += 2;
+            while i < b.len() && !b[i..].starts_with(b"*/") {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        } else if c == b',' {
+            let rest = text[i + 1..].trim_start();
+            if !(rest.starts_with('}') || rest.starts_with(']')) {
+                out.push(b',');
+            }
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub fn lower_module(path: &str, text: &str) -> ir::Module {
@@ -242,13 +329,32 @@ impl<'s> Lowerer<'s> {
                     let mname = if kind == ir::FunctionKind::Constructor { "constructor".to_string() } else { mname };
                     let qualified = format!("{name}.{mname}");
                     let fid = self.function(&m.value, &qualified, Some(&name), kind, exported, None);
+                    let decorators = self.decorators(&m.decorators);
+                    if let Some(f) = self.module.functions.iter_mut().rev().find(|f| f.id == fid) {
+                        f.decorators = decorators;
+                    }
                     methods.push(fid);
                 }
                 _ => {}
             }
         }
         let loc = self.loc(class.span);
-        self.module.classes.push(ir::Class { id: self.entity_id(&name), name, extends, fields, methods, exported, loc });
+        let decorators = self.decorators(&class.decorators);
+        self.module.classes.push(ir::Class { id: self.entity_id(&name), name, extends, fields, methods, exported, loc, decorators });
+    }
+
+    fn decorators(&mut self, decorators: &[Decorator]) -> Vec<ir::Call> {
+        decorators
+            .iter()
+            .map(|d| match &d.expression {
+                Expression::CallExpression(c) => {
+                    let callee = self.expr(&c.callee);
+                    let args = c.arguments.iter().filter_map(|a| a.as_expression()).map(|a| self.expr(a)).collect();
+                    ir::Call { callee, args, loc: self.loc(d.span) }
+                }
+                other => ir::Call { callee: self.expr(other), args: vec![], loc: self.loc(d.span) },
+            })
+            .collect()
     }
 
     fn function_decl(&mut self, f: &Function, exported: bool) {
@@ -297,6 +403,7 @@ impl<'s> Lowerer<'s> {
             loc: self.loc(f.span),
             end_line: self.line(f.span.end),
             body_hash: String::new(),
+            decorators: vec![],
         });
         id
     }
@@ -331,6 +438,7 @@ impl<'s> Lowerer<'s> {
             loc: self.loc(a.span),
             end_line: self.line(a.span.end),
             body_hash: String::new(),
+            decorators: vec![],
         });
         id
     }

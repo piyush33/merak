@@ -23,6 +23,13 @@ pub enum Pred {
         entity: String,
         negated: bool,
     },
+    /// `left op right` over non-constant operands, canonicalised by [`Pred::compare`]:
+    /// only `<`, `<=`, `==`, `!=`, with `==`/`!=` operands in sorted order.
+    Compare {
+        left: String,
+        op: String,
+        right: String,
+    },
     And(Vec<Pred>),
     Or(Vec<Pred>),
     Opaque {
@@ -34,6 +41,18 @@ pub enum Pred {
 }
 
 impl Pred {
+    /// Canonical comparison: `a > b` becomes `b < a`, `a >= b` becomes `b <= a`,
+    /// and equality operands are ordered, so equivalent spellings compare equal.
+    pub fn compare(left: String, op: &str, right: String) -> Pred {
+        let (left, op, right) = match op {
+            ">" => (right, "<", left),
+            ">=" => (right, "<=", left),
+            "==" | "!=" if right < left => (right, op, left),
+            _ => (left, op, right),
+        };
+        Pred::Compare { left, op: op.to_string(), right }
+    }
+
     pub fn negate(self) -> Pred {
         match self {
             Pred::In { field, values } => Pred::NotIn { field, values },
@@ -41,6 +60,12 @@ impl Pred {
             Pred::Truthy(f) => Pred::Falsy(f),
             Pred::Falsy(f) => Pred::Truthy(f),
             Pred::Call { entity, negated } => Pred::Call { entity, negated: !negated },
+            Pred::Compare { left, op, right } => match op.as_str() {
+                "<" => Pred::compare(left, ">=", right),
+                "<=" => Pred::compare(left, ">", right),
+                "==" => Pred::compare(left, "!=", right),
+                _ => Pred::compare(left, "==", right),
+            },
             Pred::Opaque { text, negated } => Pred::Opaque { text, negated: !negated },
             Pred::And(ps) => Pred::Or(ps.into_iter().map(Pred::negate).collect()).simplify(),
             Pred::Or(ps) => Pred::And(ps.into_iter().map(Pred::negate).collect()).simplify(),
@@ -94,6 +119,7 @@ impl Pred {
                     format!("{short}()")
                 }
             }
+            Pred::Compare { left, op, right } => format!("{left} {op} {right}"),
             Pred::And(ps) => ps.iter().map(|p| p.render()).collect::<Vec<_>>().join(" ∧ "),
             Pred::Or(ps) => ps.iter().map(|p| p.render()).collect::<Vec<_>>().join(" ∨ "),
             Pred::Opaque { text, negated } => {
@@ -172,6 +198,14 @@ mod tests {
         .simplify()
         .negate();
         assert_eq!(p, Pred::In { field: "Order.status".into(), values: set(&["A", "B"]) });
+    }
+
+    #[test]
+    fn comparisons_are_canonical() {
+        let c = |l: &str, op: &str, r: &str| Pred::compare(l.into(), op, r.into());
+        assert_eq!(c("a", ">", "b"), c("b", "<", "a"));
+        assert_eq!(c("a", "<=", "b").negate(), c("a", ">", "b"));
+        assert_eq!(c("a", "==", "b").negate(), c("b", "!=", "a"));
     }
 
     #[test]

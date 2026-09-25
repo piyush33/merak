@@ -8,7 +8,7 @@ pub mod render;
 
 use merak_behaviour::infer;
 use merak_behaviour::pred::{render_set, Pred};
-use merak_behaviour::{EffectInfo, EffectKey, Model, Origin};
+use merak_behaviour::{CallShape, EffectInfo, EffectKey, Model, Origin};
 use merak_ir::Loc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -531,6 +531,38 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         }
     }
 
+    // ------------------------------------------------------------ unclassified
+    // A changed entity whose calls changed, but which no typed op explains: say so
+    // rather than let it count towards a pure refactor.
+    let explained: BTreeSet<&str> = out.ops.iter().filter(|o| o.layer != Layer::Structural).map(|o| o.subject.as_str()).collect();
+    let mut unclassified = vec![];
+    for (ida, idb) in &m.forward {
+        let (ea, eb) = (&a.entities[ida], &b.entities[idb]);
+        if ea.body_hash == eb.body_hash || explained.contains(idb.as_str()) {
+            continue;
+        }
+        // Calls into helpers that exist on one side only (extracted or inlined) count as their bodies.
+        let sa = inline_shapes(a, ida, &|t| m.forward.contains_key(t));
+        let sb = inline_shapes(b, idb, &|t| m.backward.contains_key(t));
+        let (gone, new) = multiset_diff(&sa, &sb);
+        if gone.is_empty() && new.is_empty() {
+            continue;
+        }
+        let show = |xs: &[&CallShape]| (!xs.is_empty()).then(|| xs.iter().map(|c| c.shape.as_str()).collect::<Vec<_>>().join("; "));
+        let evidence = |xs: &[&CallShape]| {
+            let mut locs: Vec<Loc> = xs.iter().map(|c| c.loc.clone()).collect();
+            locs.dedup();
+            locs
+        };
+        unclassified.push((idb.clone(), show(&gone), show(&new), evidence(&gone), evidence(&new), b.entry_points_reaching(idb)));
+    }
+    for (subject, before, after, eb, ea, affects) in unclassified {
+        let op = out.push("UNCLASSIFIED_CHANGE", Layer::Behaviour, subject, before, after, eb, ea);
+        op.confidence = 0.5;
+        op.affects = affects;
+        op.note = Some("calls changed in a way the behaviour model does not classify; review manually".into());
+    }
+
     // ------------------------------------------------------------ pure refactor
     let structural_change = !out.ops.is_empty() || changed > 0;
     if structural_change && out.ops.iter().all(|o| o.layer == Layer::Structural) {
@@ -581,4 +613,36 @@ fn auth_change(out: &mut Builder, subject: &str, pa: &Pred, pb: &Pred, la: &Loc,
         _ => "AUTH_CHANGED",
     };
     out.push(kind, Layer::Behaviour, subject, Some(pa.render()), Some(pb.render()), vec![la.clone()], vec![lb.clone()]);
+}
+
+/// Call shapes of `id`, with calls to entities absent from the other version
+/// (`matched` is false) replaced by those entities' own shapes.
+fn inline_shapes<'x>(model: &'x Model, id: &str, matched: &dyn Fn(&str) -> bool) -> Vec<&'x CallShape> {
+    fn walk<'x>(model: &'x Model, id: &str, matched: &dyn Fn(&str) -> bool, seen: &mut BTreeSet<String>, out: &mut Vec<&'x CallShape>) {
+        let Some(e) = model.entities.get(id) else { return };
+        for c in &e.call_shapes {
+            match &c.target {
+                Some(t) if !matched(t) && model.entities.contains_key(t) && seen.insert(t.clone()) => walk(model, t, matched, seen, out),
+                _ => out.push(c),
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(model, id, matched, &mut BTreeSet::from([id.to_string()]), &mut out);
+    out
+}
+
+/// Items only in `a`, and only in `b`, comparing shapes as multisets (locations ignored).
+fn multiset_diff<'x>(a: &[&'x CallShape], b: &[&'x CallShape]) -> (Vec<&'x CallShape>, Vec<&'x CallShape>) {
+    let mut left: BTreeMap<&str, Vec<&CallShape>> = BTreeMap::new();
+    for x in a {
+        left.entry(x.shape.as_str()).or_default().push(x);
+    }
+    let mut only_b = vec![];
+    for y in b {
+        if left.get_mut(y.shape.as_str()).and_then(|v| v.pop()).is_none() {
+            only_b.push(*y);
+        }
+    }
+    (left.into_values().flatten().collect(), only_b)
 }

@@ -218,6 +218,9 @@ pub struct Function {
     pub end_line: u32,
     /// Hash of the body with names/locations stripped (used for move detection).
     pub body_hash: String,
+    /// Decorators, as calls (`@Get(':id')`; a bare `@Injectable` has no args).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decorators: Vec<Call>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -232,6 +235,9 @@ pub struct Class {
     pub methods: Vec<String>,
     pub exported: bool,
     pub loc: Loc,
+    /// Decorators, as calls (`@Get(':id')`; a bare `@Injectable` has no args).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decorators: Vec<Call>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -284,6 +290,18 @@ pub struct Module {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Program {
     pub modules: BTreeMap<String, Module>,
+    /// Non-relative import aliases (e.g. tsconfig `paths` / `baseUrl`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<PathAlias>,
+}
+
+/// `pattern` (with at most one `*`) maps to repository-relative `targets`, for
+/// modules under `scope` (a directory; `""` is the repository root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathAlias {
+    pub scope: String,
+    pub pattern: String,
+    pub targets: Vec<String>,
 }
 
 impl Program {

@@ -68,3 +68,28 @@ fn identical_trees_have_no_transition() {
     let t = merak_cli::diff(&base, &base).unwrap();
     assert!(t.ops.is_empty(), "{:#?}", t.ops);
 }
+
+#[test]
+fn git_revision_loads_like_directory() {
+    let base = fixtures().join("base");
+    let tmp = std::env::temp_dir().join(format!("merak-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let sub = tmp.join("app");
+    std::fs::create_dir_all(&sub).unwrap();
+    for (rel, text) in source::from_dir(&base).unwrap() {
+        let p = sub.join(&rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git").arg("-C").arg(&tmp).args(args).output().unwrap().status.success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]);
+    let from_git = source::from_git(&tmp, "HEAD", "app").unwrap();
+    assert_eq!(from_git, source::from_dir(&base).unwrap());
+    assert!(source::from_git(&tmp, "HEAD", "ap").unwrap().is_empty(), "prefix must match whole path segments");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
