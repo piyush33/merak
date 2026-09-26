@@ -13,6 +13,39 @@ pub struct Catalog {
     pub subscribe: Vec<SubscribeRule>,
     #[serde(default)]
     pub route: Vec<RouteRule>,
+    #[serde(default)]
+    pub filter: Vec<FilterRule>,
+    #[serde(default)]
+    pub callback: Vec<CallbackRule>,
+    #[serde(default)]
+    pub literal: Vec<FilterRule>,
+    #[serde(default)]
+    pub log: Vec<FilterRule>,
+    #[serde(default)]
+    pub access: AccessKeys,
+    #[serde(default)]
+    pub schema: SchemaKeys,
+}
+
+/// Validation-schema libraries and their documentation-only methods.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SchemaKeys {
+    /// Canonical names of schema roots (`zod` for `import { z } from 'zod'`).
+    #[serde(default)]
+    pub roots: Vec<String>,
+    /// Methods that document a schema without changing what it accepts.
+    #[serde(default)]
+    pub docs: Vec<String>,
+}
+
+/// Object-argument keys that state access requirements.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AccessKeys {
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Keys whose value grants access (`public: true`) rather than requiring it.
+    #[serde(default)]
+    pub grants: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -52,6 +85,29 @@ pub struct RouteRule {
     pub prefix: Option<String>,
 }
 
+/// A call matched by API name only: a query filter method (`where`, join `on`, …),
+/// a literal wrapper (`sql.lit(…)`) or a log call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterRule {
+    pub api: String,
+    #[serde(skip)]
+    pub pattern: ApiPattern,
+}
+
+/// The type of an untyped callback parameter passed to an external method, e.g.
+/// the `qb` in `query.$if(cond, (qb) => qb.where(…))`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CallbackRule {
+    pub api: String,
+    #[serde(skip)]
+    pub pattern: ApiPattern,
+    /// Only closures passed as this argument; any argument when omitted.
+    #[serde(default)]
+    pub arg: Option<usize>,
+    /// Canonical type of the first parameter, or `receiver`: the object the method is called on.
+    pub param: String,
+}
+
 /// What a value spec can ask about a call site.
 pub trait CallSite {
     fn segments(&self) -> &[String];
@@ -74,6 +130,14 @@ impl Catalog {
             c.effect.extend(e.effect);
             c.subscribe.extend(e.subscribe);
             c.route.extend(e.route);
+            c.filter.extend(e.filter);
+            c.callback.extend(e.callback);
+            c.literal.extend(e.literal);
+            c.log.extend(e.log);
+            c.access.keys.extend(e.access.keys);
+            c.access.grants.extend(e.access.grants);
+            c.schema.roots.extend(e.schema.roots);
+            c.schema.docs.extend(e.schema.docs);
         }
         c.compile();
         c
@@ -83,6 +147,10 @@ impl Catalog {
         self.effect.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
         self.subscribe.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
         self.route.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
+        self.filter.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
+        self.callback.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
+        self.literal.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
+        self.log.iter_mut().for_each(|r| r.pattern = ApiPattern::new(&r.api));
     }
 
     pub fn effect_for(&self, api: &str) -> Option<&EffectRule> {
@@ -98,6 +166,28 @@ impl Catalog {
     /// Call-form route (`router.get('/x', handler)`), or decorator form when `decorator`.
     pub fn route_for(&self, api: &str, decorator: bool) -> Option<&RouteRule> {
         self.route.iter().find(|r| r.handler_arg.is_none() == decorator && r.pattern.matches(api))
+    }
+
+    pub fn is_filter(&self, api: &str) -> bool {
+        self.filter.iter().any(|r| r.pattern.matches(api))
+    }
+
+    pub fn is_log(&self, api: &str) -> bool {
+        self.log.iter().any(|r| r.pattern.matches(api))
+    }
+
+    pub fn is_access_key(&self, key: &str) -> bool {
+        self.access.keys.iter().any(|k| k == key)
+    }
+
+    /// A call whose value is the constant in its first argument.
+    pub fn is_literal(&self, api: &str) -> bool {
+        self.literal.iter().any(|r| r.pattern.matches(api))
+    }
+
+    /// The rule typing a closure passed as argument `arg` of `api`.
+    pub fn callback_for(&self, api: &str, arg: usize) -> Option<&CallbackRule> {
+        self.callback.iter().find(|r| r.arg.is_none_or(|a| a == arg) && r.pattern.matches(api))
     }
 }
 
@@ -135,7 +225,16 @@ impl ApiPattern {
     }
 
     fn matches_segments(&self, segs: &[&str]) -> bool {
-        self.alternatives.iter().any(|ps| ps.len() == segs.len() && ps.iter().zip(segs).all(|(p, s)| segment_matches(p, s)))
+        self.alternatives.iter().any(|ps| segments_match(ps, segs))
+    }
+}
+
+/// `**` matches any number of segments (including none).
+fn segments_match(ps: &[String], segs: &[&str]) -> bool {
+    match ps.split_first() {
+        None => segs.is_empty(),
+        Some((p, rest)) if p == "**" => (0..=segs.len()).any(|k| segments_match(rest, &segs[k..])),
+        Some((p, rest)) => segs.first().is_some_and(|s| segment_matches(p, s)) && segments_match(rest, &segs[1..]),
     }
 }
 
@@ -199,6 +298,23 @@ mod tests {
         assert!(c.route_for("@nestjs/common.Post()", false).is_none());
         assert!(c.subscription_for("node:events.EventEmitter#.on()", false).is_some());
         assert!(c.subscription_for("@nestjs/event-emitter.OnEvent()", true).is_some());
+        assert!(c.is_filter("kysely.Kysely#.selectFrom().where()"));
+        assert!(c.is_log("console.log()"));
+        assert!(c.is_log("@nestjs/common.Logger#.warn()"));
+        assert!(c.is_log("src/repositories/logging.repository.ts::LoggingRepository.warn()"));
+        assert!(!c.is_log("src/order.service.ts::OrderService.cancel()"));
+        assert!(c.is_filter("kysely.ExpressionBuilder#()"));
+        assert!(!c.is_filter("kysely.Kysely#.selectFrom().select()"));
+        assert_eq!(c.callback_for("kysely.Kysely#.selectFrom().$if()", 1).unwrap().param, "receiver");
+        assert_eq!(c.effect_for("kysely.ExpressionBuilder#.selectFrom()").unwrap().kind, "db_read");
+    }
+
+    #[test]
+    fn double_star_matches_any_depth() {
+        let p = ApiPattern::new("kysely.**.where()");
+        assert!(p.matches("kysely.Kysely#.selectFrom().where()"));
+        assert!(p.matches("kysely.where()"));
+        assert!(!p.matches("kysely.Kysely#.selectFrom()"));
     }
 
     #[test]

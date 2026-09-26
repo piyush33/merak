@@ -1,0 +1,19 @@
+{
+  "description": "Per-turn ledger: snapshot on prompt, report this turn's semantic transition when the agent stops (once per turn). Set MERAK_HOOK=off to disable.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/merak-run\" hook prompt --data \"${CLAUDE_PLUGIN_DATA}\"", "timeout": 60 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/merak-run\" hook stop --data \"${CLAUDE_PLUGIN_DATA}\"", "timeout": 120 }
+        ]
+      }
+    ]
+  }
+}

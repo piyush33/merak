@@ -183,6 +183,8 @@ pub enum Stmt {
         loc: Loc,
     },
     Block(Vec<Stmt>),
+    /// `break` / `continue`: the rest of the enclosing block is skipped.
+    Jump(Loc),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

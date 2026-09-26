@@ -34,9 +34,28 @@ enum Cmd {
         before: Option<PathBuf>,
         #[arg(long)]
         after: Option<PathBuf>,
+        /// Compare a snapshot (from `merak snapshot`) with the working tree of --repo.
+        #[arg(long)]
+        since: Option<PathBuf>,
         /// Emit JSON instead of Markdown.
         #[arg(long)]
         json: bool,
+    },
+    /// Save the analyzable sources of a directory, to diff against later with `diff --since`.
+    Snapshot {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Run the MCP server (stdio) for coding agents.
+    Mcp,
+    /// Claude Code hook: `prompt` (UserPromptSubmit) snapshots, `stop` (Stop) reports this turn's transition.
+    Hook {
+        event: String,
+        /// Directory for per-session snapshots (the plugin passes `${CLAUDE_PLUGIN_DATA}`).
+        #[arg(long)]
+        data: PathBuf,
     },
 }
 
@@ -46,17 +65,22 @@ fn main() -> Result<()> {
             let m = model(&source::from_dir(&dir)?)?;
             println!("{}", serde_json::to_string_pretty(&m)?);
         }
-        Cmd::Diff { range, repo, root, before, after, json } => {
+        Cmd::Snapshot { dir, out } => {
+            std::fs::write(&out, serde_json::to_vec(&source::from_dir(&dir)?)?)?;
+        }
+        Cmd::Mcp => merak_cli::mcp::serve()?,
+        Cmd::Hook { event, data } => std::process::exit(merak_cli::hook::run(&event, &data)),
+        Cmd::Diff { range, repo, root, before, after, since, json } => {
             let t = std::time::Instant::now();
-            let (a, b, label) = match (range, before, after) {
-                (_, Some(x), Some(y)) => (source::from_dir(&x)?, source::from_dir(&y)?, format!("{} → {}", x.display(), y.display())),
-                (Some(r), None, None) => {
+            let (a, b, label) = match (range, before, after, since) {
+                (_, _, _, Some(snap)) => (source::from_snapshot(&snap)?, source::from_dir(&repo.join(&root))?, "since snapshot".to_string()),
+                (_, Some(x), Some(y), None) => (source::from_dir(&x)?, source::from_dir(&y)?, format!("{} → {}", x.display(), y.display())),
+                (Some(r), None, None, None) => {
                     let (base, head) = r.split_once("..").unwrap_or((r.as_str(), ""));
-                    let a = source::from_git(&repo, base, &root)?;
-                    let b = if head.is_empty() { source::from_dir(&repo.join(&root))? } else { source::from_git(&repo, head, &root)? };
+                    let (a, b) = merak_cli::load_range(&repo, base, head, &root)?;
                     (a, b, r.clone())
                 }
-                _ => anyhow::bail!("give a revision range `base..head`, or both --before and --after"),
+                _ => anyhow::bail!("give a revision range `base..head`, both --before and --after, or --since <snapshot>"),
             };
             merak_cli::timing("load", t);
             let t = merak_cli::diff(&a, &b)?;

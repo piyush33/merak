@@ -157,14 +157,25 @@ impl<'p> Index<'p> {
 
     /// Resolve a type annotation written in `module`.
     pub fn resolve_type(&self, module: &str, t: &TypeRef) -> Ty {
+        self.resolve_type_depth(module, t, 0)
+    }
+
+    fn resolve_type_depth(&self, module: &str, t: &TypeRef, depth: u32) -> Ty {
         let t = t.unwrap_async();
         if let Some(el) = t.element() {
-            return Ty::Array(Box::new(self.resolve_type(module, el)));
+            return Ty::Array(Box::new(self.resolve_type_depth(module, el, depth)));
         }
         match t {
             TypeRef::Named(name, _) => match self.resolve_symbol(module, name) {
                 Some(Symbol::Class(id)) => Ty::Class(id),
-                Some(Symbol::Record { module, name }) => Ty::Record { name, module },
+                // `type AssetExpressionBuilder = ExpressionBuilder<DB, 'asset'>` is the aliased type.
+                Some(Symbol::Record { module, name }) => match self.module(&module).and_then(|m| m.type_aliases.get(&name)) {
+                    Some(target @ TypeRef::Named(..)) if depth < 8 => match self.resolve_type_depth(&module, target, depth + 1) {
+                        Ty::Unknown => Ty::Record { name, module },
+                        ty => ty,
+                    },
+                    _ => Ty::Record { name, module },
+                },
                 Some(Symbol::External(canon)) => Ty::External(format!("{canon}#")),
                 _ => Ty::Unknown,
             },

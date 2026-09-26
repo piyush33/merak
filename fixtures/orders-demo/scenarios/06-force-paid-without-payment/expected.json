@@ -1,5 +1,7 @@
 {
   "ops": [
+    { "kind": "BEHAVIOUR_ADDED", "subject": "src/services/order.service.ts::OrderService.forceMarkPaid",
+      "after": "effects: db_write order, db_read order; writes: Order.status" },
     { "kind": "ENTITY_ADDED", "subject": "src/services/order.service.ts::OrderService.forceMarkPaid" },
     { "kind": "STATE_TRANSITION_SOURCE_WIDENED", "subject": "Order.status → PAID",
       "before": "{CONFIRMED}", "after": "{*, CONFIRMED}" },

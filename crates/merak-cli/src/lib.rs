@@ -1,3 +1,5 @@
+pub mod hook;
+pub mod mcp;
 pub mod source;
 
 use anyhow::Result;
@@ -13,6 +15,13 @@ pub fn model(files: &Files) -> Result<Model> {
     let m = merak_behaviour::analyze(&program, files.get("merak.toml").map(String::as_str)).map_err(anyhow::Error::msg);
     timing("analyze", t);
     m
+}
+
+/// Sources of `base` and `head` (git revisions of `repo`; an empty `head` is the working tree).
+pub fn load_range(repo: &std::path::Path, base: &str, head: &str, root: &str) -> Result<(Files, Files)> {
+    let a = source::from_git(repo, base, root)?;
+    let b = if head.is_empty() { source::from_dir(&repo.join(root))? } else { source::from_git(repo, head, root)? };
+    Ok((a, b))
 }
 
 pub fn diff(before: &Files, after: &Files) -> Result<merak_transition::Transition> {

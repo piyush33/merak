@@ -143,6 +143,41 @@ pub struct Entity {
     /// not, so a transition never calls an entity unchanged when its calls changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub call_shapes: Vec<CallShape>,
+    /// Predicates the entity's database queries apply: which rows they reach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<QueryFilter>,
+    /// Log calls, as call shapes: not behaviour, but not nothing either.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<CallShape>,
+    /// Access requirements stated in the entity's calls and decorators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<AccessFact>,
+}
+
+/// An access requirement: `permission=album.read`, or `permission=_` when the value
+/// comes from elsewhere (typically the caller, whose constant then counts instead).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccessFact {
+    pub requirement: String,
+    /// Opens access (`public=true`) rather than restricting it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grant: bool,
+    pub loc: Loc,
+}
+
+impl AccessFact {
+    pub fn dynamic(&self) -> bool {
+        self.requirement.ends_with("=_")
+    }
+}
+
+/// A query predicate (`where`, `whereRef`, join `on`, `eb(…)`), rendered canonically:
+/// `asset.ownerId = _`, `(asset.deletedAt is null ∨ asset.isArchived = true)`.
+/// Constants are kept, other values are `_`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryFilter {
+    pub expr: String,
+    pub loc: Loc,
 }
 
 /// A call not classified by the catalog, as `target(argument shape)`.
@@ -152,7 +187,26 @@ pub struct CallShape {
     /// The called entity, for program-internal calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Path conditions under which the call runs (rendered, sorted), other than the
+    /// entity's own guards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when: Vec<String>,
+    /// The entity's own guards in force at the call. Guard facts compare them within the
+    /// entity; they become ordinary conditions when the entity is inlined into a caller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<String>,
     pub loc: Loc,
+}
+
+impl CallShape {
+    /// The shape with its conditions: what calls are compared by.
+    pub fn key(&self) -> String {
+        if self.when.is_empty() {
+            self.shape.clone()
+        } else {
+            format!("{} when {}", self.shape, self.when.join(" ∧ "))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -184,6 +238,9 @@ pub struct Summary {
     pub reads: BTreeSet<String>,
     /// Own guards with predicate calls expanded.
     pub requires: Vec<(String, Pred, Loc)>,
+    /// Access requirements: own ones, plus the constant ones of everything reached.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub access: BTreeMap<String, AccessFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -262,6 +319,17 @@ pub struct Model {
     pub module_layers: BTreeMap<String, String>,
     /// Finite value domains of written enum / literal-union fields (`Type.field`).
     pub field_domains: BTreeMap<String, BTreeSet<String>>,
+    /// Validation schemas declared as module constants, by `module::Name`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub schemas: BTreeMap<String, SchemaFact>,
+}
+
+/// A validation schema: each field's constraints (`name` → `string().regex(/^[^/]*$/)`);
+/// `*` holds the whole schema when it is more than a plain object (refinements, `.strict()`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchemaFact {
+    pub fields: BTreeMap<String, String>,
+    pub loc: Loc,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -297,6 +365,20 @@ impl Model {
             }
         }
         seen
+    }
+
+    /// Effects `id` reaches, writes first, leaving out those that only happen inside the
+    /// checks it calls (`requireAccess` reads access tables; that is the check's behaviour).
+    pub fn effects_outside_checks(&self, id: &str) -> Vec<(&EffectKey, &EffectInfo)> {
+        let Some(s) = self.summaries.get(id) else { return vec![] };
+        let in_checks = |k: &EffectKey, i: &EffectInfo| {
+            i.evidence
+                .iter()
+                .all(|l| s.validations.keys().any(|v| self.summaries.get(v).and_then(|vs| vs.effects.get(k)).is_some_and(|vi| vi.evidence.contains(l))))
+        };
+        let mut out: Vec<(&EffectKey, &EffectInfo)> = s.effects.iter().filter(|(k, i)| !in_checks(k, i)).collect();
+        out.sort_by_key(|(k, _)| (!crate::summary::WRITE_EFFECTS.contains(&k.kind.as_str()), k.render()));
+        out
     }
 
     /// HTTP entry points whose handlers reach `id`.

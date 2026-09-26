@@ -20,6 +20,12 @@ fn wanted(path: &str) -> bool {
     merak_front_ts::is_supported(path) && !name.contains(".spec.") && !name.contains(".test.") && !path.split('/').any(|seg| TEST_DIRS.contains(&seg))
 }
 
+/// Sources saved by `merak snapshot`.
+pub fn from_snapshot(path: &Path) -> Result<Files> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading snapshot {}", path.display()))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 pub fn from_dir(root: &Path) -> Result<Files> {
     let mut files = Files::new();
     walk(root, root, &mut files)?;

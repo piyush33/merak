@@ -6,38 +6,158 @@ use crate::model::*;
 use crate::pred::Pred;
 use crate::resolve::{render, Callee, Env, Index, Ty};
 use merak_ir::{self as ir, Expr, Loc, Stmt};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+/// Typing environments of every function, plus what callbacks were learned from their call sites.
+#[derive(Debug, Default)]
+pub struct Envs {
+    pub by_fn: HashMap<String, Env>,
+    /// Closures passed to a query-filter method (`where((eb) => …)`). Their predicate
+    /// is recorded at the call site, rendered from what the closure returns.
+    pub filter_callbacks: HashSet<String>,
+    /// Types for the untyped first parameter of closures, from the catalog's callback rules.
+    hints: HashMap<String, Ty>,
+}
 
 /// Build typing environments for every function (closures inherit their parent's).
-pub fn build_envs(ix: &Index) -> HashMap<String, Env> {
-    let mut envs = HashMap::new();
+pub fn build_envs(ix: &Index, cat: &Catalog) -> Envs {
+    let mut envs = Envs::default();
     let ids: Vec<String> = ix.program.functions().map(|f| f.id.clone()).collect();
     for id in ids {
-        env_for(ix, &id, &mut envs);
+        env_for(ix, cat, &id, &mut envs);
     }
     envs
 }
 
-fn env_for(ix: &Index, id: &str, envs: &mut HashMap<String, Env>) -> Env {
-    if let Some(e) = envs.get(id) {
+fn env_for(ix: &Index, cat: &Catalog, id: &str, envs: &mut Envs) -> Env {
+    if let Some(e) = envs.by_fn.get(id) {
         return e.clone();
     }
     let Some(f) = ix.function(id) else { return Env::default() };
     let module = id.split("::").next().unwrap_or("").to_string();
     let mut env = match &f.parent {
-        Some(p) => env_for(ix, p, envs),
+        Some(p) => env_for(ix, cat, p, envs),
         None => Env { module: module.clone(), ..Default::default() },
     };
     if f.class.is_some() {
         env.this_class = Some(format!("{module}::{}", f.class.as_deref().unwrap_or("")));
     }
-    for p in &f.params {
-        let ty = p.ty.as_ref().map(|t| ix.resolve_type(&module, t)).unwrap_or(Ty::Unknown);
+    for (i, p) in f.params.iter().enumerate() {
+        let ty = match &p.ty {
+            Some(t) => ix.resolve_type(&module, t),
+            None if i == 0 => envs.hints.get(id).cloned().unwrap_or(Ty::Unknown),
+            None => Ty::Unknown,
+        };
         env.vars.insert(p.name.clone(), ty);
     }
     collect_locals(ix, &f.body, &mut env);
-    envs.insert(id.to_string(), env.clone());
+    type_callbacks(ix, cat, &env, &f.body, envs);
+    envs.by_fn.insert(id.to_string(), env.clone());
     env
+}
+
+/// Record parameter types for closures passed to catalogued external methods,
+/// e.g. `qb` in `query.$if(cond, (qb) => qb.where(…))` is the query builder.
+fn type_callbacks(ix: &Index, cat: &Catalog, env: &Env, body: &[Stmt], envs: &mut Envs) {
+    let mut found = vec![];
+    visit_calls(body, &mut |c| {
+        // Closures passed directly, or through a local (`const p = (eb) => …; qb.where(p)`).
+        let closures: Vec<(usize, String)> = c
+            .args
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| match a {
+                Expr::Closure(id) => Some((i, id.clone())),
+                Expr::Ident(n) => match env.vars.get(n) {
+                    Some(Ty::Function(id)) if ix.function(id).is_some_and(|f| f.parent.is_some()) => Some((i, id.clone())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        if closures.is_empty() {
+            return;
+        }
+        let Callee::External(api) = ix.resolve_call(env, &c.callee) else { return };
+        for (i, id) in closures {
+            let Some(rule) = cat.callback_for(&api, i) else { continue };
+            let ty = match (rule.param.as_str(), &c.callee) {
+                ("receiver", Expr::Member { object, .. }) => ix.type_of(env, object),
+                ("receiver", _) => Ty::Unknown,
+                (canon, _) => Ty::External(canon.to_string()),
+            };
+            found.push((id, ty, cat.is_filter(&api)));
+        }
+    });
+    for (id, ty, filter) in found {
+        if filter {
+            envs.filter_callbacks.insert(id.clone());
+        }
+        envs.hints.entry(id).or_insert(ty);
+    }
+}
+
+/// Every call in `stmts`, outermost first (closure bodies are separate functions).
+fn visit_calls<'e>(stmts: &'e [Stmt], f: &mut dyn FnMut(&'e ir::Call)) {
+    for s in stmts {
+        match s {
+            Stmt::Expr(e, _) | Stmt::Throw(e, _) | Stmt::Return(Some(e), _) | Stmt::Let { init: Some(e), .. } => visit_expr(e, f),
+            Stmt::If { test, then, otherwise, .. } => {
+                visit_expr(test, f);
+                visit_calls(then, f);
+                visit_calls(otherwise, f);
+            }
+            Stmt::Loop { iter, body, .. } => {
+                if let Some(it) = iter {
+                    visit_expr(it, f);
+                }
+                visit_calls(body, f);
+            }
+            Stmt::Try { body, handler, finalizer, .. } => {
+                visit_calls(body, f);
+                visit_calls(handler, f);
+                visit_calls(finalizer, f);
+            }
+            Stmt::Block(b) => visit_calls(b, f),
+            Stmt::Return(None, _) | Stmt::Let { init: None, .. } | Stmt::Jump(_) => {}
+        }
+    }
+}
+
+fn visit_expr<'e>(e: &'e Expr, f: &mut dyn FnMut(&'e ir::Call)) {
+    match e {
+        Expr::Call(c) => {
+            f(c);
+            visit_expr(&c.callee, f);
+            c.args.iter().for_each(|a| visit_expr(a, f));
+        }
+        Expr::Member { object, .. } => visit_expr(object, f),
+        Expr::Index { object, index } => {
+            visit_expr(object, f);
+            visit_expr(index, f);
+        }
+        Expr::New { callee, args, .. } => {
+            visit_expr(callee, f);
+            args.iter().for_each(|a| visit_expr(a, f));
+        }
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            visit_expr(left, f);
+            visit_expr(right, f);
+        }
+        Expr::Not(x) | Expr::Await(x) => visit_expr(x, f),
+        Expr::Template { exprs: xs, .. } | Expr::Array(xs) => xs.iter().for_each(|x| visit_expr(x, f)),
+        Expr::Object(props) => props.iter().for_each(|(_, v)| visit_expr(v, f)),
+        Expr::Conditional { test, then, otherwise } => {
+            visit_expr(test, f);
+            visit_expr(then, f);
+            visit_expr(otherwise, f);
+        }
+        Expr::Assign { target, value, .. } => {
+            visit_expr(target, f);
+            visit_expr(value, f);
+        }
+        _ => {}
+    }
 }
 
 fn collect_locals(ix: &Index, stmts: &[Stmt], env: &mut Env) {
@@ -73,13 +193,19 @@ fn collect_locals(ix: &Index, stmts: &[Stmt], env: &mut Env) {
     }
 }
 
-pub fn extract_entity(ix: &Index, cat: &Catalog, env: &Env, f: &ir::Function) -> Entity {
+pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) -> Entity {
     let module = f.id.split("::").next().unwrap_or("").to_string();
+    let fallback = Env::default();
     let mut w = Walker {
         ix,
         cat,
-        env,
+        env: envs.by_fn.get(&f.id).unwrap_or(&fallback),
+        envs,
         depth: 0,
+        // A filter callback's predicate belongs to the call it is passed to.
+        filter_depth: u32::from(envs.filter_callbacks.contains(&f.id)),
+        ctes: scope_ctes(ix, f),
+        path: vec![],
         consumed_closures: BTreeSet::new(),
         e: Entity {
             id: f.id.clone(),
@@ -107,6 +233,9 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, env: &Env, f: &ir::Function) ->
             routes: vec![],
             unknowns: vec![],
             call_shapes: vec![],
+            filters: vec![],
+            logs: vec![],
+            access: vec![],
         },
     };
     w.stmts(&f.body, true);
@@ -139,14 +268,25 @@ struct Walker<'a, 'p> {
     ix: &'a Index<'p>,
     cat: &'a Catalog,
     env: &'a Env,
+    envs: &'a Envs,
     /// Nesting depth of conditional/loop/try regions.
     depth: u32,
+    /// Nesting depth inside query-filter arguments: only the outermost filter is recorded.
+    filter_depth: u32,
+    /// CTE names in scope: reading one is not a table read.
+    ctes: BTreeSet<String>,
+    /// Conditions under which the current statement runs: enclosing `if` tests and the
+    /// negations of earlier early exits. Part of every call shape, so a condition added
+    /// around a call is a change, while `if (c) { f() }` and `if (!c) return; f()` agree.
+    /// Top-level guards are marked (`true`): guard facts already compare them.
+    path: Vec<(Pred, bool)>,
     consumed_closures: BTreeSet<String>,
     e: Entity,
 }
 
 impl Walker<'_, '_> {
     fn stmts(&mut self, stmts: &[Stmt], top: bool) {
+        let scope = self.path.len();
         for (i, s) in stmts.iter().enumerate() {
             // At function top level, a trailing `if (c) { … }` (no else, no exit inside)
             // is the same as `if (!c) return; …`: record the guard, walk the body as top level.
@@ -156,12 +296,22 @@ impl Walker<'_, '_> {
                     let requires = self.pred(test);
                     let requires = self.with_domain(requires);
                     self.e.guards.push(GuardFact { requires, on_fail: OnFail::Return, loc: loc.clone() });
+                    self.path.push((self.pred(test), true));
                     self.stmts(then, true);
                     continue;
                 }
             }
             self.stmt(s, top);
+            // After `if (c) return|throw|continue;` the rest of the block runs under ¬c
+            // (after a top-level return/throw, a guard).
+            if let Stmt::If { test, then, otherwise, .. } = s {
+                if otherwise.is_empty() && matches!(then.last(), Some(Stmt::Throw(..) | Stmt::Return(..) | Stmt::Jump(..))) {
+                    let guard = top && !matches!(then.last(), Some(Stmt::Jump(..)));
+                    self.path.push((self.pred(test).negate(), guard));
+                }
+            }
         }
+        self.path.truncate(scope);
     }
 
     fn stmt(&mut self, s: &Stmt, top: bool) {
@@ -199,8 +349,13 @@ impl Walker<'_, '_> {
                     }
                 }
                 self.depth += 1;
+                let cond = self.pred(test);
+                self.path.push((cond.clone(), false));
                 self.stmts(then, false);
+                self.path.pop();
+                self.path.push((cond.negate(), false));
                 self.stmts(otherwise, false);
+                self.path.pop();
                 self.depth -= 1;
             }
             Stmt::Return(e, loc) => {
@@ -210,7 +365,11 @@ impl Walker<'_, '_> {
             }
             Stmt::Throw(e, loc) => {
                 self.e.throws = true;
-                self.expr(e, loc);
+                // The error thrown is part of the guard that throws it, not a call shape.
+                match e {
+                    Expr::New { args, loc: nloc, .. } => args.iter().for_each(|a| self.expr(a, nloc)),
+                    e => self.expr(e, loc),
+                }
             }
             Stmt::Loop { iter, body, loc, .. } => {
                 if let Some(it) = iter {
@@ -228,6 +387,7 @@ impl Walker<'_, '_> {
                 self.stmts(finalizer, false);
             }
             Stmt::Block(b) => self.stmts(b, top),
+            Stmt::Jump(_) => {}
         }
     }
 
@@ -250,7 +410,13 @@ impl Walker<'_, '_> {
                 }
                 self.expr(value, aloc);
             }
-            Expr::New { args, loc: nloc, .. } => args.iter().for_each(|a| self.expr(a, nloc)),
+            Expr::New { callee, args, loc: nloc } => {
+                // `new X(…)` is a call too: `await new Promise((r) => setTimeout(r, 1000))`.
+                let call = ir::Call { callee: callee.as_ref().clone(), args: args.clone(), loc: nloc.clone() };
+                let shape = format!("new {}", self.call_shape(&call));
+                self.e.call_shapes.push(CallShape { shape, target: None, when: self.conditions(false), guards: self.conditions(true), loc: nloc.clone() });
+                args.iter().for_each(|a| self.expr(a, nloc));
+            }
             Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
                 self.expr(left, loc);
                 self.expr(right, loc);
@@ -275,6 +441,10 @@ impl Walker<'_, '_> {
                 // assumed to run on behalf of this entity.
                 if !self.consumed_closures.contains(id) => {
                     self.e.calls.push(CallFact { target: id.clone(), loc: loc.clone(), conditional: true });
+                    // By its name within this entity, so the conditions it is used under count.
+                    let name = id.strip_prefix(&format!("{}.", self.e.id)).unwrap_or(id);
+                    let shape = format!("<fn {name}>");
+                    self.e.call_shapes.push(CallShape { shape, target: Some(id.clone()), when: self.conditions(false), guards: self.conditions(true), loc: loc.clone() });
                 }
             _ => {}
         }
@@ -282,19 +452,47 @@ impl Walker<'_, '_> {
 
     fn call(&mut self, c: &ir::Call) {
         let loc = &c.loc;
+        self.access_args(&c.args, loc);
         let shape = self.call_shape(c);
+        if self.api_name(&c.callee).is_some_and(|api| self.cat.is_log(&api)) {
+            self.e.logs.push(CallShape { shape, target: None, when: self.conditions(false), guards: self.conditions(true), loc: loc.clone() });
+            c.args.iter().for_each(|a| self.expr(a, loc));
+            return;
+        }
         match self.ix.resolve_call(self.env, &c.callee) {
             Callee::Internal(target) => {
-                self.e.call_shapes.push(CallShape { shape, target: Some(target.clone()), loc: loc.clone() });
+                self.e.call_shapes.push(CallShape {
+                    shape,
+                    target: Some(target.clone()),
+                    when: self.conditions(false),
+                    guards: self.conditions(true),
+                    loc: loc.clone(),
+                });
                 self.e.calls.push(CallFact { target, loc: loc.clone(), conditional: self.depth > 0 });
             }
+            Callee::External(api) if self.cat.is_filter(&api) => {
+                if self.filter_depth == 0 {
+                    let expr = self.filter_text(self.env, c);
+                    self.e.filters.push(QueryFilter { expr, loc: loc.clone() });
+                }
+                // The builder chain is walked as usual; nested predicates are part of this one.
+                if let Expr::Member { object, .. } = &c.callee {
+                    self.expr(object, loc);
+                }
+                self.filter_depth += 1;
+                c.args.iter().for_each(|a| self.expr(a, loc));
+                self.filter_depth -= 1;
+                return;
+            }
+            // A literal inside a predicate is part of the predicate's text.
+            Callee::External(api) if self.filter_depth > 0 && self.cat.is_literal(&api) => {}
             Callee::External(api) => {
                 if !self.external_call(&api, c) {
-                    self.e.call_shapes.push(CallShape { shape, target: None, loc: loc.clone() });
+                    self.e.call_shapes.push(CallShape { shape, target: None, when: self.conditions(false), guards: self.conditions(true), loc: loc.clone() });
                 }
             }
             Callee::Unresolved(text) => {
-                self.e.call_shapes.push(CallShape { shape, target: None, loc: loc.clone() });
+                self.e.call_shapes.push(CallShape { shape, target: None, when: self.conditions(false), guards: self.conditions(true), loc: loc.clone() });
                 self.e.unknowns.push(Unknown { question: format!("unresolved call `{text}`"), loc: loc.clone() });
             }
         }
@@ -322,8 +520,10 @@ impl Walker<'_, '_> {
         let arg = |a: &Expr| match (self.ix.const_str(self.env, a), a) {
             (Some(v), _) => format!("{v:?}"),
             (None, Expr::Object(props)) => {
+                // Access keys are covered by access facts.
                 let mut keys: Vec<String> = props
                     .iter()
+                    .filter(|(k, _)| !self.cat.is_access_key(k))
                     .map(|(k, v)| match self.ix.const_str(self.env, v) {
                         Some(v) => format!("{k}={v:?}"),
                         None => k.clone(),
@@ -335,6 +535,31 @@ impl Walker<'_, '_> {
             _ => "_".to_string(),
         };
         format!("{target}({})", c.args.iter().map(arg).collect::<Vec<_>>().join(", "))
+    }
+
+    /// The current path conditions (`guards`: the entity's own guards), rendered for a call shape.
+    fn conditions(&self, guards: bool) -> Vec<String> {
+        let mut conds: Vec<String> = self.path.iter().filter(|(_, g)| *g == guards).map(|(p, _)| p.render()).collect();
+        conds.sort();
+        conds.dedup();
+        conds
+    }
+
+    /// Access requirements in object arguments: `{ auth, permission: Permission.AlbumRead }`.
+    fn access_args(&mut self, args: &[Expr], loc: &Loc) {
+        for a in args {
+            let Expr::Object(props) = a else { continue };
+            for (k, v) in props.iter().filter(|(k, _)| self.cat.is_access_key(k)) {
+                let values: Vec<String> = match v {
+                    Expr::Array(xs) => xs.iter().map(|x| self.ix.const_str(self.env, x).unwrap_or_else(|| "_".into())).collect(),
+                    v => vec![self.ix.const_str(self.env, v).unwrap_or_else(|| "_".into())],
+                };
+                let grant = self.cat.access.grants.contains(k);
+                for value in values {
+                    self.e.access.push(AccessFact { requirement: format!("{k}={value}"), grant, loc: loc.clone() });
+                }
+            }
+        }
     }
 
     /// Canonical name of a decorator or call target, for catalog matching.
@@ -350,6 +575,7 @@ impl Walker<'_, '_> {
     fn decorators(&mut self, f: &ir::Function) {
         let handler = f.id.clone();
         for d in &f.decorators {
+            self.access_args(&d.args, &d.loc);
             let Some(api) = self.api_name(&d.callee) else { continue };
             let site = Site { segments: catalog::split_segments(&api), walker: self, call: d };
             if let Some(rule) = self.cat.route_for(&api, true) {
@@ -394,6 +620,11 @@ impl Walker<'_, '_> {
             let site = Site { segments: catalog::split_segments(api), walker: self, call: c };
             if let Some(rule) = self.cat.effect_for(api) {
                 let target = catalog::eval_spec(&rule.target, &site);
+                // `db.with('x', …).selectFrom('x')` reads a CTE, not a table: the CTE's
+                // own query is recorded where it is defined.
+                if target.as_ref().is_some_and(|t| self.ctes.contains(t)) {
+                    return true;
+                }
                 let method = rule.method.as_ref().and_then(|m| catalog::eval_spec(m, &site));
                 let dynamic = target.is_none();
                 Found::Effect(EffectKey { kind: rule.kind.clone(), target: target.unwrap_or_else(|| "<dynamic>".into()), method }, dynamic)
@@ -444,6 +675,94 @@ impl Walker<'_, '_> {
         };
         self.consumed_closures.insert(id.clone());
         Some(id)
+    }
+
+    // ------------------------------------------------------------ query predicates
+
+    /// Canonical text of a filter call: `col op value`, `(a ∨ b)`, `¬a`, `exists(subquery)`.
+    fn filter_text(&self, env: &Env, c: &ir::Call) -> String {
+        let method = match &c.callee {
+            Expr::Member { property, .. } => property.as_str(),
+            _ => "",
+        };
+        match (method, c.args.as_slice()) {
+            ("and" | "or", [Expr::Array(items)]) => {
+                let sep = if method == "and" { " ∧ " } else { " ∨ " };
+                format!("({})", items.iter().map(|i| self.predicate(env, i)).collect::<Vec<_>>().join(sep))
+            }
+            ("not", [x]) => format!("¬{}", self.predicate(env, x)),
+            ("exists", [x]) => format!("exists({})", self.query_text(env, x).unwrap_or_else(|| self.predicate(env, x))),
+            ("and" | "or", [x]) => format!("{method}({})", self.predicate(env, x)),
+            (_, [x]) => self.predicate(env, x),
+            (_, [l, op, r]) => format!("{} {} {}", self.operand(env, l), self.operand(env, op), self.operand(env, r)),
+            (_, args) => format!("{method}({})", args.iter().map(|x| self.operand(env, x)).collect::<Vec<_>>().join(", ")),
+        }
+    }
+
+    /// A whole predicate: as an operand, but one built dynamically keeps its source
+    /// text (`eb.and(predicates)`), so a reviewer sees what it was.
+    fn predicate(&self, env: &Env, e: &Expr) -> String {
+        if let Expr::Closure(id) = e {
+            return match (returned(self.ix, id), self.envs.by_fn.get(id)) {
+                (Some(r), Some(cenv)) => self.predicate(cenv, r),
+                _ => "`<callback>`".into(),
+            };
+        }
+        match self.operand(env, e) {
+            v if v == "_" => format!("`{}`", render(e)),
+            v => v,
+        }
+    }
+
+    /// A filter operand: a constant, a nested predicate, what a callback returns,
+    /// or a subquery. Anything else is `_`.
+    fn operand(&self, env: &Env, e: &Expr) -> String {
+        if let Some(v) = self.ix.const_str(env, e) {
+            return v;
+        }
+        match e {
+            Expr::Await(x) => self.operand(env, x),
+            Expr::Array(xs) => format!("[{}]", xs.iter().map(|x| self.operand(env, x)).collect::<Vec<_>>().join(", ")),
+            Expr::Closure(id) => match (returned(self.ix, id), self.envs.by_fn.get(id)) {
+                (Some(r), Some(cenv)) => self.operand(cenv, r),
+                _ => "_".into(),
+            },
+            // A predicate kept in a local: `const p = (eb) => eb(…); qb.where(p)`.
+            Expr::Ident(n) => match env.vars.get(n) {
+                Some(Ty::Function(id)) if self.ix.function(id).is_some_and(|f| f.parent.is_some()) => self.operand(env, &Expr::Closure(id.clone())),
+                _ => "_".into(),
+            },
+            // A subquery first: its outermost link may itself be a `where`.
+            Expr::Call(c) => match self.query_text(env, e) {
+                Some(q) => format!("({q})"),
+                None => match self.ix.resolve_call(env, &c.callee) {
+                    Callee::External(api) if self.cat.is_filter(&api) => self.filter_text(env, c),
+                    Callee::External(api) if self.cat.is_literal(&api) => c.args.first().map_or_else(|| "_".into(), |a| self.operand(env, a)),
+                    _ => "_".into(),
+                },
+            },
+            _ => "_".into(),
+        }
+    }
+
+    /// A subquery chain as `table where f1 ∧ f2`, if `e` is one.
+    fn query_text(&self, env: &Env, e: &Expr) -> Option<String> {
+        let mut filters = vec![];
+        let mut cur = e;
+        loop {
+            let Expr::Call(c) = cur else { return None };
+            let Expr::Member { object, .. } = &c.callee else { return None };
+            let Callee::External(api) = self.ix.resolve_call(env, &c.callee) else { return None };
+            if self.cat.effect_for(&api).is_some_and(|r| r.kind == "db_read") {
+                let table = c.args.first().map(|a| self.operand(env, a)).unwrap_or_else(|| "_".into());
+                filters.reverse();
+                return Some(if filters.is_empty() { table } else { format!("{table} where {}", filters.join(" ∧ ")) });
+            }
+            if self.cat.is_filter(&api) {
+                filters.push(self.filter_text(env, c));
+            }
+            cur = object;
+        }
     }
 
     // ------------------------------------------------------------ predicates
@@ -553,6 +872,32 @@ impl CallSite for Site<'_, '_, '_> {
             _ => None,
         }
     }
+}
+
+/// What a closure returns last: the predicate of `(eb) => { …; return eb.and(ps); }`.
+fn returned<'p>(ix: &Index<'p>, id: &str) -> Option<&'p Expr> {
+    ix.function(id)?.body.iter().rev().find_map(|s| match s {
+        Stmt::Return(Some(r), _) => Some(r),
+        _ => None,
+    })
+}
+
+/// Names of the common table expressions (`with('x', …)`) defined in a function or
+/// the functions enclosing it: a CTE is visible from every callback of its query.
+fn scope_ctes(ix: &Index, f: &ir::Function) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut cur = Some(f);
+    while let Some(g) = cur {
+        visit_calls(&g.body, &mut |c| {
+            if let (Expr::Member { property, .. }, Some(Expr::Str(name))) = (&c.callee, c.args.first()) {
+                if property == "with" || property == "withRecursive" {
+                    out.insert(name.split_whitespace().next().unwrap_or(name).to_string());
+                }
+            }
+        });
+        cur = g.parent.as_deref().and_then(|p| ix.function(p));
+    }
+    out
 }
 
 /// `/prefix/path`, with duplicate and trailing slashes removed.

@@ -1,0 +1,950 @@
+{
+ "0628f8b96": {
+  "verdict": "behaviour",
+  "notes": "PersonRepository.reassignFaces now scopes the owner filter to faces on assets owned by the owner instead of faces whose person group the owner has a person in, so merges no longer move other cluster-group users' faces.",
+  "findings": [
+   {
+    "file": "server/src/repositories/person.repository.ts",
+    "entity": "PersonRepository.reassignFaces",
+    "kind": "query_scope",
+    "description": "Owner filter changed from asset_face.personGroupId IN (person groups where person.ownerId = ownerId) — which matched faces of all users sharing that group — to joining asset and requiring asset.ownerId = ownerId.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/person.repository.ts",
+    "entity": "PersonRepository.reassignFaces",
+    "kind": "response",
+    "description": "Return value now uses numUpdatedRows instead of numChangedRows (previously always 0 on Postgres); callers ignore the value, so little external effect.",
+    "confidence": "low"
+   }
+  ]
+ },
+ "1b3aa9cd5": {
+  "verdict": "behaviour",
+  "notes": "Tag creation now rejects names containing '/', and both create and upsert insert the tag and its closure-table rows atomically in a single CTE statement (create previously wrote no closure rows).",
+  "findings": [
+   {
+    "file": "server/src/dtos/tag.dto.ts",
+    "entity": "TagCreateSchema",
+    "kind": "validation_guard",
+    "description": "POST /tags now rejects a name containing '/' (regex ^[^/]*$), matching the update DTO; previously accepted.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/tag.repository.ts",
+    "entity": "TagRepository.create",
+    "kind": "data_written",
+    "description": "Before: inserted only the tag row. After: via insertTagWithClosures also inserts tag_closure rows (self row plus one per ancestor of parentId), so tags created via the API are now in the closure table.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/tag.repository.ts",
+    "entity": "TagRepository.upsertValue",
+    "kind": "control_flow",
+    "description": "Tag upsert and closure inserts now run as a single CTE statement (previously the tag insert ran on this.db outside the transaction used for closure inserts, so it was not atomic); returns all tag columns instead of columns.tag.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "1db4677cf": {
+  "verdict": "behaviour",
+  "notes": "Timeline bucket assets taken in the same second are now sub-sorted by original filename.",
+  "findings": [
+   {
+    "file": "server/src/repositories/asset.repository.ts",
+    "entity": "AssetRepository.getTimeBucket",
+    "kind": "control_flow",
+    "description": "Adds a tie-breaker ORDER BY asset.originalFileName <order> after fileCreatedAt, so assets with equal timestamps now come back in a deterministic order by filename.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "221ddd31c": {
+  "verdict": "refactor",
+  "notes": "Adds import-sorting lint rules; server/src changes are import reordering and switching namespace calls (semver.x, React.createElement, chokidar.watch) to named imports of the same functions. No runtime behaviour change.",
+  "findings": []
+ },
+ "2a6262204": {
+  "verdict": "behaviour",
+  "notes": "Migrates the server to NestJS 12 and ESM. Almost every change is an import rewrite (.js suffixes, lodash to lodash-es named imports, __dirname to import.meta.dirname, dynamic import for migrations). The only runtime changes in server code are new NestFactory route options in the API and maintenance workers.",
+  "findings": [
+   {
+    "file": "server/src/workers/api.ts",
+    "entity": "bootstrap",
+    "kind": "config",
+    "description": "NestFactory.create now passes routeConflictPolicy { duplicate: 'error' } and routeResolutionStrategy 'specificity'. Before, overlapping routes were matched in declaration order and duplicate routes were allowed. After, the most specific route wins and a duplicate route definition fails startup.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/workers/maintenance.ts",
+    "entity": "bootstrap",
+    "kind": "config",
+    "description": "The same NestFactory options are added to the maintenance app: duplicate routes now error, and routes resolve by specificity instead of declaration order.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "2c53b7640": {
+  "verdict": "behaviour",
+  "notes": "Mostly OpenAPI metadata: adds format 'double' to number fields and a spec-generation check that every non-integer number has a format. The rotate-angle schema gains int/min/max checks, but the set of accepted values stays {0,90,180,270}.",
+  "findings": [
+   {
+    "file": "server/src/dtos/editing.dto.ts",
+    "entity": "RotateParametersSchema",
+    "kind": "validation_guard",
+    "description": "angle changed from z.number() to z.int().min(0).max(270) before the existing refine to [0,90,180,270]. The accepted values are unchanged, but invalid inputs now fail with different messages: non-integers get an int error and out-of-range values get a min/max error instead of the 'Angle must be one of...' message.",
+    "confidence": "low"
+   },
+   {
+    "file": "server/src/utils/misc.ts",
+    "entity": "patchOpenAPI",
+    "kind": "config",
+    "description": "OpenAPI spec generation (dev-mode write only) now collects errors and throws if any number property, or number array item, has no format or has format 'float'. Before: it threw only on float, and did not check array items.",
+    "confidence": "low"
+   },
+   {
+    "file": "server/src/validation.ts",
+    "entity": "latitudeSchema",
+    "kind": "response",
+    "description": "latitude/longitude and many number schemas (exif, search, time-bucket DTOs) now carry format 'double' in the served OpenAPI spec (/api/spec.json). Request validation is unchanged.",
+    "confidence": "low"
+   }
+  ]
+ },
+ "2feb889b9": {
+  "verdict": "refactor",
+  "notes": "Bumps zod to 4.4.3 and nestjs-zod to 5.5.0, with schema changes that keep validation the same under the new library. configBool is rewritten with z.stringbool plus .nonoptional(), assetIds gets .nonoptional(), and assetData is made .optional() with an x-immich-required marker. The patchOpenAPI change only affects the OpenAPI file written for the SDK (it runs only when writing the spec), not the served /doc or request handling.",
+  "findings": []
+ },
+ "351be9576": {
+  "verdict": "behaviour",
+  "notes": "Memories view: memory search gains id, isUpcoming and page filters, results are ordered by showAt first, and user preferences get a new memories.sidebarWeb flag (default false).",
+  "findings": [
+   {
+    "file": "server/src/repositories/memory.repository.ts",
+    "entity": "MemoryRepository.searchBuilder",
+    "kind": "query_scope",
+    "description": "New isUpcoming filter: true → only memories with showAt > now; false → showAt IS NULL or showAt <= now. It applies to both search and statistics, which share the builder.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/memory.repository.ts",
+    "entity": "MemoryRepository.search",
+    "kind": "query_scope",
+    "description": "New optional id filter (where id = dto.id) in the memory search query.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/memory.repository.ts",
+    "entity": "MemoryRepository.search",
+    "kind": "control_flow",
+    "description": "Non-random ordering changes from ORDER BY memoryAt <dir> to ORDER BY showAt <dir> NULLS LAST, then memoryAt <dir>.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/memory.repository.ts",
+    "entity": "MemoryRepository.search",
+    "kind": "control_flow",
+    "description": "Pagination added: when both page and size are given, OFFSET (page-1)*size is applied.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/dtos/memory.dto.ts",
+    "entity": "MemorySearchSchema",
+    "kind": "validation_guard",
+    "description": "The memory search query now accepts id (uuidv4), isUpcoming (bool) and page (int >= 1).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/utils/preferences.ts",
+    "entity": "getDefaultPreferences",
+    "kind": "response",
+    "description": "User preferences gain memories.sidebarWeb (default false). It is accepted on update (MemoriesUpdateSchema), stored, and returned in the preferences response.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "351ddff32": {
+  "verdict": "behaviour",
+  "notes": "The integrity untracked-file check now treats paths that differ only in Unicode normalization (NFC/NFD) as the same file, which removes false untracked reports.",
+  "findings": [
+   {
+    "file": "server/src/services/integrity.service.ts",
+    "entity": "IntegrityService.handleUntrackedFiles",
+    "kind": "query_scope",
+    "description": "The asset, asset-file and person-thumbnail path lookups now query each path in its original, NFC and NFD forms (deduplicated), instead of only the raw paths.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/integrity.service.ts",
+    "entity": "IntegrityService.handleUntrackedFiles",
+    "kind": "data_written",
+    "description": "Tracked and on-disk paths are now compared after NFC normalization instead of byte for byte. Files that differ only in normalization are no longer written as UntrackedFile integrity reports.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "399217bf5": {
+  "verdict": "behaviour",
+  "notes": "Face detection now uses a single preview file, preferring the edited preview, instead of failing when an asset has more than one preview (original plus edited).",
+  "findings": [
+   {
+    "file": "server/src/repositories/asset-job.repository.ts",
+    "entity": "AssetJobRepository.getForDetectFacesJob",
+    "kind": "query_scope",
+    "description": "Before: returned all preview asset_file rows as a 'files' array. After: returns one 'previewFile' object, the preview row ordered by isEdited desc with limit 1, so the edited preview is preferred over the original.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.handleDetectFaces",
+    "kind": "validation_guard",
+    "description": "Before: the job returned Failed unless exactly one preview file existed, so edited assets with two previews always failed. After: it fails only when there is no preview file, and detection runs on the edited preview when one exists.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "54e7ffa4e": {
+  "verdict": "behaviour",
+  "notes": "Adds AssetFacesV3 sync request type that streams asset face upserts/deletes for every user in the requester's cluster group (not only own assets). V2 is kept with the same scope; the columns just moved into a shared list.",
+  "findings": [
+   {
+    "file": "server/src/services/sync.service.ts",
+    "entity": "SyncService.stream",
+    "kind": "endpoint",
+    "description": "New SyncRequestType.AssetFacesV3 accepted by the sync stream (added to SYNC_TYPES_ORDER and the handler map) and dispatched to syncAssetFacesV3, which emits AssetFaceV3 upserts and AssetFaceDeleteV1 deletes.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/sync.repository.ts",
+    "entity": "AssetFaceSync.getUpsertsV3",
+    "kind": "query_scope",
+    "description": "New upsert query scoped to faces on assets whose owner.clusterGroupId equals the requesting user's clusterGroupId (inner joins asset and user), instead of V2's asset.ownerId = userId. Other users' faces in the same cluster group are now exposed to the requester.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/sync.repository.ts",
+    "entity": "AssetFaceSync.getDeletesV3",
+    "kind": "query_scope",
+    "description": "New asset_face_audit delete query scoped by the asset owner's clusterGroupId matching the requester's (inner joins), instead of per-owner scoping.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/sync.service.ts",
+    "entity": "SyncService.syncAssetFacesV3",
+    "kind": "response",
+    "description": "New sync handler sends SyncEntityType.AssetFaceV3 items (same payload shape as V2, cluster-scoped) and AssetFaceDeleteV1 items, with their own AssetFaceV3 checkpoint.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "58fb1ed4a": {
+  "verdict": "behaviour",
+  "notes": "Queueing video transcodes without force no longer excludes hidden assets, so hidden live-photo motion parts get transcoded.",
+  "findings": [
+   {
+    "file": "server/src/repositories/asset-job.repository.ts",
+    "entity": "AssetJobRepository.streamForVideoConversion",
+    "kind": "query_scope",
+    "description": "In the non-force branch, removed the filter asset.visibility != 'hidden'. Hidden video assets without an encoded_video file (e.g. live photo motion parts) are now streamed for conversion; before they were skipped.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "64a2fc825": {
+  "verdict": "behaviour",
+  "notes": "Speeds up startup in two ways: the 1s sleep is skipped once the maintenance advisory lock is free, and ImmichAdminModule is imported lazily only in the immich-admin CLI branch.",
+  "findings": [
+   {
+    "file": "server/src/main.ts",
+    "entity": "Workers.waitForFreeLock",
+    "kind": "control_flow",
+    "description": "Before, the loop always waited 1000ms after each lock check, including the check that got the lock. After, it only sleeps when the lock was not acquired, so startup continues immediately once the lock is free.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/main.ts",
+    "entity": "main",
+    "kind": "config",
+    "description": "app.module is no longer imported at the top of the supervisor entrypoint. It is now loaded with a dynamic import only for the 'immich-admin' command, so the supervisor process no longer loads or evaluates the full application module graph. main is now async.",
+    "confidence": "low"
+   }
+  ]
+ },
+ "6b7b0fe3a": {
+  "verdict": "behaviour",
+  "notes": "Tightens the asset permission for adding assets to memories and tags from AssetShare to AssetUpdate, so partner assets are excluded. A migration deletes existing cross-owner memory assets. Albums keep AssetShare.",
+  "findings": [
+   {
+    "file": "server/src/services/memory.service.ts",
+    "entity": "MemoryService.create",
+    "kind": "auth",
+    "description": "Assets given at memory creation are filtered by Permission.AssetUpdate instead of AssetShare, so partner/shared assets are silently dropped.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/memory.service.ts",
+    "entity": "MemoryService.addAssets",
+    "kind": "auth",
+    "description": "Adding assets to a memory now checks Permission.AssetUpdate instead of AssetShare, so assets not owned by the user (e.g. partner assets) are rejected (no_permission).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/tag.service.ts",
+    "entity": "TagService.addAssets",
+    "kind": "auth",
+    "description": "Tagging assets now checks Permission.AssetUpdate instead of AssetShare.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/schema/migrations/1787148183730-DeleteMismatchedMemoryAssets.ts",
+    "entity": "up",
+    "kind": "data_written",
+    "description": "New migration that deletes memory_asset rows whose asset owner differs from the memory owner. It has no down migration.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "72f1034c5": {
+  "verdict": "behaviour",
+  "notes": "The version check job now runs only when the environment is production.",
+  "findings": [
+   {
+    "file": "server/src/services/version.service.ts",
+    "entity": "VersionService.handleVersionCheck",
+    "kind": "validation_guard",
+    "description": "New early exit: returns JobStatus.Skipped unless configRepository.isProduction(). Non-production environments no longer fetch the latest release or emit new-version notifications.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "7abd625af": {
+  "verdict": "cosmetic",
+  "notes": "Updates only the OpenAPI description and example of timeBucket in TimeBucketAssetDto to show the UTC ISO timestamp format. Validation stays z.string().",
+  "findings": []
+ },
+ "7b51c50a9": {
+  "verdict": "behaviour",
+  "notes": "Adds POST /people/merge taking an ordered list of people and rewrites merge logic (first-defined name/birthDate wins, per-owner targets, auto-merge for other cluster-group users); the legacy /people/:id/merge now delegates to it.",
+  "findings": [
+   {
+    "file": "server/src/controllers/person.controller.ts",
+    "entity": "PersonController.mergePeople",
+    "kind": "endpoint",
+    "description": "New endpoint POST /people/merge (PersonMerge permission) accepting {ids} in merge order; POST /people/:id/merge is deprecated and now calls mergePeople with [id, ...ids].",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.mergePeople",
+    "kind": "auth",
+    "description": "Primary/target person is no longer checked with requireAccess(PersonUpdate) (which threw 403); all ids including the first are checked with checkAccess(PersonMerge) and inaccessible ids are silently reported as NO_PERMISSION, with the next accessible person becoming the target.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.mergePeople",
+    "kind": "validation_guard",
+    "description": "Now rejects with 400 when fewer than two ids are supplied or when ids contain duplicates (previously only rejected if the primary id was among the merge ids).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.mergePeople",
+    "kind": "control_flow",
+    "description": "Target per owner is now the first person (in given order) that owner has, instead of the owner's person in the primary group (owners without a person in the primary group were previously skipped). Faces of each later group are reassigned to that owner's target group.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.mergePeople",
+    "kind": "data_written",
+    "description": "Conflict rule changed: before, a merge person with a name/birthDate differing from the primary's was skipped entirely; now the current user's people are always merged, the target keeps its values and only fills missing name/birthDate from merged people; other users' people are skipped only when both target and merged person have a name or both have a birthDate.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.mergePeople",
+    "kind": "error_handling",
+    "description": "Iterates peopleMap[mergeId] for every accessible id; an accessible id with no person rows yields undefined and throws a TypeError (500) instead of being silently skipped as before.",
+    "confidence": "low"
+   }
+  ]
+ },
+ "8b3d6b320": {
+  "verdict": "behaviour",
+  "notes": "Adds a structured search API (filter tree, orderBy, cursor) to the existing metadata/statistics/random/smart search endpoints. Requests that use the new fields go to new V3 service and repository paths with their own scoping, auth and pagination. The flat fields are deprecated; size defaults move into the DTOs with no change in effect.",
+  "findings": [
+   {
+    "file": "server/src/services/search.service.ts",
+    "entity": "SearchService.searchMetadata",
+    "kind": "control_flow",
+    "description": "Before: every request took the legacy flat-field path. After: a request with filter/orderBy/cursor set (isNewShapeRequest) goes to searchMetadataV3. searchStatistics, searchRandom and searchSmart dispatch the same way to their new V3 counterparts.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/search.service.ts",
+    "entity": "SearchService.resolveSearchScopeV3",
+    "kind": "auth",
+    "description": "New scope resolution for V3 searches. A shared-link caller gets a 400 unless every filter branch is album-confined (albumIds any/all). All albumIds in the filter, including those inside or-branches, need AlbumRead access. When the filter is fully album-confined, the owner universe is only [auth.user.id] with no partner lookup; otherwise it is the user plus partners.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/utils/search-filter.ts",
+    "entity": "applyLockedVisibilityPolicy",
+    "kind": "auth",
+    "description": "New policy for V3 filters. Without an elevated session, a filter whose deciding visibility conditions could match Locked gets a 401 (requireElevatedPermission). Otherwise, when no top-level visibility is given, visibility != locked is ANDed into the filter.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/utils/database.ts",
+    "entity": "searchAssetBuilder",
+    "kind": "query_scope",
+    "description": "Ownership scoping now comes from a required server-side scope instead of optional options.userIds. It is omitted when the top-level filter is album-confined, applied per non-album-confined or-branch when some branch is album-confined, and applied globally otherwise. Before, it was applied globally only when userIds was non-empty.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/utils/database.ts",
+    "entity": "searchAssetBuilder",
+    "kind": "query_scope",
+    "description": "Every V3 query (metadata, stats, random, smart) now always adds WHERE (asset.visibility != 'locked' OR asset.ownerId = lockedOwnerId), so other users' locked assets are never returned.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/search.repository.ts",
+    "entity": "SearchRepository.searchSmartV3",
+    "kind": "query_scope",
+    "description": "New smart-search query: a transaction that sets vchordrq.probes, inner-joins smart_search and orders by embedding distance and then asset.id, using the V3 filter and scope. searchSmartV3 in the service returns no nextCursor (pagination not supported yet).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/search.repository.ts",
+    "entity": "SearchRepository.searchRandomV3",
+    "kind": "query_scope",
+    "description": "New random-search query using the V3 filter and scope builder, with ORDER BY random() LIMIT size.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/search.service.ts",
+    "entity": "SearchService.searchMetadataV3",
+    "kind": "response",
+    "description": "V3 metadata search pages by offset from a decoded cursor and returns a base64url nextCursor ({offset}) when more rows exist (the repository now fetches take+1 with an offset). Every search response now has a nextCursor field (null for legacy requests).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/dtos/search.dto.ts",
+    "entity": "withShapeExclusivity",
+    "kind": "validation_guard",
+    "description": "Metadata/random/statistics/smart search DTOs now reject a request that sets any deprecated flat field together with filter/orderBy/cursor. The filter schema is also strict: unknown keys are rejected, and each or-branch must have at least one condition.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/utils/search-cursor.ts",
+    "entity": "decodeSearchCursor",
+    "kind": "validation_guard",
+    "description": "New: a malformed cursor (not base64url JSON {offset:int>=0}) is rejected with 400 'Invalid cursor'.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "91d362eb9": {
+  "verdict": "behaviour",
+  "notes": "Library statistics now exclude soft-deleted (trashed/excluded) assets.",
+  "findings": [
+   {
+    "file": "server/src/repositories/library.repository.ts",
+    "entity": "LibraryRepository.getStatistics",
+    "kind": "query_scope",
+    "description": "Added WHERE asset.deletedAt IS NULL, so photo/video counts and usage exclude deleted assets; a library whose assets are all deleted now falls through to the zero-stats query.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "99fd56114": {
+  "verdict": "behaviour",
+  "notes": "Makes user.oauthId nullable: a migration converts '' to NULL, unlink paths write NULL, and a new AuthUsersV2 sync type exposes the nullable value. V1 sync and the admin DTO still map null to '' for backward compatibility.",
+  "findings": [
+   {
+    "file": "server/src/schema/migrations/1789419229196-ConvertUserOAuthIdEmptyStringToNull.ts",
+    "entity": "up",
+    "kind": "data_written",
+    "description": "Migration drops NOT NULL on user.oauthId, changes its default from '' to NULL and rewrites existing '' values to NULL.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/auth.service.ts",
+    "entity": "AuthService.unlink",
+    "kind": "data_written",
+    "description": "Unlinking OAuth now writes oauthId = null instead of ''.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/auth-admin.service.ts",
+    "entity": "AuthAdminService.unlinkAll",
+    "kind": "data_written",
+    "description": "Admin unlink-all now sets oauthId = null for all users instead of ''.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/schema/tables/user.table.ts",
+    "entity": "UserTable",
+    "kind": "data_written",
+    "description": "New users get oauthId default NULL instead of ''.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/sync.service.ts",
+    "entity": "SyncService.stream",
+    "kind": "endpoint",
+    "description": "New SyncRequestType.AuthUsersV2 accepted and dispatched to syncAuthUsersV2, which emits AuthUserV2 items with oauthId as nullable.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/sync.service.ts",
+    "entity": "SyncService.syncAuthUsersV1",
+    "kind": "response",
+    "description": "AuthUserV1 sync payload now coerces a null oauthId to '' so the V1 shape is preserved after the column became nullable.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/dtos/user.dto.ts",
+    "entity": "mapUserAdmin",
+    "kind": "response",
+    "description": "Admin user response maps a null oauthId to '' (oauthId: entity.oauthId ?? ''), so API output stays a string.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "9abb605b6": {
+  "verdict": "behaviour",
+  "notes": "Handles sync-stream clients that disconnect: writes fail fast when the response is closed, and the stream exits quietly instead of hanging on 'drain' or throwing.",
+  "findings": [
+   {
+    "file": "server/src/services/sync.service.ts",
+    "entity": "send",
+    "kind": "validation_guard",
+    "description": "New early exit: when the response is already destroyed or writableEnded, send throws ClientDisconnectedError instead of writing.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/utils/response.ts",
+    "entity": "waitForDrain",
+    "kind": "error_handling",
+    "description": "Before: send waited on once(response,'drain'), which could hang forever after a disconnect. After: waitForDrain resolves on 'drain', rejects with ClientDisconnectedError on 'close' or when the response is already destroyed, and rejects on 'error'.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/sync.service.ts",
+    "entity": "SyncService.stream",
+    "kind": "error_handling",
+    "description": "stream now wraps streamInternal and catches ClientDisconnectedError: it logs at debug level and returns normally instead of propagating. Other errors are still rethrown.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "9e3d9a777": {
+  "verdict": "refactor",
+  "notes": "The title is about SVG thumbnails, but the only server/src change is that OAuthRepository.getProfilePicture returns the ArrayBuffer directly instead of {data, contentType}. The only caller used only data, so runtime behaviour is unchanged. The other changes are in the Dockerfile, e2e tests and specs.",
+  "findings": []
+ },
+ "9e5dcc598": {
+  "verdict": "behaviour",
+  "notes": "Creating an Album shared link with an empty assetIds array no longer fails validation.",
+  "findings": [
+   {
+    "file": "server/src/dtos/shared-link.dto.ts",
+    "entity": "SharedLinkCreateSchema",
+    "kind": "validation_guard",
+    "description": "For type=ALBUM, the 'assetIds can only be used with type INDIVIDUAL' issue is now raised only when assetIds is non-empty; before, any assetIds array (including []) was rejected.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "a84de0188": {
+  "verdict": "behaviour",
+  "notes": "Fixes person creation during tagged-face metadata extraction. The insert into person included a clusterGroupId key, which person has no column for.",
+  "findings": [
+   {
+    "file": "server/src/services/metadata.service.ts",
+    "entity": "MetadataService.applyTaggedFaces",
+    "kind": "data_written",
+    "description": "personRepository.createAll now gets only {name, ownerId, personGroupId}. Before, each row also carried clusterGroupId, which person has no column for, so the insert of new people from face regions failed. It now succeeds and the follow-up jobs run.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "b26b0cc80": {
+  "verdict": "behaviour",
+  "notes": "Fixes the ON CONFLICT DO UPDATE in upsertExif for audio, video and keyframe rows: it now takes the incoming values instead of assigning the stored row back to itself.",
+  "findings": [
+   {
+    "file": "server/src/repositories/asset.repository.ts",
+    "entity": "AssetRepository.upsertExif",
+    "kind": "data_written",
+    "description": "On conflict, asset_audio, asset_video and asset_keyframe columns were set to their own stored values (a no-op). They are now set from excluded.*, so re-running metadata extraction overwrites stored AV metadata.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/asset.repository.ts",
+    "entity": "AssetRepository.upsertExif",
+    "kind": "data_written",
+    "description": "asset_video.frameCount is now in the conflict update set (excluded.frameCount). Before, it was never updated after the first insert.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "c0a914602": {
+  "verdict": "behaviour",
+  "notes": "Image resizing/cropping is moved to a separate transform step that resamples in linear light (scRGB) on already-decoded bitmaps, changing the pixels of generated thumbnails, previews, face thumbnails and thumbhashes.",
+  "findings": [
+   {
+    "file": "server/src/repositories/media.repository.ts",
+    "entity": "MediaRepository.generateThumbnail",
+    "kind": "data_written",
+    "description": "Before: built a sharp pipeline over the raw buffer (colourspace/ICC conversion, edits, resize in the pipeline colourspace). After: edits and resize are applied to the decoded bitmap in linear scRGB via transform(), and the result is only re-tagged with the ICC profile, so written thumbnail/preview/fullsize/face/profile image pixels differ.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/media.repository.ts",
+    "entity": "MediaRepository.decodeImage",
+    "kind": "control_flow",
+    "description": "decodeImage no longer resizes or applies edits inside the decoding pipeline; it decodes at full size and then resizes via transform() in linear light (edits option removed from decode).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/media.repository.ts",
+    "entity": "MediaRepository.generateThumbhash",
+    "kind": "data_written",
+    "description": "Thumbhash is now computed from a bitmap downscaled to 100px in linear scRGB (without the ICC colourspace conversion pipeline previously applied), so stored asset.thumbhash values change.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/media.service.ts",
+    "entity": "MediaService.generateVideoThumbnails",
+    "kind": "control_flow",
+    "description": "Video thumbhash is now generated by first decoding the preview file with decodeImage (honouring IMMICH_PROCESS_INVALID_IMAGES) and then hashing the bitmap, instead of passing the file path to generateThumbhash.",
+    "confidence": "low"
+   },
+   {
+    "file": "server/src/utils/profile-image.ts",
+    "entity": "generateProfileImage",
+    "kind": "control_flow",
+    "description": "Profile images are now decoded with decodeImage (failOn error) before generateThumbnail, rather than generateThumbnail reading the encoded input directly.",
+    "confidence": "low"
+   }
+  ]
+ },
+ "c1f2756f6": {
+  "verdict": "behaviour",
+  "notes": "The integrity service no longer deletes files flagged as untracked if an asset, asset_file or person thumbnail now references that path. Untracked reports for paths that are now tracked are treated as out of date.",
+  "findings": [
+   {
+    "file": "server/src/repositories/integrity.repository.ts",
+    "entity": "IntegrityRepository.getTrackedPaths",
+    "kind": "query_scope",
+    "description": "New query returns which of the given paths appear in asset.originalPath, asset_file.path or person.thumbnailPath (UNION).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/integrity.service.ts",
+    "entity": "IntegrityService.deleteIntegrityReport",
+    "kind": "side_effect",
+    "description": "For untracked-file reports, the file is unlinked only if getTrackedPaths finds no reference to it; the report row is still deleted either way. Before, it was always unlinked.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/integrity.service.ts",
+    "entity": "IntegrityService.handleUntrackedRefresh",
+    "kind": "control_flow",
+    "description": "Report paths that are now referenced by an asset/asset_file/person are treated as stale (the reportId is returned for removal) without the filesystem stat check.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/integrity.service.ts",
+    "entity": "IntegrityService.handleDeleteIntegrityReports",
+    "kind": "side_effect",
+    "description": "Bulk delete of path-based (untracked) reports now skips unlinking paths that are currently tracked; the reports are still deleted.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "c7d24321b": {
+  "verdict": "behaviour",
+  "notes": "Adds POST /cluster-groups/:id/regenerate-people which queues a forced facial-recognition run scoped to the users of a cluster group; repository methods gain clusterGroupId scoping and the 'people without faces' query is fixed to include people with no faces.",
+  "findings": [
+   {
+    "file": "server/src/controllers/cluster-group.controller.ts",
+    "entity": "ClusterGroupController.clusterGroupRegeneratePeople",
+    "kind": "endpoint",
+    "description": "New endpoint POST /cluster-groups/:id/regenerate-people (204), requiring the ClusterGroupRead permission.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/cluster-group.service.ts",
+    "entity": "ClusterGroupService.regeneratePeople",
+    "kind": "auth",
+    "description": "Any user with ClusterGroupRead access to the group (not an admin-only/write permission) can trigger a forced facial recognition re-run that unassigns ML faces of all users in the group.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/cluster-group.service.ts",
+    "entity": "ClusterGroupService.regeneratePeople",
+    "kind": "side_effect",
+    "description": "Queues a FacialRecognitionQueueAll job with {clusterGroupId: id, force: true}.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/person.repository.ts",
+    "entity": "PersonRepository.unassignFaces",
+    "kind": "query_scope",
+    "description": "UPDATE asset_face now joins asset (FROM asset WHERE asset_face.assetId = asset.id) and, when clusterGroupId is given, only unassigns faces on assets whose owner's user.clusterGroupId matches (previously all faces of the source type).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/person.repository.ts",
+    "entity": "PersonRepository.getAllFaces",
+    "kind": "query_scope",
+    "description": "New optional clusterGroupId filter joins asset and user and restricts faces to assets owned by users in that cluster group.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.handleQueueRecognizeFaces",
+    "kind": "control_flow",
+    "description": "Job accepts clusterGroupId: forced runs unassign and requeue only that group's faces and, when scoped, only MachineLearning-sourced faces (previously a forced run requeued all faces regardless of source); non-forced runs are also scoped when clusterGroupId is set. handlePersonCleanup and vacuum still run globally.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/person.repository.ts",
+    "entity": "PersonRepository.getAllWithoutFaces",
+    "kind": "query_scope",
+    "description": "Filter changed from asset_face.isVisible IS TRUE to (isVisible IS NULL OR isVisible = true); with the LEFT JOIN, people that have no face rows at all are now returned (and thus deleted by person cleanup) where previously they were excluded.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "d6d094738": {
+  "verdict": "behaviour",
+  "notes": "Adds a 'birthday' memory type: the nightly memory-generation job now also creates birthday memories per person (assets of that person on past birthdays), with new person/asset queries and DTO validation for the new type.",
+  "findings": [
+   {
+    "file": "server/src/services/memory.service.ts",
+    "entity": "MemoryService.onMemoriesCreate",
+    "kind": "side_effect",
+    "description": "For each user and target day the job now runs createBirthdayMemories in addition to createOnThisDayMemories (both awaited in parallel inside the same try/catch), so a failure in either now aborts memory creation for that day.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/memory.service.ts",
+    "entity": "MemoryService.createBirthdayMemories",
+    "kind": "data_written",
+    "description": "New: inserts memory rows of type 'birthday' with data {personId, personName, year: birthYear}, memoryAt=start of target day, showAt=target-3 days, hideAt=end of target day, linked to the selected assets; skipped when a person has no matching assets.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/person.repository.ts",
+    "entity": "PersonRepository.forBirthdayMemories",
+    "kind": "query_scope",
+    "description": "New query selecting the owner's people that are not hidden, have a non-empty name and a birthDate whose month/day equals the target date (also Feb 29 when target is Feb 28 of a non-leap year) and whose birth year is before the target year.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/memory.repository.ts",
+    "entity": "MemoryRepository.getPersonBirthdayYears",
+    "kind": "query_scope",
+    "description": "New query: distinct years in which the owner's timeline-visible, non-deleted assets with a visible non-deleted face of the person group (and a preview file) were taken on the person's birthday, from birth date up to (excluding) the target date.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/memory.repository.ts",
+    "entity": "MemoryRepository.getPersonAssetsByDate",
+    "kind": "query_scope",
+    "description": "New query returning up to `limit` of the owner's timeline, non-deleted assets containing the person on a given local date, newest first.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/memory.service.ts",
+    "entity": "MemoryService.getBirthdayAssets",
+    "kind": "control_flow",
+    "description": "New selection algorithm: up to 5 assets per birthday year capped at 25 assets total; if more than 25 years have assets, 25 years are chosen at random (shuffle) with 1 asset each.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/dtos/memory.dto.ts",
+    "entity": "MemoryCreateSchema",
+    "kind": "validation_guard",
+    "description": "POST memory now accepts type 'birthday' and data.personId (uuid) / data.personName; a birthday memory without personId or personName is rejected with a validation error (previously only on_this_day with {year} existed).",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/dtos/memory.dto.ts",
+    "entity": "MemoryResponseSchema",
+    "kind": "response",
+    "description": "Memory response data now may include personId and personName (schema renamed OnThisDayDto → MemoryDataDto) and type may be 'birthday'.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "da8131d5c": {
+  "verdict": "cosmetic",
+  "notes": "The server change only rewords the descriptions of the startDate/endDate fields in AlbumResponseSchema (OpenAPI docs). The real fix is in web date formatting.",
+  "findings": []
+ },
+ "db6a5b0d5": {
+  "verdict": "behaviour",
+  "notes": "Clears the user's shouldChangePassword flag when they change their password.",
+  "findings": [
+   {
+    "file": "server/src/services/auth.service.ts",
+    "entity": "AuthService.changePassword",
+    "kind": "data_written",
+    "description": "The user update now writes shouldChangePassword: false along with the new password hash. Before, only the password was written and the flag stayed as it was.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "dc3d6eeec": {
+  "verdict": "behaviour",
+  "notes": "Stops pg_dump from lingering and holding table locks after a failed backup. Destroying a spawned duplex stream now kills its child process, and the backup error path explicitly destroys the pg_dump and gzip streams.",
+  "findings": [
+   {
+    "file": "server/src/repositories/process.repository.ts",
+    "entity": "ProcessRepository.spawnDuplexStream",
+    "kind": "side_effect",
+    "description": "The duplex gets a destroy() handler. Before, destroying the stream (for example when pipeline() tears it down on failure) left the child process running. After, the child is killed with process.kill() if it has not already exited or been signalled.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/database-backup.service.ts",
+    "entity": "DatabaseBackupService.createDatabaseBackup",
+    "kind": "error_handling",
+    "description": "The pgdump and gzip streams are now kept outside the try block. On any backup failure they are destroyed, which kills the pg_dump and gzip processes. This includes failures such as createWriteStream throwing before pipeline() takes ownership. Before, pg_dump could keep running and hold AccessShareLocks.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "e039168e4": {
+  "verdict": "behaviour",
+  "notes": "Adds a whole-database VACUUM ANALYZE after migrations when any ran, makes the vacuum after a vector reindex fire-and-forget, and swaps PersonRepository.vacuum for per-table vacuum plus REINDEX CONCURRENTLY in the face queue jobs.",
+  "findings": [
+   {
+    "file": "server/src/services/database.service.ts",
+    "entity": "DatabaseService.onBootstrap",
+    "kind": "side_effect",
+    "description": "After runMigrations, if one or more migrations ran (runMigrations now returns the count), the server now runs VACUUM ANALYZE on the whole database during bootstrap. Before: no vacuum after migrations.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/database.service.ts",
+    "entity": "DatabaseService.onBootstrap",
+    "kind": "control_flow",
+    "description": "The schema drift check, post-migration vacuum and CLIP/face index prewarm now run concurrently in one Promise.all. Before: the drift check ran to completion first, then prewarm ran.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/repositories/database.repository.ts",
+    "entity": "DatabaseRepository.reindexVectors",
+    "kind": "control_flow",
+    "description": "After reindexing a vector table, the table vacuum is no longer awaited; it is fire-and-forget (void ... .catch logs a warning). It is also plain VACUUM instead of VACUUM ANALYZE. Before: an awaited VACUUM ANALYZE <table>, with errors caught and logged.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.handleQueueDetectFaces",
+    "kind": "side_effect",
+    "description": "On force, maintenance changed from one VACUUM ANALYZE asset_face, face_search, person followed by blocking REINDEX TABLE on each, to a parallel VACUUM ANALYZE per table, each followed by REINDEX TABLE CONCURRENTLY. Vacuum failures are now caught and logged (DatabaseRepository.vacuum) instead of failing the job.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.handleQueueRecognizeFaces",
+    "kind": "side_effect",
+    "description": "On force, only asset_face and person are vacuumed and then reindexed concurrently. Before: VACUUM ANALYZE also covered face_search (only the face_search reindex was skipped) and REINDEX was not concurrent. Vacuum errors are now swallowed and logged.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "e35aa718d": {
+  "verdict": "behaviour",
+  "notes": "In PersonService.reassignFaces, faces the user lacks PersonCreate access to are now skipped instead of failing the whole request.",
+  "findings": [
+   {
+    "file": "server/src/services/person.service.ts",
+    "entity": "PersonService.reassignFaces",
+    "kind": "auth",
+    "description": "Per-face access check changed from requireAccess (throws 403 and aborts, leaving earlier faces already reassigned) to checkAccess with silent skip of faces the user cannot access (e.g. faces of other cluster-group users).",
+    "confidence": "high"
+   }
+  ]
+ },
+ "e598e1089": {
+  "verdict": "behaviour",
+  "notes": "Attaches an error listener to every accepted HTTP socket so socket errors such as ECONNRESET are logged at debug level instead of crashing the process.",
+  "findings": [
+   {
+    "file": "server/src/app.common.ts",
+    "entity": "configureExpress",
+    "kind": "error_handling",
+    "description": "server.on('connection') now registers socket.on('error') on each socket and logs at debug. Unhandled socket errors, which could crash the process before, are now swallowed.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "e66f2c761": {
+  "verdict": "refactor",
+  "notes": "eslint-plugin-unicorn v75 upgrade; server changes invert if-blocks into early return/continue guards (prefer-early-return / prefer-continue) and add/remove eslint-disable comments. Every inverted condition is logically equivalent and the guarded block was the last statement, so runtime behaviour is unchanged.",
+  "findings": []
+ },
+ "ef9718e93": {
+  "verdict": "behaviour",
+  "notes": "Feature-face lookup now ignores soft-deleted faces.",
+  "findings": [
+   {
+    "file": "server/src/repositories/person.repository.ts",
+    "entity": "PersonRepository.getForFeatureFaceUpdate",
+    "kind": "query_scope",
+    "description": "Added WHERE asset_face.deletedAt IS NULL, so soft-deleted faces are no longer candidates for the person feature face.",
+    "confidence": "high"
+   }
+  ]
+ },
+ "f346fe1f9": {
+  "verdict": "behaviour",
+  "notes": "Merges request-error handling into a new onRouteError helper that decides whether an error response may still be written. It also moves response headers to res.header(). Most of the changes to sendFile and the interceptor only restructure code or change logging.",
+  "findings": [
+   {
+    "file": "server/src/middleware/global-exception.filter.ts",
+    "entity": "GlobalExceptionFilter.handleError",
+    "kind": "error_handling",
+    "description": "Before, an error response was written whenever headers were not yet sent. After, nothing is written if the error has code ECONNABORTED or the request was aborted (destroyed and not complete), and this now applies to HttpExceptions too.",
+    "confidence": "high"
+   },
+   {
+    "file": "server/src/middleware/global-exception.filter.ts",
+    "entity": "GlobalExceptionFilter.handleError",
+    "kind": "response",
+    "description": "Error responses now set 'Content-Type: application/json' explicitly together with the correlation-id header. For JSON bodies this is effectively the same as before, because res.json already set it.",
+    "confidence": "low"
+   },
+   {
+    "file": "server/src/controllers/sync.controller.ts",
+    "entity": "SyncController.getSyncStream",
+    "kind": "error_handling",
+    "description": "The catch block no longer calls res.setHeader('Content-Type', 'application/json') before handleError. Before, a stream failure after headers were sent made setHeader throw ERR_HTTP_HEADERS_SENT inside the catch, so the error escaped the handler. After, handleError gets it and skips writing because headers were already sent. The Content-Type is still set in handleError when a write is possible.",
+    "confidence": "low"
+   },
+   {
+    "file": "server/src/controllers/integrity-admin.controller.ts",
+    "entity": "IntegrityAdminController.getIntegrityReportCsv",
+    "kind": "response",
+    "description": "Headers moved from raw res.setHeader to Express 5 res.header(). Express normalises Content-Type through mime.contentType, so the header likely changes from 'text/csv' to 'text/csv; charset=utf-8'.",
+    "confidence": "low"
+   }
+  ]
+ },
+ "fbd5dc2c6": {
+  "verdict": "cosmetic",
+  "notes": "Changes only logger calls in the ML and OAuth repositories so the full error object is logged instead of just its message. Thrown errors and control flow are unchanged.",
+  "findings": []
+ }
+}

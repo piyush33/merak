@@ -8,7 +8,7 @@ pub mod render;
 
 use merak_behaviour::infer;
 use merak_behaviour::pred::{render_set, Pred};
-use merak_behaviour::{CallShape, EffectInfo, EffectKey, Model, Origin};
+use merak_behaviour::{AccessFact, CallShape, EffectInfo, EffectKey, Model, Origin, QueryFilter};
 use merak_ir::Loc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -290,9 +290,18 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
     }
 
     // ------------------------------------------------------------ behaviour: per changed entity
+    let (kids_a, kids_b) = (closures_by_parent(a), closures_by_parent(b));
     for (ida, idb) in &m.forward {
         let (ea, eb) = (&a.entities[ida], &b.entities[idb]);
-        if ea.body_hash == eb.body_hash {
+        // Query filters belong to the top-level entity, closures included: a new
+        // `$if(c, (qb) => qb.where(…))` narrows the method's query, and closure ids
+        // shift when a sibling closure is inserted.
+        let (fa, fb) = match ea.parent {
+            None => (scoped_filters(a, &kids_a, ida), scoped_filters(b, &kids_b, idb)),
+            Some(_) => (vec![], vec![]),
+        };
+        // Decorators are not in the body hash: `@Authenticated({ public: true })` alone is a change.
+        if ea.body_hash == eb.body_hash && same_filters(&fa, &fb) && own_access(ea) == own_access(eb) {
             continue;
         }
         changed += 1;
@@ -423,8 +432,72 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
             );
         }
 
+        query_filters(&mut out, idb, &fa, &fb);
+        access_change(&mut out, idb, &sa.access, &sb.access);
+
         for op in &mut out.ops[start..] {
             op.affects = affects.clone();
+        }
+    }
+
+    // ------------------------------------------------------------ behaviour: new code
+    // An added entity is described by what it does, not only that it exists, unless it
+    // was extracted: every caller existed before and behaves as it did.
+    let changed_behaviour: BTreeSet<&str> = out.ops.iter().filter(|o| o.layer != Layer::Structural).map(|o| o.subject.as_str()).collect();
+    let mut callers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for e in b.entities.values() {
+        for c in &e.calls {
+            callers.entry(c.target.as_str()).or_default().push(e.id.as_str());
+        }
+    }
+    let mut described = vec![];
+    for (id, e) in &b.entities {
+        if m.backward.contains_key(id) || e.parent.is_some() || e.kind == merak_behaviour::EntityKind::Constructor {
+            continue;
+        }
+        let cs = callers.get(id.as_str()).map(Vec::as_slice).unwrap_or_default();
+        if !cs.is_empty() && cs.iter().all(|c| m.backward.contains_key(*c) && !changed_behaviour.contains(c)) {
+            continue;
+        }
+        if let Some(summary) = describe(b, &kids_b, id) {
+            described.push((id.clone(), summary, e.loc.clone(), b.entry_points_reaching(id)));
+        }
+    }
+    for (id, summary, loc, affects) in described {
+        out.push("BEHAVIOUR_ADDED", Layer::Behaviour, id, None, Some(summary), vec![], vec![loc]).affects = affects;
+    }
+
+    // ------------------------------------------------------------ behaviour: validation schemas
+    for (key, sb) in &b.schemas {
+        let (module, name) = key.split_once("::").unwrap_or(("", key));
+        let old = a.schemas.iter().find(|(k, _)| k.split_once("::").is_some_and(|(ma, na)| na == name && m.module_to_after(ma) == module));
+        let Some((_, sa)) = old else { continue };
+        // `*` is the schema as a whole (refinements, strictness): SCHEMA_CHANGED.
+        let subject = |f: &str| if f == "*" { key.clone() } else { format!("{key}.{f}") };
+        let kind = |f: &str, field_kind: &'static str| if f == "*" { "SCHEMA_CHANGED" } else { field_kind };
+        for (f, cb) in &sb.fields {
+            match sa.fields.get(f) {
+                None => {
+                    out.push(kind(f, "SCHEMA_FIELD_ADDED"), Layer::Behaviour, subject(f), None, Some(cb.clone()), vec![], vec![sb.loc.clone()]);
+                }
+                Some(ca) if ca != cb => {
+                    out.push(
+                        kind(f, "SCHEMA_FIELD_CHANGED"),
+                        Layer::Behaviour,
+                        subject(f),
+                        Some(ca.clone()),
+                        Some(cb.clone()),
+                        vec![sa.loc.clone()],
+                        vec![sb.loc.clone()],
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        for (f, ca) in &sa.fields {
+            if !sb.fields.contains_key(f) {
+                out.push(kind(f, "SCHEMA_FIELD_REMOVED"), Layer::Behaviour, subject(f), Some(ca.clone()), None, vec![sa.loc.clone()], vec![]);
+            }
         }
     }
 
@@ -544,11 +617,12 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         // Calls into helpers that exist on one side only (extracted or inlined) count as their bodies.
         let sa = inline_shapes(a, ida, &|t| m.forward.contains_key(t));
         let sb = inline_shapes(b, idb, &|t| m.backward.contains_key(t));
+        let (sa, sb): (Vec<&CallShape>, Vec<&CallShape>) = (sa.iter().collect(), sb.iter().collect());
         let (gone, new) = multiset_diff(&sa, &sb);
         if gone.is_empty() && new.is_empty() {
             continue;
         }
-        let show = |xs: &[&CallShape]| (!xs.is_empty()).then(|| xs.iter().map(|c| c.shape.as_str()).collect::<Vec<_>>().join("; "));
+        let show = |xs: &[&CallShape]| (!xs.is_empty()).then(|| xs.iter().map(|c| c.key()).collect::<Vec<_>>().join("; "));
         let evidence = |xs: &[&CallShape]| {
             let mut locs: Vec<Loc> = xs.iter().map(|c| c.loc.clone()).collect();
             locs.dedup();
@@ -563,9 +637,26 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         op.note = Some("calls changed in a way the behaviour model does not classify; review manually".into());
     }
 
+    // ------------------------------------------------------------ logging
+    for (ida, idb) in &m.forward {
+        let (ea, eb) = (&a.entities[ida], &b.entities[idb]);
+        if ea.body_hash == eb.body_hash {
+            continue;
+        }
+        let (la, lb): (Vec<&CallShape>, Vec<&CallShape>) = (ea.logs.iter().collect(), eb.logs.iter().collect());
+        let (gone, new) = multiset_diff(&la, &lb);
+        if gone.is_empty() && new.is_empty() {
+            continue;
+        }
+        let show = |xs: &[&CallShape]| (!xs.is_empty()).then(|| xs.iter().map(|c| c.key()).collect::<Vec<_>>().join("; "));
+        let locs = |xs: &[&CallShape]| xs.iter().map(|c| c.loc.clone()).collect();
+        out.push("LOGGING_CHANGED", Layer::Structural, idb.clone(), show(&gone), show(&new), locs(&gone), locs(&new));
+    }
+
     // ------------------------------------------------------------ pure refactor
+    // Changed logging is not behaviour, but it is not a refactor either.
     let structural_change = !out.ops.is_empty() || changed > 0;
-    if structural_change && out.ops.iter().all(|o| o.layer == Layer::Structural) {
+    if structural_change && out.ops.iter().all(|o| o.layer == Layer::Structural && o.kind != "LOGGING_CHANGED") {
         out.push("PURE_REFACTOR", Layer::Structural, "*", None, Some(format!("{changed} entities changed; behaviour summaries unchanged")), vec![], vec![]);
     }
 
@@ -615,32 +706,163 @@ fn auth_change(out: &mut Builder, subject: &str, pa: &Pred, pb: &Pred, la: &Loc,
     out.push(kind, Layer::Behaviour, subject, Some(pa.render()), Some(pb.render()), vec![la.clone()], vec![lb.clone()]);
 }
 
+/// What an entity does, in one line: effects reached, access required, query filters
+/// (closures included), guards, validations and fields written. `None` when it does none of these.
+fn describe(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Option<String> {
+    const MAX: usize = 8;
+    let s = model.summaries.get(id)?;
+    let list = |label: &str, items: Vec<String>| -> Option<String> {
+        let mut items = items;
+        items.dedup();
+        if items.is_empty() {
+            return None;
+        }
+        let more = items.len().saturating_sub(MAX);
+        items.truncate(MAX);
+        Some(format!("{label}: {}{}", items.join(", "), if more > 0 { format!(", +{more} more") } else { String::new() }))
+    };
+    let mut filters: Vec<String> = scoped_filters(model, kids, id).iter().map(|f| f.expr.clone()).collect();
+    filters.sort();
+    let effects: Vec<&EffectKey> = model.effects_outside_checks(id).into_iter().map(|(k, _)| k).collect();
+    let parts: Vec<String> = [
+        list("effects", effects.iter().map(|k| k.render()).collect()),
+        list("requires", s.access.keys().cloned().collect()),
+        list("filters", filters),
+        list("guards", s.requires.iter().map(|(_, p, _)| p.render()).collect()),
+        list("validates", s.validations.keys().map(|v| short(v).to_string()).collect()),
+        list("writes", s.writes.iter().cloned().collect()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+fn own_access(e: &merak_behaviour::Entity) -> BTreeSet<&str> {
+    e.access.iter().map(|x| x.requirement.as_str()).collect()
+}
+
+fn closures_by_parent(model: &Model) -> BTreeMap<&str, Vec<&str>> {
+    let mut out: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for e in model.entities.values() {
+        if let Some(p) = &e.parent {
+            out.entry(p.as_str()).or_default().push(e.id.as_str());
+        }
+    }
+    out
+}
+
+/// Filters of `id` and of every closure nested in it.
+fn scoped_filters<'x>(model: &'x Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<&'x QueryFilter> {
+    let mut out = vec![];
+    let mut stack = vec![id];
+    while let Some(cur) = stack.pop() {
+        out.extend(model.entities.get(cur).into_iter().flat_map(|e| &e.filters));
+        stack.extend(kids.get(cur).into_iter().flatten());
+    }
+    out
+}
+
+fn same_filters(a: &[&QueryFilter], b: &[&QueryFilter]) -> bool {
+    fn sorted<'x>(xs: &[&'x QueryFilter]) -> Vec<&'x str> {
+        let mut v: Vec<&str> = xs.iter().map(|f| f.expr.as_str()).collect();
+        v.sort_unstable();
+        v
+    }
+    sorted(a) == sorted(b)
+}
+
+/// Access requirements reached before and after. Dropping a requirement or adding
+/// a grant widens access; the reverse narrows it.
+fn access_change(out: &mut Builder, subject: &str, a: &BTreeMap<String, AccessFact>, b: &BTreeMap<String, AccessFact>) {
+    if a.keys().eq(b.keys()) {
+        return;
+    }
+    let gone: Vec<&AccessFact> = a.iter().filter(|(k, _)| !b.contains_key(*k)).map(|(_, f)| f).collect();
+    let new: Vec<&AccessFact> = b.iter().filter(|(k, _)| !a.contains_key(*k)).map(|(_, f)| f).collect();
+    let widens = gone.iter().any(|f| !f.grant) || new.iter().any(|f| f.grant);
+    let narrows = new.iter().any(|f| !f.grant) || gone.iter().any(|f| f.grant);
+    let kind = match (widens, narrows) {
+        (true, false) => "AUTH_WIDENED",
+        (false, true) => "AUTH_NARROWED",
+        _ => "AUTH_CHANGED",
+    };
+    let show = |fs: &[&AccessFact]| (!fs.is_empty()).then(|| fs.iter().map(|f| f.requirement.as_str()).collect::<Vec<_>>().join(", "));
+    let locs = |fs: &[&AccessFact]| fs.iter().map(|f| f.loc.clone()).collect();
+    out.push(kind, Layer::Behaviour, subject, show(&gone), show(&new), locs(&gone), locs(&new));
+}
+
+/// Query predicates that appeared or disappeared in one entity. A removed filter
+/// widens the rows a query reaches; one replaced on the same column changed it.
+fn query_filters(out: &mut Builder, subject: &str, fa: &[&QueryFilter], fb: &[&QueryFilter]) {
+    let mut gone: Vec<&QueryFilter> = fa.to_vec();
+    let mut new = vec![];
+    for &f in fb {
+        match gone.iter().position(|g| g.expr == f.expr) {
+            Some(i) => {
+                gone.remove(i);
+            }
+            None => new.push(f),
+        }
+    }
+    // The column a comparison constrains: `asset.ownerId = _` → `asset.ownerId`.
+    let column = |f: &QueryFilter| f.expr.split(' ').next().unwrap_or("").to_string();
+    let mut pairs = vec![];
+    gone.retain(|g| match new.iter().position(|n| column(n) == column(g)) {
+        Some(i) => {
+            pairs.push((*g, new.remove(i)));
+            false
+        }
+        None => true,
+    });
+    if let ([g], [n]) = (gone.as_slice(), new.as_slice()) {
+        pairs.push((*g, *n));
+        (gone, new) = (vec![], vec![]);
+    }
+    for (g, n) in pairs {
+        out.push("QUERY_FILTER_CHANGED", Layer::Behaviour, subject, Some(g.expr.clone()), Some(n.expr.clone()), vec![g.loc.clone()], vec![n.loc.clone()]);
+    }
+    for g in gone {
+        out.push("QUERY_FILTER_REMOVED", Layer::Behaviour, subject, Some(g.expr.clone()), None, vec![g.loc.clone()], vec![]).note =
+            Some("the query no longer applies this predicate: it can reach more rows".into());
+    }
+    for n in new {
+        out.push("QUERY_FILTER_ADDED", Layer::Behaviour, subject, None, Some(n.expr.clone()), vec![], vec![n.loc.clone()]).note =
+            Some("the query now applies this predicate: it reaches fewer rows".into());
+    }
+}
+
 /// Call shapes of `id`, with calls to entities absent from the other version
-/// (`matched` is false) replaced by those entities' own shapes.
-fn inline_shapes<'x>(model: &'x Model, id: &str, matched: &dyn Fn(&str) -> bool) -> Vec<&'x CallShape> {
-    fn walk<'x>(model: &'x Model, id: &str, matched: &dyn Fn(&str) -> bool, seen: &mut BTreeSet<String>, out: &mut Vec<&'x CallShape>) {
+/// (`matched` is false) replaced by those entities' own shapes, under the
+/// conditions of the call site as well as their own.
+fn inline_shapes(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> Vec<CallShape> {
+    /// `inlined`: `id` is a helper seen from its caller, so its own guards are conditions too.
+    fn walk(model: &Model, id: &str, outer: &[String], inlined: bool, matched: &dyn Fn(&str) -> bool, seen: &mut BTreeSet<String>, out: &mut Vec<CallShape>) {
         let Some(e) = model.entities.get(id) else { return };
         for c in &e.call_shapes {
+            let mut when: Vec<String> = c.when.iter().chain(outer).chain(c.guards.iter().filter(|_| inlined)).cloned().collect();
+            when.sort();
+            when.dedup();
             match &c.target {
-                Some(t) if !matched(t) && model.entities.contains_key(t) && seen.insert(t.clone()) => walk(model, t, matched, seen, out),
-                _ => out.push(c),
+                Some(t) if !matched(t) && model.entities.contains_key(t) && seen.insert(t.clone()) => walk(model, t, &when, true, matched, seen, out),
+                _ => out.push(CallShape { when, ..c.clone() }),
             }
         }
     }
     let mut out = vec![];
-    walk(model, id, matched, &mut BTreeSet::from([id.to_string()]), &mut out);
+    walk(model, id, &[], false, matched, &mut BTreeSet::from([id.to_string()]), &mut out);
     out
 }
 
 /// Items only in `a`, and only in `b`, comparing shapes as multisets (locations ignored).
 fn multiset_diff<'x>(a: &[&'x CallShape], b: &[&'x CallShape]) -> (Vec<&'x CallShape>, Vec<&'x CallShape>) {
-    let mut left: BTreeMap<&str, Vec<&CallShape>> = BTreeMap::new();
+    let mut left: BTreeMap<String, Vec<&CallShape>> = BTreeMap::new();
     for x in a {
-        left.entry(x.shape.as_str()).or_default().push(x);
+        left.entry(x.key()).or_default().push(x);
     }
     let mut only_b = vec![];
     for y in b {
-        if left.get_mut(y.shape.as_str()).and_then(|v| v.pop()).is_none() {
+        if left.get_mut(&y.key()).and_then(|v| v.pop()).is_none() {
             only_b.push(*y);
         }
     }

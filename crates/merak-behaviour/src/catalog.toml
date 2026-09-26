@@ -4,7 +4,7 @@
 #   `<module>.<export>` for imports       e.g. `axios.post()`
 #   `<module>.<Class>#` for instances     e.g. `@prisma/client.PrismaClient#.order.update()`
 #   `name()` for globals                  e.g. `fetch()`
-# `*` matches one segment; `{a,b}` expands to alternatives.
+# `*` matches one segment, `**` any number of them; `{a,b}` expands to alternatives.
 #
 # Value specs: `seg:N` (segment N of the matched name, negative from the end),
 # `arg:N` (constant string of argument N), `host:N` (host of the URL in argument N),
@@ -40,13 +40,15 @@ api = "{pg,mysql,mysql2,mssql}.*#.{query,execute}()"
 kind = "db_query"
 target = "seg:0"
 
+# Kysely: anywhere in a chain (`db.with(…).selectFrom()`) or on an expression
+# builder (`eb.exists(eb.selectFrom(…))`).
 [[effect]]
-api = "kysely.{Kysely,Transaction}#.{insertInto,replaceInto,updateTable,deleteFrom,mergeInto}()"
+api = "kysely.**.{insertInto,replaceInto,updateTable,deleteFrom,mergeInto}()"
 kind = "db_write"
 target = "arg:0"
 
 [[effect]]
-api = "kysely.{Kysely,Transaction}#.selectFrom()"
+api = "kysely.**.selectFrom()"
 kind = "db_read"
 target = "arg:0"
 
@@ -123,3 +125,64 @@ api = "@nestjs/common.{Get,Post,Put,Patch,Delete,All,Head,Options}()"
 method = "seg:-1:upper"
 path = "arg:0|"
 prefix = "@nestjs/common.Controller()"
+
+# ---- logging ---------------------------------------------------------------
+# Log calls are kept apart from behaviour: a change to them is LOGGING_CHANGED.
+# Program-internal targets match by entity id (`src/x.ts::AppLogger.warn()`).
+[[log]]
+api = "{console.*(),**.Logger#.*(),**.*Logger#.*(),**.*::*Logger.*(),**.*::LoggingRepository.*()}"
+
+# ---- validation schemas ----------------------------------------------------
+# Module constants built from these roots are validation schemas. `docs` methods
+# document a schema without changing what it accepts.
+[schema]
+roots = ["zod", "nestjs-zod"]
+docs = ["describe", "meta", "openapi", "example", "title"]
+
+# ---- access requirements -------------------------------------------------
+# Object-argument keys that state an access requirement, at calls
+# (`requireAccess({ auth, permission: Permission.AlbumRead })`) and decorators
+# (`@Authenticated({ permission: … })`). `grants` keys open access instead.
+[access]
+keys = ["permission", "permissions", "role", "roles", "scope", "scopes", "admin", "isAdmin", "public"]
+grants = ["public"]
+
+# ---- query predicates ------------------------------------------------------
+# Methods that narrow the rows a query reaches. The expression-builder forms are
+# `eb(column, op, value)` and its combinators.
+[[filter]]
+api = "kysely.**.{where,whereRef,having,on,onRef}()"
+
+[[filter]]
+api = "kysely.ExpressionBuilder#{(),.and(),.or(),.not(),.exists(),.between()}"
+
+# Calls that stand for a constant, e.g. sql.lit('hidden') is the literal `hidden`.
+[[literal]]
+api = "kysely.sql.{lit,val}()"
+
+# Untyped callback parameters of query builders. First match wins;
+# `receiver` is the builder the method is called on.
+[[callback]]
+api = "kysely.**.{$if,$call,with,withRecursive}()"
+param = "receiver"
+
+[[callback]]
+api = "kysely.**.transaction().execute()"
+param = "kysely.Transaction#"
+
+[[callback]]
+api = "kysely.**.{innerJoinLateral,leftJoinLateral,crossJoinLateral}()"
+arg = 0
+param = "kysely.ExpressionBuilder#"
+
+[[callback]]
+api = "kysely.**.{innerJoin,leftJoin,rightJoin,fullJoin,innerJoinLateral,leftJoinLateral}()"
+param = "kysely.JoinBuilder#"
+
+[[callback]]
+api = "kysely.**.onConflict()"
+param = "kysely.OnConflictBuilder#"
+
+[[callback]]
+api = "kysely.**"
+param = "kysely.ExpressionBuilder#"

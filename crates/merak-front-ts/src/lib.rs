@@ -134,6 +134,9 @@ struct Lowerer<'s> {
     /// Qualified-name stack of enclosing functions, for naming closures.
     scope: Vec<String>,
     closure_counter: BTreeMap<String, u32>,
+    /// Module constant whose initializer is being lowered: names its closures
+    /// (`SharedLinkCreateSchema.superRefine`) without being their parent function.
+    const_scope: Option<String>,
 }
 
 impl<'s> Lowerer<'s> {
@@ -151,6 +154,7 @@ impl<'s> Lowerer<'s> {
             module: ir::Module { path: path.to_string(), ..Default::default() },
             scope: vec![],
             closure_counter: BTreeMap::new(),
+            const_scope: None,
         }
     }
 
@@ -236,7 +240,9 @@ impl<'s> Lowerer<'s> {
                             self.function(f, &name, None, ir::FunctionKind::Function, exported, None);
                         }
                         init => {
+                            self.const_scope = Some(name.clone());
                             let init = init.as_ref().map(|e| self.expr(e));
+                            self.const_scope = None;
                             let loc = self.loc(d.span);
                             self.module.consts.push(ir::Const { name, ty, init, exported, loc });
                         }
@@ -450,7 +456,7 @@ impl<'s> Lowerer<'s> {
 
     /// Name for a closure found inside the current function.
     fn closure_name(&mut self, hint: Option<String>) -> String {
-        let parent = self.scope.last().cloned().unwrap_or_else(|| "<module>".into());
+        let parent = self.scope.last().or(self.const_scope.as_ref()).cloned().unwrap_or_else(|| "<module>".into());
         let base = match hint {
             Some(h) => format!("{parent}.{h}"),
             None => format!("{parent}.<closure>"),
@@ -567,7 +573,8 @@ impl<'s> Lowerer<'s> {
                 }
                 return None;
             }
-            Statement::EmptyStatement(_) | Statement::BreakStatement(_) | Statement::ContinueStatement(_) => return None,
+            Statement::EmptyStatement(_) => return None,
+            Statement::BreakStatement(_) | Statement::ContinueStatement(_) => ir::Stmt::Jump(loc),
             _ => ir::Stmt::Expr(ir::Expr::Opaque(self.text(s.span())), loc),
         })
     }

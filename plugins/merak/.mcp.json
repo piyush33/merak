@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "merak": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/merak-run",
+      "args": ["mcp"]
+    }
+  }
+}

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Find the merak binary: $MERAK_BIN, then `merak` on PATH, then a build in the
+# repository this plugin lives in (development). Hooks never fail the session.
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for candidate in "${MERAK_BIN:-}" "$(command -v merak 2>/dev/null)" "$here/../../../target/release/merak"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+echo "merak: binary not found. Install it with \`cargo install --path crates/merak-cli\` from the Merak repository, or set MERAK_BIN." >&2
+if [ "${1:-}" = "hook" ]; then exit 0; fi
+exit 1

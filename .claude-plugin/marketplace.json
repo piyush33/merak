@@ -1,0 +1,16 @@
+{
+  "name": "merak",
+  "description": "Merak: semantic transitions for code changes.",
+  "owner": {
+    "name": "Khidki Tech",
+    "email": "tech@khidki.homes"
+  },
+  "plugins": [
+    {
+      "name": "merak",
+      "source": "./plugins/merak",
+      "description": "Semantic transitions for code changes, as an MCP server, a /merak:review skill and a per-turn review hook.",
+      "version": "0.1.0"
+    }
+  ]
+}

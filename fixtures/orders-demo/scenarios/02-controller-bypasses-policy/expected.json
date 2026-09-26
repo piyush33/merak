@@ -1,5 +1,7 @@
 {
   "ops": [
+    { "kind": "BEHAVIOUR_ADDED", "subject": "src/controllers/order.controller.ts::OrderController.managerCancel",
+      "after": "effects: db_write order, db_read order; writes: Order.status" },
     {
       "kind": "ENTITY_ADDED",
       "subject": "src/controllers/order.controller.ts::OrderController.managerCancel"

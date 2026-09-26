@@ -5,7 +5,7 @@ use crate::model::*;
 use crate::pred::Pred;
 use std::collections::{BTreeMap, BTreeSet};
 
-const WRITE_EFFECTS: &[&str] = &["db_write", "db_query", "http", "event_emit", "fs_write", "queue", "cache_write"];
+pub const WRITE_EFFECTS: &[&str] = &["db_write", "db_query", "http", "event_emit", "fs_write", "queue", "cache_write"];
 
 pub fn compute(model: &mut Model) {
     let handlers = handlers_by_event(model);
@@ -21,6 +21,9 @@ pub fn compute(model: &mut Model) {
             info.evidence.insert(eff.loc.clone());
         }
         s.reads = e.reads.keys().cloned().collect();
+        for a in &e.access {
+            s.access.entry(a.requirement.clone()).or_insert_with(|| a.clone());
+        }
         s.writes = e.writes.iter().map(|w| w.field.clone()).collect();
         sums.insert(e.id.clone(), s);
     }
@@ -30,8 +33,11 @@ pub fn compute(model: &mut Model) {
             let mut add: Vec<(EffectKey, EffectInfo)> = vec![];
             let mut reads = BTreeSet::new();
             let mut writes = BTreeSet::new();
+            let mut access = vec![];
             for c in &e.calls {
                 let Some(cs) = sums.get(&c.target) else { continue };
+                // A callee's dynamic requirement is the caller's to fill in.
+                access.extend(cs.access.values().filter(|a| !a.dynamic()).cloned());
                 for (k, info) in &cs.effects {
                     add.push((k.clone(), EffectInfo { modes: info.modes.clone(), via: BTreeSet::from([c.target.clone()]), evidence: info.evidence.clone() }));
                 }
@@ -62,10 +68,13 @@ pub fn compute(model: &mut Model) {
                 slot.evidence.extend(info.evidence);
                 changed |= before != (slot.modes.len(), slot.via.len(), slot.evidence.len());
             }
-            let before = (s.reads.len(), s.writes.len());
+            let before = (s.reads.len(), s.writes.len(), s.access.len());
             s.reads.extend(reads);
             s.writes.extend(writes);
-            changed |= before != (s.reads.len(), s.writes.len());
+            for a in access {
+                s.access.entry(a.requirement.clone()).or_insert(a);
+            }
+            changed |= before != (s.reads.len(), s.writes.len(), s.access.len());
         }
         if !changed {
             break;

@@ -9,6 +9,7 @@ pub mod infer;
 pub mod model;
 pub mod pred;
 pub mod resolve;
+pub mod schema;
 pub mod summary;
 
 pub use model::*;
@@ -25,7 +26,7 @@ pub fn analyze(program: &ir::Program, config: Option<&str>) -> Result<Model, Str
     };
     let cat = catalog::Catalog::with_extensions(config.catalog.clone());
     let ix = resolve::Index::new(program);
-    let envs = extract::build_envs(&ix);
+    let envs = extract::build_envs(&ix, &cat);
 
     let mut model = Model::default();
     for m in program.modules.values() {
@@ -36,12 +37,15 @@ pub fn analyze(program: &ir::Program, config: Option<&str>) -> Result<Model, Str
             );
         }
         for f in &m.functions {
-            let env = envs.get(&f.id).cloned().unwrap_or_default();
-            let e = extract::extract_entity(&ix, &cat, &env, f);
+            let e = extract::extract_entity(&ix, &cat, &envs, f);
             model.routes.extend(e.routes.iter().cloned());
             model.subscriptions.extend(e.subscriptions.iter().cloned());
             model.entities.insert(e.id.clone(), e);
         }
+    }
+
+    for m in program.modules.values() {
+        model.schemas.extend(schema::extract(&ix, &cat, m));
     }
 
     let fields: BTreeSet<String> = model.entities.values().flat_map(|e| e.writes.iter().map(|w| w.field.clone())).collect();

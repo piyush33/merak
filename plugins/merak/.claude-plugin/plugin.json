@@ -1,0 +1,9 @@
+{
+  "name": "merak",
+  "displayName": "Merak",
+  "version": "0.1.0",
+  "description": "Semantic transitions for code changes: what an edit did to auth, query filters, effects, validation and state, with file:line evidence. Checks each turn's edits and gives the agent that evidence.",
+  "author": { "name": "Khidki Tech", "email": "tech@khidki.homes" },
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["code-review", "semantic-diff", "typescript", "static-analysis"]
+}
