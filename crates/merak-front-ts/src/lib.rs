@@ -374,13 +374,14 @@ impl<'s> Lowerer<'s> {
             .items
             .iter()
             .map(|p| {
+                // A destructured parameter keeps its pattern: `{ phrase, matched }`.
                 let name = match &p.pattern {
                     BindingPattern::BindingIdentifier(b) => b.name.as_str().to_string(),
                     BindingPattern::AssignmentPattern(a) => match &a.left {
                         BindingPattern::BindingIdentifier(b) => b.name.as_str().to_string(),
-                        _ => "_".into(),
+                        other => self.text(other.span()),
                     },
-                    _ => "_".into(),
+                    other => self.text(other.span()),
                 };
                 let ty = p.type_annotation.as_ref().map(|t| self.ts_type(&t.type_annotation));
                 ir::Param { name, ty }
@@ -622,6 +623,11 @@ impl<'s> Lowerer<'s> {
                     BinaryOperator::LessEqualThan => ir::BinOp::LtEq,
                     BinaryOperator::GreaterThan => ir::BinOp::Gt,
                     BinaryOperator::GreaterEqualThan => ir::BinOp::GtEq,
+                    BinaryOperator::Addition => ir::BinOp::Add,
+                    BinaryOperator::Subtraction => ir::BinOp::Sub,
+                    BinaryOperator::Multiplication => ir::BinOp::Mul,
+                    BinaryOperator::Division => ir::BinOp::Div,
+                    BinaryOperator::Remainder => ir::BinOp::Rem,
                     _ => ir::BinOp::Other,
                 },
                 left: Box::new(self.expr(&b.left)),
@@ -693,6 +699,8 @@ impl<'s> Lowerer<'s> {
                 let q = self.closure_name(None);
                 ir::Expr::Closure(self.arrow(a, &q, false))
             }
+            Expression::JSXElement(e) => ir::Expr::Jsx(Box::new(self.jsx_element(e))),
+            Expression::JSXFragment(f) => ir::Expr::Jsx(Box::new(ir::Jsx { tag: String::new(), attrs: vec![], children: self.jsx_children(&f.children) })),
             Expression::FunctionExpression(f) => {
                 let q = self.closure_name(None);
                 let parent = self.scope.last().map(|p| self.entity_id(p));
@@ -700,6 +708,73 @@ impl<'s> Lowerer<'s> {
             }
             Expression::SequenceExpression(s) => s.expressions.last().map(|x| self.expr(x)).unwrap_or(ir::Expr::Undefined),
             other => ir::Expr::Opaque(self.text(other.span())),
+        }
+    }
+
+    // ---------------------------------------------------------------- JSX
+
+    fn jsx_element(&mut self, e: &JSXElement) -> ir::Jsx {
+        let o = &e.opening_element;
+        let tag = match &o.name {
+            JSXElementName::Identifier(i) => i.name.as_str().to_string(),
+            JSXElementName::IdentifierReference(r) => r.name.as_str().to_string(),
+            other => self.text(other.span()),
+        };
+        let mut attrs = vec![];
+        for a in &o.attributes {
+            match a {
+                JSXAttributeItem::Attribute(at) => {
+                    let name = match &at.name {
+                        JSXAttributeName::Identifier(i) => i.name.as_str().to_string(),
+                        JSXAttributeName::NamespacedName(n) => self.text(n.span),
+                    };
+                    let value = match &at.value {
+                        None => ir::Expr::Bool(true),
+                        Some(JSXAttributeValue::StringLiteral(s)) => ir::Expr::Str(s.value.as_str().to_string()),
+                        Some(JSXAttributeValue::ExpressionContainer(c)) => self.jsx_expr(&c.expression, Some(&name)).unwrap_or(ir::Expr::Undefined),
+                        Some(JSXAttributeValue::Element(el)) => ir::Expr::Jsx(Box::new(self.jsx_element(el))),
+                        Some(JSXAttributeValue::Fragment(f)) => {
+                            ir::Expr::Jsx(Box::new(ir::Jsx { tag: String::new(), attrs: vec![], children: self.jsx_children(&f.children) }))
+                        }
+                    };
+                    attrs.push((name, value));
+                }
+                JSXAttributeItem::SpreadAttribute(s) => attrs.push(("...".into(), self.expr(&s.argument))),
+            }
+        }
+        ir::Jsx { tag, attrs, children: self.jsx_children(&e.children) }
+    }
+
+    fn jsx_children(&mut self, children: &[JSXChild]) -> Vec<ir::Expr> {
+        let mut out = vec![];
+        for c in children {
+            match c {
+                JSXChild::Text(t) => {
+                    let text = t.value.as_str().split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !text.is_empty() {
+                        out.push(ir::Expr::Str(text));
+                    }
+                }
+                JSXChild::Element(e) => out.push(ir::Expr::Jsx(Box::new(self.jsx_element(e)))),
+                JSXChild::Fragment(f) => {
+                    out.push(ir::Expr::Jsx(Box::new(ir::Jsx { tag: String::new(), attrs: vec![], children: self.jsx_children(&f.children) })))
+                }
+                JSXChild::ExpressionContainer(x) => out.extend(self.jsx_expr(&x.expression, None)),
+                JSXChild::Spread(s) => out.push(self.expr(&s.expression)),
+            }
+        }
+        out
+    }
+
+    /// An expression in `{…}`; handlers are named after their attribute (`Row.onClick`).
+    fn jsx_expr(&mut self, e: &JSXExpression, attr: Option<&str>) -> Option<ir::Expr> {
+        match e {
+            JSXExpression::EmptyExpression(_) => None,
+            JSXExpression::ArrowFunctionExpression(a) if attr.is_some() => {
+                let q = self.closure_name(attr.map(str::to_string));
+                Some(ir::Expr::Closure(self.arrow(a, &q, false)))
+            }
+            other => other.as_expression().map(|x| self.expr(x)),
         }
     }
 
@@ -721,7 +796,13 @@ impl<'s> Lowerer<'s> {
             None => m,
         });
         let args = c.arguments.iter().map(|a| self.arg(a, hint.clone())).collect();
-        ir::Expr::Call(Box::new(ir::Call { callee, args, loc: self.loc(c.span) }))
+        // In a chain spread over lines (`db\n  .selectFrom(…)\n  .where(…)`), a call is where its
+        // method name is, not where the chain starts.
+        let at = match &c.callee {
+            Expression::StaticMemberExpression(m) => m.property.span,
+            _ => c.span,
+        };
+        ir::Expr::Call(Box::new(ir::Call { callee, args, loc: self.loc(at) }))
     }
 
     fn arg(&mut self, a: &Argument, closure_hint: Option<String>) -> ir::Expr {
@@ -828,6 +909,10 @@ fn body_hash(body: &[ir::Stmt]) -> String {
             }
             serde_json::Value::Object(map) => {
                 map.remove("loc");
+                // Closure ids carry the file path (`src/a.ts::f.map`); a moved function keeps its body.
+                if let Some(serde_json::Value::String(id)) = map.get_mut("Closure") {
+                    *id = id.rsplit("::").next().unwrap_or(id).to_string();
+                }
                 map.values_mut().for_each(strip_locs);
             }
             serde_json::Value::Array(items) => items.iter_mut().for_each(strip_locs),
@@ -862,6 +947,14 @@ mod tests {
         let a = lower_module("src/a.ts", "export function f(x: number) {\n  if (x) { throw new Error('x'); }\n  return g(x);\n}\n");
         let b = lower_module("src/a.ts", "\n\n// moved down\nexport function f(x: number) {\n  if (x) { throw new Error('x'); }\n  return g(x);\n}\n");
         assert_eq!(a.functions[0].body_hash, b.functions[0].body_hash);
+    }
+
+    #[test]
+    fn body_hash_ignores_the_file_of_closures() {
+        let src = "export function list(xs: number[]) { return xs.map((x) => x * 2); }";
+        let (a, b) = (lower_module("src/list.ts", src), lower_module("app/src/list.ts", src));
+        let hash = |m: &ir::Module| m.functions.iter().find(|f| f.name == "list").unwrap().body_hash.clone();
+        assert_eq!(hash(&a), hash(&b));
     }
 
     #[test]

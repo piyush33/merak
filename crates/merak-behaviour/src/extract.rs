@@ -156,7 +156,73 @@ fn visit_expr<'e>(e: &'e Expr, f: &mut dyn FnMut(&'e ir::Call)) {
             visit_expr(target, f);
             visit_expr(value, f);
         }
+        Expr::Jsx(j) => {
+            j.attrs.iter().for_each(|(_, v)| visit_expr(v, f));
+            j.children.iter().for_each(|c| visit_expr(c, f));
+        }
         _ => {}
+    }
+}
+
+/// What markup renders: each piece of content with the element around it and the
+/// conditions (`a && <x/>`, `a ? <x/> : <y/>`) that show it.
+fn rendered(e: &Expr, style: &str, when: &mut Vec<String>, out: &mut Vec<Rendered>) {
+    let cond = |w: &Vec<String>| w.join(" ∧ ");
+    match e {
+        Expr::Jsx(j) => {
+            let style = if j.tag.is_empty() {
+                style.to_string()
+            } else {
+                let classes: String = j.class().map(|c| c.split_whitespace().map(|x| format!(".{x}")).collect()).unwrap_or_default();
+                format!("{}{classes}", j.tag)
+            };
+            if j.children.is_empty() && !j.tag.is_empty() {
+                out.push(Rendered { content: format!("<{}>", j.tag), style: style.clone(), when: cond(when) });
+            }
+            for c in &j.children {
+                rendered(c, &style, when, out);
+            }
+        }
+        Expr::Logical { op: ir::LogicOp::And, left, right } if contains_jsx(right) => {
+            when.push(render(left));
+            rendered(right, style, when, out);
+            when.pop();
+        }
+        Expr::Conditional { test, then, otherwise } if contains_jsx(then) || contains_jsx(otherwise) => {
+            when.push(render(test));
+            rendered(then, style, when, out);
+            when.pop();
+            when.push(format!("!({})", render(test)));
+            rendered(otherwise, style, when, out);
+            when.pop();
+        }
+        Expr::Str(s) if !style.is_empty() => out.push(Rendered { content: format!("{s:?}"), style: style.to_string(), when: cond(when) }),
+        Expr::Null | Expr::Undefined | Expr::Bool(_) => {}
+        other if !style.is_empty() => out.push(Rendered { content: format!("{{{}}}", render(other)), style: style.to_string(), when: cond(when) }),
+        _ => {}
+    }
+}
+
+/// A type as written: `Promise<Order>`, `string[]`, `"ADMIN" | "MANAGER"`.
+pub fn type_text(t: &ir::TypeRef) -> String {
+    match t {
+        ir::TypeRef::Named(n, args) if args.is_empty() => n.clone(),
+        ir::TypeRef::Named(n, args) => format!("{n}<{}>", args.iter().map(type_text).collect::<Vec<_>>().join(", ")),
+        ir::TypeRef::Array(el) => format!("{}[]", type_text(el)),
+        ir::TypeRef::StringLiterals(vs) => vs.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join(" | "),
+        ir::TypeRef::Union(ts) => ts.iter().map(type_text).collect::<Vec<_>>().join(" | "),
+        ir::TypeRef::Object(fs) => format!("{{ {} }}", fs.iter().map(|(k, v)| format!("{k}: {}", type_text(v))).collect::<Vec<_>>().join("; ")),
+        ir::TypeRef::Primitive(p) => p.clone(),
+        ir::TypeRef::Unknown => "?".into(),
+    }
+}
+
+fn contains_jsx(e: &Expr) -> bool {
+    match e {
+        Expr::Jsx(_) => true,
+        Expr::Logical { right, .. } => contains_jsx(right),
+        Expr::Conditional { then, otherwise, .. } => contains_jsx(then) || contains_jsx(otherwise),
+        _ => false,
     }
 }
 
@@ -228,6 +294,16 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
             writes: vec![],
             guards: vec![],
             returns: None,
+            returns_at: None,
+            outputs: vec![],
+            params: f
+                .params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(t) => format!("{}: {}", p.name, type_text(t)),
+                    None => p.name.clone(),
+                })
+                .collect(),
             throws: false,
             subscriptions: vec![],
             routes: vec![],
@@ -241,16 +317,17 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
     w.stmts(&f.body, true);
     w.decorators(f);
     if is_predicate_fn(f) {
-        let returns: Vec<&Expr> = f
+        let returns: Vec<(&Expr, &Loc)> = f
             .body
             .iter()
             .filter_map(|s| match s {
-                Stmt::Return(Some(e), _) => Some(e),
+                Stmt::Return(Some(e), l) => Some((e, l)),
                 _ => None,
             })
             .collect();
-        if returns.len() == 1 {
-            w.e.returns = Some(w.pred(returns[0]));
+        if let [(e, l)] = returns.as_slice() {
+            w.e.returns = Some(w.pred(e));
+            w.e.returns_at = Some((*l).clone());
         }
     }
     w.e
@@ -295,7 +372,7 @@ impl Walker<'_, '_> {
                     self.expr(test, loc);
                     let requires = self.pred(test);
                     let requires = self.with_domain(requires);
-                    self.e.guards.push(GuardFact { requires, on_fail: OnFail::Return, loc: loc.clone() });
+                    self.e.guards.push(GuardFact { requires, on_fail: OnFail::Return, loc: loc.clone(), returns_value: false });
                     self.path.push((self.pred(test), true));
                     self.stmts(then, true);
                     continue;
@@ -345,7 +422,8 @@ impl Walker<'_, '_> {
                     if let Some(on_fail) = exits {
                         let requires = self.pred(test).negate();
                         let requires = self.with_domain(requires);
-                        self.e.guards.push(GuardFact { requires, on_fail, loc: loc.clone() });
+                        let returns_value = matches!(then.last(), Some(Stmt::Return(Some(_), _)));
+                        self.e.guards.push(GuardFact { requires, on_fail, loc: loc.clone(), returns_value });
                     }
                 }
                 self.depth += 1;
@@ -361,6 +439,9 @@ impl Walker<'_, '_> {
             Stmt::Return(e, loc) => {
                 if let Some(e) = e {
                     self.expr(e, loc);
+                    let mut renders = vec![];
+                    rendered(e, "", &mut Vec::new(), &mut renders);
+                    self.e.outputs.push(Output { when: self.conditions(false), value: render(e), renders, loc: loc.clone() });
                 }
             }
             Stmt::Throw(e, loc) => {
@@ -435,6 +516,10 @@ impl Walker<'_, '_> {
                 self.expr(then, loc);
                 self.expr(otherwise, loc);
                 self.depth -= 1;
+            }
+            Expr::Jsx(j) => {
+                j.attrs.iter().for_each(|(_, v)| self.expr(v, loc));
+                j.children.iter().for_each(|c| self.expr(c, loc));
             }
             Expr::Closure(id)
                 // A closure used as a value (not registered as a handler/route) is
@@ -518,6 +603,8 @@ impl Walker<'_, '_> {
             Callee::Unresolved(text) => text,
         };
         let arg = |a: &Expr| match (self.ix.const_str(self.env, a), a) {
+            // Numbers, booleans and null as written; strings quoted.
+            (Some(v), Expr::Num(_) | Expr::Bool(_) | Expr::Null) => v,
             (Some(v), _) => format!("{v:?}"),
             (None, Expr::Object(props)) => {
                 // Access keys are covered by access facts.
@@ -776,7 +863,7 @@ impl Walker<'_, '_> {
 
     fn pred(&self, e: &Expr) -> Pred {
         match e {
-            Expr::Binary { op, left, right } if *op != ir::BinOp::Other => {
+            Expr::Binary { op, left, right } if op.is_comparison() => {
                 let sym = match op {
                     ir::BinOp::Eq => "==",
                     ir::BinOp::NotEq => "!=",
@@ -784,7 +871,7 @@ impl Walker<'_, '_> {
                     ir::BinOp::LtEq => "<=",
                     ir::BinOp::Gt => ">",
                     ir::BinOp::GtEq => ">=",
-                    ir::BinOp::Other => unreachable!(),
+                    _ => unreachable!(),
                 };
                 let (lc, rc) = (self.ix.const_str(self.env, left), self.ix.const_str(self.env, right));
                 // Put the constant (if any) on the right: `0 < n` is `n > 0`.

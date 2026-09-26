@@ -322,7 +322,7 @@ fn condition_added_around_a_call_is_not_a_refactor() {
     let t = merak_cli::diff(&src("await sleep(1000);"), &src("if (!isLocked) { await sleep(1000); }")).unwrap();
     let kinds: Vec<&str> = t.ops.iter().map(|o| o.kind.as_str()).collect();
     assert_eq!(kinds, ["UNCLASSIFIED_CHANGE"], "{:#?}", t.ops);
-    assert_eq!(t.ops[0].after.as_deref(), Some(r#"sleep("1000") when isLocked is not set"#));
+    assert_eq!(t.ops[0].after.as_deref(), Some("sleep(1000) when isLocked is not set"));
 }
 
 #[test]
@@ -544,7 +544,208 @@ fn hooks_report_a_turns_behaviour_change_once() {
 
     std::fs::write(proj.join("src/policy.ts"), policy("user.role === 'ADMIN' || user.role === 'MANAGER'")).unwrap();
     let Outcome::Review(msg) = stop(&input(false), &data).unwrap() else { panic!("expected a review") };
-    assert!(msg.contains("AUTH_WIDENED OrderPolicy.canCancel: user.role ∈ {ADMIN} → user.role ∈ {ADMIN, MANAGER}"), "{msg}");
+    assert!(
+        msg.contains("OrderPolicy.canCancel · changed") && msg.contains("~ who       user.role ∈ {ADMIN} → user.role ∈ {ADMIN, MANAGER}  (widened)"),
+        "{msg}"
+    );
     assert!(matches!(stop(&input(true), &data).unwrap(), Outcome::Quiet), "once per turn");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hooks_stay_quiet_when_nothing_typed_changed() {
+    use merak_cli::hook::{prompt, stop, Outcome};
+    // A UI helper rewritten (immich-free example from a React app): only UNCLASSIFIED_CHANGE.
+    let dir = std::env::temp_dir().join(format!("merak-hook-ui-{}", std::process::id()));
+    let (proj, data) = (dir.join("proj"), dir.join("data"));
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    let write =
+        |body: &str| std::fs::write(proj.join("src/render.tsx"), format!("export function render(phrase: string, typed: string) {{ {body} }}")).unwrap();
+    write("return phrase.slice(0, 2);");
+    let input = serde_json::json!({"session_id": "ui", "cwd": proj, "stop_hook_active": false});
+    prompt(&input, &data).unwrap();
+    write("const at = phrase.toLowerCase().indexOf(typed.trim().toLowerCase()); return phrase.slice(at, at + typed.length);");
+    assert!(matches!(stop(&input, &data).unwrap(), Outcome::Quiet));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hooks_diff_the_snapshot_root_even_after_the_agent_cds() {
+    use merak_cli::hook::{prompt, stop, Outcome};
+    // A session started in `outer/`, then the agent ran `cd inner` before stopping:
+    // Claude Code passes the new cwd to the Stop hook.
+    let dir = std::env::temp_dir().join(format!("merak-hook-cd-{}", std::process::id()));
+    let (outer, data) = (dir.join("outer"), dir.join("data"));
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(inner.join("src")).unwrap();
+    let policy = |roles: &str| format!("export class P {{ canCancel(user: {{ role: string }}): boolean {{ return {roles}; }} }}");
+    std::fs::write(inner.join("src/p.ts"), policy("user.role === 'ADMIN'")).unwrap();
+    // The same helper copied into several pages (kyzowebapp's `fetchGstPrefill`).
+    for dir in ["a", "b", "c"] {
+        std::fs::create_dir_all(inner.join("src").join(dir)).unwrap();
+        std::fs::write(
+            inner.join("src").join(dir).join("page.tsx"),
+            "export function fetchPrefill(x: number) { if (x < 1) { return null; } return fetch('https://api.example.com/gst'); }",
+        )
+        .unwrap();
+    }
+    let at = |cwd: &std::path::Path| serde_json::json!({"session_id": "cd", "cwd": cwd, "stop_hook_active": false});
+
+    prompt(&at(&outer), &data).unwrap();
+    assert!(matches!(stop(&at(&inner), &data).unwrap(), Outcome::Quiet), "no edits: nothing to say, whatever the cwd");
+
+    std::fs::write(inner.join("src/p.ts"), policy("user.role === 'ADMIN' || user.role === 'MANAGER'")).unwrap();
+    let Outcome::Review(msg) = stop(&at(&inner), &data).unwrap() else { panic!("expected a review") };
+    assert!(msg.contains("P.canCancel · changed") && msg.contains("(widened)"), "{msg}");
+    assert!(msg.contains("inner/src/p.ts:1"), "analysed from the session's root: {msg}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn identical_copies_in_moved_files_pair_up_one_to_one() {
+    let page = "export function fetchPrefill(x: number) { if (x < 1) { return null; } return fetch('https://api.example.com/gst'); }";
+    let at = |prefix: &str| {
+        files(&[(&*format!("{prefix}src/a/page.tsx"), page), (&*format!("{prefix}src/b/page.tsx"), page), (&*format!("{prefix}src/c/page.tsx"), page)])
+    };
+    let t = merak_cli::diff(&at("app/"), &at("")).unwrap();
+    let moved: Vec<(String, String)> = t.ops.iter().filter(|o| o.kind == "ENTITY_MOVED").map(|o| (o.subject.clone(), o.after.clone().unwrap())).collect();
+    assert_eq!(
+        moved,
+        [
+            ("app/src/a/page.tsx::fetchPrefill".to_string(), "src/a/page.tsx::fetchPrefill".to_string()),
+            ("app/src/b/page.tsx::fetchPrefill".to_string(), "src/b/page.tsx::fetchPrefill".to_string()),
+            ("app/src/c/page.tsx::fetchPrefill".to_string(), "src/c/page.tsx::fetchPrefill".to_string()),
+        ]
+    );
+    assert!(t.ops.iter().all(|o| o.kind != "BEHAVIOUR_ADDED"), "{:#?}", t.ops);
+}
+
+// ---- plain-language view ------------------------------------------------------
+
+#[test]
+fn plain_view_reads_like_a_review() {
+    let fx = |scenario: &str| {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/orders-demo");
+        let base = merak_cli::source::from_dir(&dir.join("base")).unwrap();
+        let after = merak_cli::source::with_overlay(&base, &dir.join("scenarios").join(scenario)).unwrap();
+        merak_transition::render::markdown(&merak_cli::diff(&base, &after).unwrap(), None)
+    };
+    let auth = fx("01-manager-can-cancel");
+    assert!(auth.contains("**1 behaviour change.**"), "{auth}");
+    assert!(auth.contains("### Who can do what"), "{auth}");
+    assert!(auth.contains("**More access:** `OrderPolicy.canCancel` now also allows role `MANAGER` (before: only `ADMIN`)."), "{auth}");
+    assert!(auth.contains("Affects `POST /orders/:id/cancel`"), "{auth}");
+
+    let refactor = fx("08-pure-refactor");
+    assert!(refactor.contains("**No behaviour change.**"), "{refactor}");
+    assert!(!refactor.contains("_CHANGE") && !refactor.contains("ENTITY_"), "no internal op names: {refactor}");
+
+    let state = fx("05-cancel-confirmed-orders");
+    assert!(state.contains("`Order.status` can now become `CANCELLED` from `CONFIRMED` too"), "{state}");
+}
+
+#[test]
+fn plain_view_of_an_unmodelled_change_names_the_calls() {
+    let src = |body: &str| files(&[("src/r.tsx", &format!("export function render(phrase: string, typed: string) {{ {body} }}"))]);
+    let t = merak_cli::diff(&src("return phrase.slice(0, 2);"), &src("const at = phrase.toLowerCase().indexOf(typed.trim()); return phrase.slice(at, 2);"))
+        .unwrap();
+    let md = merak_transition::render::markdown(&t, None);
+    assert!(md.contains("**No behaviour change Merak can name.** 1 change Merak can't classify: review it by hand."), "{md}");
+    assert!(md.contains("`render` changed in a way Merak can't classify: it now also calls `indexOf`, `toLowerCase` and `trim`."), "{md}");
+    assert!(!md.contains(" when ") && !md.contains('…'), "no call-shape notation: {md}");
+}
+
+// ---- contract view -------------------------------------------------------------
+
+fn contract_view(scenario: &str) -> String {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/orders-demo");
+    let base = merak_cli::source::from_dir(&dir.join("base")).unwrap();
+    let after = merak_cli::source::with_overlay(&base, &dir.join("scenarios").join(scenario)).unwrap();
+    let t = merak_cli::diff(&base, &after).unwrap();
+    merak_cli::render(&t, "contracts", "test", &base, &after)
+}
+
+#[test]
+fn contract_view_shows_a_widened_check_with_its_code() {
+    let v = contract_view("05-cancel-confirmed-orders");
+    assert!(v.contains("**1 contract changed.**"), "{v}");
+    assert!(v.contains("### `OrderService.cancelOrder` · changed"), "{v}");
+    assert!(v.contains("      who       User.role ∈ {ADMIN}"), "unchanged clauses stay as context: {v}");
+    assert!(v.contains("    ~ pre       Order.status ∈ {PENDING}  →  Order.status ∈ {CONFIRMED, PENDING}   ← widened"), "{v}");
+    assert!(v.contains("- if (order.status !== OrderStatus.PENDING) {"), "the code before: {v}");
+    assert!(v.contains("+ if (order.status !== OrderStatus.PENDING && order.status !== OrderStatus.CONFIRM"), "the code after: {v}");
+}
+
+#[test]
+fn contract_view_of_an_unchecked_new_endpoint() {
+    let v = contract_view("02-controller-bypasses-policy");
+    assert!(v.contains("### `OrderController.managerCancel` · new"), "{v}");
+    assert!(v.contains("`POST /orders/:id/manager-cancel` (new route)"), "{v}");
+    assert!(!v.contains("+ who") && !v.contains("+ pre"), "no access requirement and no check: the gap is visible by absence: {v}");
+    assert!(v.contains("    ! rule      breaks Order.status := CANCELLED requires User.role ∈ {ADMIN}"), "{v}");
+    assert!(v.contains("3 rules broken."), "{v}");
+}
+
+#[test]
+fn contract_view_of_an_effect_moved_to_an_event_handler() {
+    let v = contract_view("07-refund-via-event");
+    assert!(v.contains("→ POST payments.example.com (later, via OrderCancelled)   ← now happens later"), "{v}");
+    assert!(v.contains("### `registerRefundHandler, on OrderCancelled` · new"), "{v}");
+    assert!(v.contains("event `OrderCancelled` (new handler)"), "{v}");
+    assert!(!v.contains("! rule"), "a new handler is not a broken rule: {v}");
+}
+
+#[test]
+fn contract_view_of_a_pure_refactor_says_so() {
+    let v = contract_view("08-pure-refactor");
+    assert!(v.contains("**No behaviour change.**"), "{v}");
+    assert!(!v.contains("### "), "no contracts: {v}");
+}
+
+#[test]
+fn contract_view_of_a_ui_change_says_what_it_renders() {
+    // kyzowebapp: the matched part of a suggestion goes from muted to bold, the rest from
+    // bold to grey, and a new helper finds a fallback match.
+    let before = r#"export function renderHighlighted({ phrase, matched }: Suggestion) {
+  const start = matched.start;
+  const end = start + matched.length;
+  if (end <= start) return <span className="font-semibold text-gray-900">{phrase}</span>;
+  return (
+    <>
+      {start > 0 && <span className="font-semibold text-gray-900">{phrase.slice(0, start)}</span>}
+      <span className="text-gray-500">{phrase.slice(start, end)}</span>
+    </>
+  );
+}"#;
+    let after = r#"export function renderHighlighted({ phrase, matched }: Suggestion, typed: string) {
+  let start = matched.start;
+  let end = start + matched.length;
+  if (end <= start) {
+    const fallback = findTypedPrefix(phrase, typed);
+    if (fallback) [start, end] = fallback;
+  }
+  if (end <= start) return <span className="text-gray-400">{phrase}</span>;
+  return (
+    <>
+      {start > 0 && <span className="text-gray-400">{phrase.slice(0, start)}</span>}
+      <span className="font-semibold text-gray-900">{phrase.slice(start, end)}</span>
+    </>
+  );
+}
+function findTypedPrefix(phrase: string, typed: string): [number, number] | null {
+  const at = phrase.toLowerCase().indexOf(typed.toLowerCase());
+  if (at === -1) return null;
+  return [at, at + typed.length];
+}"#;
+    let (a, b) = (files(&[("src/s.tsx", before)]), files(&[("src/s.tsx", after)]));
+    let t = merak_cli::diff(&a, &b).unwrap();
+    let v = merak_cli::render(&t, "contracts", "test", &a, &b);
+    assert!(v.contains("+ takes     typed: string   ← new parameter"), "{v}");
+    assert!(v.contains("~ renders   {phrase.slice(start, end)}: span.text-gray-500  →  span.font-semibold.text-gray-900"), "{v}");
+    assert!(v.contains("~ renders   {phrase.slice(0, start)} if start > 0: span.font-semibold.text-gray-900  →  span.text-gray-400"), "{v}");
+    assert!(v.contains("~ renders   {phrase}: span.font-semibold.text-gray-900  →  span.text-gray-400"), "{v}");
+    assert!(v.contains("### `findTypedPrefix` · new"), "{v}");
+    assert!(v.contains("[at, at + typed.length]"), "arithmetic is rendered as written: {v}");
+    assert!(!v.contains("? calls"), "typed rows explain the change: {v}");
+    assert!(v.contains("`a → b`: before → after"), "the legend explains the arrow: {v}");
 }

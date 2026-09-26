@@ -40,6 +40,13 @@ enum Cmd {
         /// Emit JSON instead of Markdown.
         #[arg(long)]
         json: bool,
+        /// Presentation: `contracts` (behaviour contracts, before and after), `plain`
+        /// (sentences grouped by concern) or `ops` (every operation as derived).
+        #[arg(long, default_value = "contracts")]
+        view: String,
+        /// Same as `--view ops`.
+        #[arg(long)]
+        detail: bool,
     },
     /// Save the analyzable sources of a directory, to diff against later with `diff --since`.
     Snapshot {
@@ -70,7 +77,7 @@ fn main() -> Result<()> {
         }
         Cmd::Mcp => merak_cli::mcp::serve()?,
         Cmd::Hook { event, data } => std::process::exit(merak_cli::hook::run(&event, &data)),
-        Cmd::Diff { range, repo, root, before, after, since, json } => {
+        Cmd::Diff { range, repo, root, before, after, since, json, view, detail } => {
             let t = std::time::Instant::now();
             let (a, b, label) = match (range, before, after, since) {
                 (_, _, _, Some(snap)) => (source::from_snapshot(&snap)?, source::from_dir(&repo.join(&root))?, "since snapshot".to_string()),
@@ -87,7 +94,7 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&t)?);
             } else {
-                print!("{}", merak_transition::render::markdown(&t, Some(&label)));
+                print!("{}", merak_cli::render(&t, if detail { "ops" } else { &view }, &label, &a, &b));
             }
         }
     }

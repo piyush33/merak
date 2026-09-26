@@ -17,6 +17,20 @@ pub fn model(files: &Files) -> Result<Model> {
     m
 }
 
+/// How to present a transition: `contracts` (default), `plain` sentences or `ops` as derived.
+pub fn render(t: &merak_transition::Transition, view: &str, label: &str, before: &Files, after: &Files) -> String {
+    use merak_transition::render;
+    let source = |loc: &merak_ir::Loc, is_before: bool| {
+        let files = if is_before { before } else { after };
+        files.get(&loc.file).and_then(|text| text.lines().nth((loc.line as usize).saturating_sub(1))).map(str::to_string)
+    };
+    match view {
+        "ops" => render::detailed(t, Some(label)),
+        "plain" => render::markdown(t, Some(label)),
+        _ => render::contracts(t, Some(label), &source),
+    }
+}
+
 /// Sources of `base` and `head` (git revisions of `repo`; an empty `head` is the working tree).
 pub fn load_range(repo: &std::path::Path, base: &str, head: &str, root: &str) -> Result<(Files, Files)> {
     let a = source::from_git(repo, base, root)?;

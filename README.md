@@ -9,11 +9,46 @@ program's *behaviour and design*, not which lines moved.
 ```
 
 ```text
-auth widened  OrderPolicy.canCancel
-  before:  User.role ∈ {ADMIN}
-  after:   User.role ∈ {ADMIN, MANAGER}
-  affects: POST /orders/:id/cancel
-  evidence: src/policies/order.policy.ts:4
+### `OrderPolicy.canCancel` · changed
+
+reached from `POST /orders/:id/cancel` · `src/policies/order.policy.ts:4`
+
+    ~ who       User.role ∈ {ADMIN}  →  User.role ∈ {ADMIN, MANAGER}   ← widened
+                   5 - return user.role === "ADMIN";
+                   5 + return user.role === "ADMIN" || user.role === "MANAGER";
+```
+
+Each changed or new function is shown as a **behaviour contract**, before and after: what
+it `takes`, `who` may call it (access requirements), what it `returns` in each case, `pre`
+(checks that must pass), `where` (which rows its queries reach), `post` (what it writes),
+`effects` (database, HTTP, events, queues) and, for components, what it `renders`: each
+piece of content with the element that styles it and the condition that shows it. A UI
+change reads as what it does:
+
+```text
+### `renderHighlighted` · changed
+
+    + takes     typed: string   ← new parameter
+    ~ returns   when end <= start: renders differently (see renders)
+    ~ renders   {phrase}: span.font-semibold.text-gray-900  →  span.text-gray-400
+    ~ renders   {phrase.slice(start, end)}: span.text-gray-500  →  span.font-semibold.text-gray-900
+```
+Unchanged clauses stay as context; changed ones are marked (`+ - ~`) with the code behind
+them, and `a → b` always reads before → after. Broken rules (`!`: inferred invariants, declared layering and ownership), lifecycle
+changes and validation schemas attach to the contract they concern, and what Merak can't
+type is marked `?` rather than hidden. For example, a new endpoint that skips the access
+check shows up as a contract with no `who` and no `pre`, next to the rules it breaks:
+
+```text
+### `OrderController.managerCancel` · new
+
+reached from `POST /orders/:id/manager-cancel` (new route) · `src/controllers/order.controller.ts:22`
+
+    + post      Order.status := CANCELLED
+    + effects   write order · read order
+    ! rule      breaks Order.status := CANCELLED requires User.role ∈ {ADMIN} (50% of writers follow it)
+    ! rule      the controller layer now calls order.repository.ts in the repository layer, which
+                merak.toml forbids   ← declared in merak.toml
 ```
 
 AI agents make code cheap to write and expensive to verify. A textual diff is the
@@ -50,17 +85,20 @@ cargo build --release
 
 [`plugins/merak`](plugins/merak) is a Claude Code plugin: an MCP server (`merak_transition`,
 `merak_context`), a `/merak:review` skill, and a per-turn hook. When Claude finishes a turn
-that changed behaviour, the hook hands it this turn's transition once, to check against what
-was asked:
+whose edits changed behaviour in a way Merak types (auth, filters, effects, schemas, new code),
+the hook hands it this turn's transition once, to check against what was asked; other turns stay
+silent:
 
 ```text
-Merak: semantic transition of this turn's edits (1 behavioural/design change(s)):
-- AUTH_WIDENED OrderPolicy.canCancel: User.role ∈ {ADMIN} → User.role ∈ {ADMIN, MANAGER} [affects POST /orders/:id/cancel] (src/policies/order.policy.ts:4)
+Merak checked what this turn's edits do. 1 behaviour change the user should know about:
+OrderPolicy.canCancel · changed
+  ~ who       User.role ∈ {ADMIN} → User.role ∈ {ADMIN, MANAGER}  (widened)  src/policies/order.policy.ts:5
 ```
 
 ```sh
 cargo install --path crates/merak-cli
 claude plugin marketplace add /path/to/merak && claude plugin install merak@merak
+# or, for one session: claude --plugin-dir /path/to/merak/plugins/merak (absolute path)
 ```
 
 The CLI also has `merak mcp` (stdio MCP server), `merak snapshot --out f` and
@@ -93,19 +131,21 @@ A query predicate is behaviour too: which rows a query reaches. Here, from immic
 a person query that used to match only visible faces now matches faces whose visibility is unset as well:
 
 ```text
-query filter changed  PersonRepository.getAllWithoutFaces
-  before:  asset_face.isVisible is true
-  after:   (asset_face.isVisible is null ∨ asset_face.isVisible = true)
+- `PersonRepository.getAllWithoutFaces` filters rows differently: `asset_face.isVisible is true` → `(asset_face.isVisible is null ∨ asset_face.isVisible = true)`.
 ```
 
-When nothing typed explains a change, Merak says so:
+When nothing typed explains a change, Merak says so instead of calling it a refactor:
 
 ```text
-unclassified change  AuthService.changePassword
-  before:  UserRepository.update(_, {password})
-  after:   UserRepository.update(_, {password, shouldChangePassword="false"})
-  affects: POST /auth/change-password
+### Needs a human look
+
+- `AuthService.changePassword` changed in a way Merak can't classify: the arguments or conditions of its calls to `UserRepository.update` changed.
+  Affects `POST /auth/change-password` · `src/services/auth.service.ts:138`
 ```
+
+`merak diff` shows contracts by default. `--view plain` gives sentences grouped by concern,
+`--view ops` (or `--detail`) every operation as derived, and `--json` both operations and
+contracts for machines.
 
 ## How it works
 

@@ -4,6 +4,7 @@
 //! The snapshot models are only the substrate; the output of this crate — a
 //! list of typed, evidence-backed operations — is the object Merak is about.
 
+pub mod contract;
 pub mod render;
 
 use merak_behaviour::infer;
@@ -47,6 +48,9 @@ pub struct Op {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Transition {
     pub ops: Vec<Op>,
+    /// The same change as behaviour contracts, one per changed or new function (see [`contract`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contracts: Vec<contract::ContractDiff>,
     pub stats: Stats,
 }
 
@@ -133,9 +137,13 @@ pub fn match_entities(a: &Model, b: &Model) -> Matching {
     // Classes that disappeared and reappeared elsewhere with the same name and methods.
     let gone: Vec<_> = a.classes.values().filter(|c| !b.classes.contains_key(&c.id)).collect();
     let new: Vec<_> = b.classes.values().filter(|c| !a.classes.contains_key(&c.id)).collect();
+    let mut taken: BTreeSet<&str> = BTreeSet::new();
     for ca in &gone {
         let names = |ms: &[String]| -> BTreeSet<String> { ms.iter().filter_map(|x| x.rsplit('.').next().map(str::to_string)).collect() };
-        if let Some(cb) = new.iter().find(|cb| cb.name == ca.name && names(&cb.methods) == names(&ca.methods)) {
+        let fits = |cb: &&&merak_behaviour::ClassInfo| !taken.contains(cb.id.as_str()) && cb.name == ca.name && names(&cb.methods) == names(&ca.methods);
+        let found = new.iter().filter(fits).find(|cb| same_path(&ca.module, &cb.module)).or_else(|| new.iter().find(fits));
+        if let Some(cb) = found {
+            taken.insert(cb.id.as_str());
             m.moved_classes.insert(ca.id.clone(), cb.id.clone());
             for ma in &ca.methods {
                 let suffix = ma.rsplit_once("::").map(|(_, q)| q).unwrap_or(ma);
@@ -146,18 +154,27 @@ pub fn match_entities(a: &Model, b: &Model) -> Matching {
         }
     }
     // Remaining free functions: same body hash and same name (moved) or same module (renamed).
-    let unmatched_b: BTreeSet<&String> = b.entities.keys().filter(|id| !m.forward.values().any(|v| v == *id)).collect();
+    // Each new entity is claimed once, preferring the same path under a moved directory, so
+    // identical copies in several files (`fetchPrefill` in two pages) pair up one to one.
+    let mut unmatched_b: BTreeSet<&String> = b.entities.keys().filter(|id| !m.forward.values().any(|v| v == *id)).collect();
     for (ida, ea) in &a.entities {
         if m.forward.contains_key(ida) || ea.class.is_some() || ea.parent.is_some() {
             continue;
         }
-        let candidate = unmatched_b.iter().find(|idb| {
+        let fits = |idb: &&&String| {
             let eb = &b.entities[**idb];
             eb.class.is_none() && eb.parent.is_none() && eb.body_hash == ea.body_hash && (eb.name == ea.name || eb.module == ea.module)
-        });
+        };
+        let candidate = unmatched_b
+            .iter()
+            .filter(fits)
+            .find(|idb| same_path(&ea.module, &b.entities[**idb].module))
+            .or_else(|| unmatched_b.iter().find(fits))
+            .map(|idb| (*idb).clone());
         if let Some(idb) = candidate {
-            m.forward.insert(ida.clone(), (*idb).clone());
-            m.moved_functions.insert(ida.clone(), (*idb).clone());
+            unmatched_b.remove(&idb);
+            m.forward.insert(ida.clone(), idb.clone());
+            m.moved_functions.insert(ida.clone(), idb);
         }
     }
     // Closures follow their parents: `a::f.on("X")` ↔ `b::g.on("X")` when f ↔ g.
@@ -186,7 +203,12 @@ pub fn match_entities(a: &Model, b: &Model) -> Matching {
     m
 }
 
-fn short(id: &str) -> &str {
+/// The same file seen from two roots: `inner/src/a.ts` and `src/a.ts`.
+fn same_path(a: &str, b: &str) -> bool {
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+pub(crate) fn short(id: &str) -> &str {
     id.rsplit("::").next().unwrap_or(id)
 }
 
@@ -265,7 +287,7 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
     let routes_b: BTreeMap<String, &merak_behaviour::Route> = b.routes.iter().map(|r| (r.key(), r)).collect();
     for (k, r) in &routes_b {
         if !routes_a.contains_key(k) {
-            let effects = b.summaries.get(&r.handler).map(|s| s.effects.keys().map(|e| e.render()).collect::<Vec<_>>().join(", "));
+            let effects = Some(b.effects_outside_checks(&r.handler).iter().map(|(e, _)| e.render()).collect::<Vec<_>>().join(", "));
             out.push("ENTRYPOINT_ADDED", Layer::Behaviour, k.clone(), None, effects, vec![], vec![r.loc.clone()]);
         }
     }
@@ -277,7 +299,7 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
     let subs_a: BTreeSet<(String, String)> = a.subscriptions.iter().map(|s| (s.event.clone(), m.to_after(&s.handler))).collect();
     for s in &b.subscriptions {
         if !subs_a.contains(&(s.event.clone(), s.handler.clone())) {
-            let effects = b.summaries.get(&s.handler).map(|x| x.effects.keys().map(|e| e.render()).collect::<Vec<_>>().join(", "));
+            let effects = Some(b.effects_outside_checks(&s.handler).iter().map(|(e, _)| e.render()).collect::<Vec<_>>().join(", "));
             out.push("EVENT_HANDLER_ADDED", Layer::Behaviour, s.event.clone(), None, effects, vec![], vec![s.loc.clone()]).note =
                 Some(format!("handled by {}", short(&s.handler)));
         }
@@ -660,7 +682,8 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         out.push("PURE_REFACTOR", Layer::Structural, "*", None, Some(format!("{changed} entities changed; behaviour summaries unchanged")), vec![], vec![]);
     }
 
-    Transition { ops: out.ops, stats: Stats { entities_before: a.entities.len(), entities_after: b.entities.len(), entities_changed: changed } }
+    let contracts = contract::build(a, b, &m, &out.ops);
+    Transition { ops: out.ops, contracts, stats: Stats { entities_before: a.entities.len(), entities_after: b.entities.len(), entities_changed: changed } }
 }
 
 fn map_detail(m: &Matching, detail: &str) -> String {
@@ -678,7 +701,7 @@ fn rename_key(m: &Matching, key: &str) -> String {
     }
 }
 
-fn is_auth_pred(p: &Pred) -> bool {
+pub(crate) fn is_auth_pred(p: &Pred) -> bool {
     match p {
         Pred::In { field, .. } | Pred::NotIn { field, .. } => is_auth_field(field),
         Pred::And(ps) | Pred::Or(ps) => ps.iter().any(is_auth_pred),
@@ -742,7 +765,7 @@ fn own_access(e: &merak_behaviour::Entity) -> BTreeSet<&str> {
     e.access.iter().map(|x| x.requirement.as_str()).collect()
 }
 
-fn closures_by_parent(model: &Model) -> BTreeMap<&str, Vec<&str>> {
+pub(crate) fn closures_by_parent(model: &Model) -> BTreeMap<&str, Vec<&str>> {
     let mut out: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for e in model.entities.values() {
         if let Some(p) = &e.parent {
@@ -753,7 +776,7 @@ fn closures_by_parent(model: &Model) -> BTreeMap<&str, Vec<&str>> {
 }
 
 /// Filters of `id` and of every closure nested in it.
-fn scoped_filters<'x>(model: &'x Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<&'x QueryFilter> {
+pub(crate) fn scoped_filters<'x>(model: &'x Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<&'x QueryFilter> {
     let mut out = vec![];
     let mut stack = vec![id];
     while let Some(cur) = stack.pop() {

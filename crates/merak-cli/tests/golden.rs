@@ -20,7 +20,7 @@ fn run(name: &str) {
     let got: Vec<(String, String)> = t.ops.iter().map(|o| (o.kind.clone(), o.subject.clone())).collect();
     let want: Vec<(String, String)> =
         expected["ops"].as_array().unwrap().iter().map(|o| (o["kind"].as_str().unwrap().to_string(), o["subject"].as_str().unwrap().to_string())).collect();
-    let report = merak_transition::render::markdown(&t, Some(name));
+    let report = merak_transition::render::detailed(&t, Some(name));
     let mut missing: Vec<_> = want.iter().filter(|w| !got.contains(w)).collect();
     let mut extra: Vec<_> = got.iter().filter(|g| !want.contains(g)).collect();
     missing.sort();

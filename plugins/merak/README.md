@@ -11,13 +11,16 @@ behaviour: access rules, query filters, effects, validation schemas, state trans
   asked to check it against your request before it stops:
 
   ```text
-  Merak: semantic transition of this turn's edits (1 behavioural/design change(s)):
-  - AUTH_WIDENED OrderPolicy.canCancel: User.role ∈ {ADMIN} → User.role ∈ {ADMIN, MANAGER} [affects POST /orders/:id/cancel] (src/policies/order.policy.ts:4)
+  Merak checked what this turn's edits do. 1 behaviour change the user should know about:
+  OrderPolicy.canCancel · changed
+    ~ who       User.role ∈ {ADMIN} → User.role ∈ {ADMIN, MANAGER}  (widened)  src/policies/order.policy.ts:5
   ```
 
-  Refactors, logging-only and test-only turns stay silent. Claude Code labels any Stop hook that
+  Only typed changes interrupt Claude. Refactors, logging, tests, and turns whose only residue
+  is `UNCLASSIFIED_CHANGE` (UI code and anything else Merak does not model) stay silent; ask
+  with `/merak:review` or `merak_transition` to see those. Claude Code labels any Stop hook that
   continues a turn as "Stop hook error" in its UI; for Merak that is the review, not a failure.
-- **MCP tools.** `merak_transition` (a change's transition: uncommitted work by default, or
+- **MCP tools.** `merak_transition` (a change as behaviour contracts, before and after, with the code behind each change; `view: plain` or `ops` for the other presentations: uncommitted work by default, or
   `base`/`head`, with `root` for a subdirectory) and `merak_context` (what one function does:
   effects, access requirements, filters, guards, routes that reach it, callers).
 - **`/merak:review`**: a behaviour-level review of the current changes, a branch or a range.
@@ -37,8 +40,17 @@ claude plugin marketplace add /path/to/merak
 claude plugin install merak@merak
 ```
 
-For development, `claude --plugin-dir plugins/merak` loads it for one session (it also finds
-`target/release/merak` in this repository).
+To try it for one session in any project, give the **absolute** path (a relative one is
+resolved against the project you start Claude in, and a missing directory is skipped quietly):
+
+```sh
+cd /path/to/your/project
+claude --plugin-dir /path/to/merak/plugins/merak
+```
+
+The launcher finds the binary through `MERAK_BIN`, `PATH`, `~/.cargo/bin` (where
+`cargo install` puts it, often not on `PATH`) or `target/release` in this repository.
+Check that the plugin is active with `/mcp` (a `plugin:merak:merak` server) or `/merak:review`.
 
 Both MCP tools are read-only. To skip their permission prompts, allow them in your settings:
 `mcp__plugin_merak_merak__merak_transition`, `mcp__plugin_merak_merak__merak_context`.

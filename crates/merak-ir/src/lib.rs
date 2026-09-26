@@ -76,7 +76,19 @@ pub enum BinOp {
     LtEq,
     Gt,
     GtEq,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
     Other,
+}
+
+impl BinOp {
+    /// A comparison (`==`, `<` …), as opposed to arithmetic.
+    pub fn is_comparison(self) -> bool {
+        matches!(self, BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -141,8 +153,30 @@ pub enum Expr {
         value: Box<Expr>,
         loc: Loc,
     },
+    /// A JSX element or fragment: what a component renders.
+    Jsx(Box<Jsx>),
     /// Anything we don't model; keeps the source text for evidence/debugging.
     Opaque(String),
+}
+
+/// `<tag attr={…}>children</tag>`; `tag` is empty for a fragment `<>…</>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Jsx {
+    pub tag: String,
+    /// In source order; a spread `{...props}` is named `...`, a bare `disabled` is `true`.
+    pub attrs: Vec<(String, Expr)>,
+    /// Text (trimmed), expressions and nested elements, in order.
+    pub children: Vec<Expr>,
+}
+
+impl Jsx {
+    /// The literal `className` / `class`, if any.
+    pub fn class(&self) -> Option<&str> {
+        self.attrs.iter().find(|(k, _)| k == "className" || k == "class").and_then(|(_, v)| match v {
+            Expr::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

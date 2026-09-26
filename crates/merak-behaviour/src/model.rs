@@ -87,6 +87,32 @@ pub struct GuardFact {
     pub requires: Pred,
     pub on_fail: OnFail,
     pub loc: Loc,
+    /// The early exit returns a value (`if (!x) return null;`): an output case as much as a check.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub returns_value: bool,
+}
+
+/// One way a function returns: under which conditions, what value, and for markup what it renders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Output {
+    /// Conditions on the path to this `return` (the function's own guards excluded); empty: otherwise.
+    pub when: Vec<String>,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renders: Vec<Rendered>,
+    pub loc: Loc,
+}
+
+/// A piece of rendered content with the element that styles it and the condition that shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rendered {
+    /// `{phrase.slice(start, end)}`, `"Add to cart"`, or `<Icon>` for an empty element.
+    pub content: String,
+    /// The element directly around it: `span.font-semibold.text-gray-900`.
+    pub style: String,
+    /// Conditions inside the markup (`start > 0 &&`, ternaries); empty when always shown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub when: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +161,15 @@ pub struct Entity {
     pub guards: Vec<GuardFact>,
     /// For boolean predicate functions: what the return value means.
     pub returns: Option<Pred>,
+    /// Where that value is returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns_at: Option<Loc>,
+    /// Parameters as written: `typed: string`, `{ phrase, matched }: Suggestion`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<String>,
+    /// Every `return <value>`, with its conditions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<Output>,
     pub throws: bool,
     pub subscriptions: Vec<Subscription>,
     pub routes: Vec<Route>,
@@ -371,11 +406,19 @@ impl Model {
     /// checks it calls (`requireAccess` reads access tables; that is the check's behaviour).
     pub fn effects_outside_checks(&self, id: &str) -> Vec<(&EffectKey, &EffectInfo)> {
         let Some(s) = self.summaries.get(id) else { return vec![] };
-        let in_checks = |k: &EffectKey, i: &EffectInfo| {
-            i.evidence
-                .iter()
-                .all(|l| s.validations.keys().any(|v| self.summaries.get(v).and_then(|vs| vs.effects.get(k)).is_some_and(|vi| vi.evidence.contains(l))))
-        };
+        // Checks: validators it reaches, and access checks anywhere: read-only functions that
+        // take the permission to check as an argument, like `checkAccess({ permission })`.
+        // They may filter rather than throw, so they are not validators. A helper that takes a
+        // permission and also writes (`addAssets`) is not a check: its effects are real.
+        let read_only = |x: &Summary| !x.effects.keys().any(|k| crate::summary::WRITE_EFFECTS.contains(&k.kind.as_str())) && x.writes.is_empty();
+        let checks: Vec<&Summary> = s
+            .validations
+            .keys()
+            .filter_map(|v| self.summaries.get(v))
+            .chain(self.entities.values().filter(|e| e.access.iter().any(|a| a.dynamic())).filter_map(|e| self.summaries.get(&e.id)).filter(|x| read_only(x)))
+            .collect();
+        let in_checks =
+            |k: &EffectKey, i: &EffectInfo| i.evidence.iter().all(|l| checks.iter().any(|cs| cs.effects.get(k).is_some_and(|ci| ci.evidence.contains(l))));
         let mut out: Vec<(&EffectKey, &EffectInfo)> = s.effects.iter().filter(|(k, i)| !in_checks(k, i)).collect();
         out.sort_by_key(|(k, _)| (!crate::summary::WRITE_EFFECTS.contains(&k.kind.as_str()), k.render()));
         out

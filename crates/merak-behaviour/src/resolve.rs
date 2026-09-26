@@ -477,6 +477,11 @@ pub fn render(e: &Expr) -> String {
                 ir::BinOp::LtEq => "<=",
                 ir::BinOp::Gt => ">",
                 ir::BinOp::GtEq => ">=",
+                ir::BinOp::Add => "+",
+                ir::BinOp::Sub => "-",
+                ir::BinOp::Mul => "*",
+                ir::BinOp::Div => "/",
+                ir::BinOp::Rem => "%",
                 ir::BinOp::Other => "?",
             };
             format!("{} {o} {}", render(left), render(right))
@@ -497,7 +502,40 @@ pub fn render(e: &Expr) -> String {
         Expr::Await(x) => format!("await {}", render(x)),
         Expr::Conditional { test, then, otherwise } => format!("{} ? {} : {}", render(test), render(then), render(otherwise)),
         Expr::Assign { target, value, .. } => format!("{} = {}", render(target), render(value)),
+        Expr::Jsx(j) => render_jsx(j),
         Expr::Opaque(t) => t.clone(),
+    }
+}
+
+/// `<span.font-semibold.text-gray-900 onClick>{phrase}</span>`: classes as selectors,
+/// handlers by name, other attributes by value.
+fn render_jsx(j: &ir::Jsx) -> String {
+    let classes: String = j.class().map(|c| c.split_whitespace().map(|x| format!(".{x}")).collect()).unwrap_or_default();
+    let attrs: Vec<String> = j
+        .attrs
+        .iter()
+        .filter(|(k, _)| k != "key" && !(matches!(k.as_str(), "className" | "class") && j.class().is_some()))
+        .map(|(k, v)| match v {
+            _ if k.starts_with("on") => k.clone(),
+            Expr::Str(s) => format!("{k}={s:?}"),
+            Expr::Bool(true) => k.clone(),
+            other => format!("{k}={{{}}}", render(other)),
+        })
+        .collect();
+    let open = format!("{}{classes}{}", j.tag, if attrs.is_empty() { String::new() } else { format!(" {}", attrs.join(" ")) });
+    let children: String = j
+        .children
+        .iter()
+        .map(|c| match c {
+            Expr::Str(s) => s.clone(),
+            Expr::Jsx(inner) => render_jsx(inner),
+            other => format!("{{{}}}", render(other)),
+        })
+        .collect();
+    if children.is_empty() && !j.tag.is_empty() {
+        format!("<{open}/>")
+    } else {
+        format!("<{open}>{children}</{}>", j.tag)
     }
 }
 

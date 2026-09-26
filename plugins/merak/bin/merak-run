@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Find the merak binary: $MERAK_BIN, then `merak` on PATH, then a build in the
+# Find the merak binary: $MERAK_BIN, then `merak` on PATH, then `cargo install`'s
+# default location (often not on PATH for GUI-launched shells), then a build in the
 # repository this plugin lives in (development). Hooks never fail the session.
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for candidate in "${MERAK_BIN:-}" "$(command -v merak 2>/dev/null)" "$here/../../../target/release/merak"; do
+for candidate in "${MERAK_BIN:-}" "$(command -v merak 2>/dev/null)" "${CARGO_HOME:-$HOME/.cargo}/bin/merak" "$here/../../../target/release/merak"; do
   if [ -n "$candidate" ] && [ -x "$candidate" ]; then
     exec "$candidate" "$@"
   fi

@@ -52,8 +52,22 @@ pub fn run(event: &str, data: &Path) -> i32 {
     }
 }
 
+/// The project to snapshot: where the session started. Hooks receive the agent's current
+/// directory as `cwd`, which moves when it runs `cd`, so the Stop hook uses the root saved
+/// in the snapshot instead.
 fn project(input: &Value) -> PathBuf {
-    input["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    std::env::var("CLAUDE_PROJECT_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .or_else(|| input["cwd"].as_str().map(str::to_string))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Snapshot {
+    root: PathBuf,
+    files: Files,
 }
 
 fn snapshot_path(input: &Value, data: &Path) -> PathBuf {
@@ -65,7 +79,8 @@ fn snapshot_path(input: &Value, data: &Path) -> PathBuf {
 const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 pub fn prompt(input: &Value, data: &Path) -> Result<()> {
-    let files = source::from_dir(&project(input))?;
+    let root = project(input);
+    let files = source::from_dir(&root)?;
     let path = snapshot_path(input, data);
     let dir = path.parent().unwrap_or(data);
     std::fs::create_dir_all(dir)?;
@@ -74,7 +89,7 @@ pub fn prompt(input: &Value, data: &Path) -> Result<()> {
             let _ = std::fs::remove_file(old.path());
         }
     }
-    std::fs::write(&path, serde_json::to_vec(&files)?).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, serde_json::to_vec(&Snapshot { root, files })?).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -87,9 +102,16 @@ pub fn stop(input: &Value, data: &Path) -> Result<Outcome> {
     if !path.exists() {
         return Ok(Outcome::Quiet);
     }
-    let before: Files = source::from_snapshot(&path)?;
-    let after = source::from_dir(&project(input))?;
+    // A snapshot in another format (an older Merak) is not an error, just nothing to compare.
+    let Ok(snap) = serde_json::from_slice::<Snapshot>(&std::fs::read(&path)?) else { return Ok(Outcome::Quiet) };
+    let (before, after) = (snap.files, source::from_dir(&snap.root)?);
     if before == after {
+        return Ok(Outcome::Quiet);
+    }
+    // One turn edits some files; it does not replace the tree. If most paths differ, this is
+    // not the tree the snapshot came from: say nothing rather than report every file as new.
+    let shared = before.keys().filter(|k| after.contains_key(*k)).count();
+    if shared * 2 < before.len().min(after.len()) {
         return Ok(Outcome::Quiet);
     }
     let t = crate::diff(&before, &after)?;
@@ -100,46 +122,33 @@ pub fn stop(input: &Value, data: &Path) -> Result<Outcome> {
 }
 
 /// The message for the agent, if the turn changed behaviour or design.
+///
+/// Only typed changes interrupt the agent. A turn whose only residue is
+/// `UNCLASSIFIED_CHANGE` (UI code, formatting helpers, anything Merak does not model) stays
+/// quiet; `merak_transition` still shows it on request.
 pub fn report(t: &Transition) -> Option<String> {
     let ops: Vec<&Op> = t.ops.iter().filter(|o| o.layer != Layer::Structural).collect();
-    if ops.is_empty() {
+    if ops.iter().all(|o| o.kind == "UNCLASSIFIED_CHANGE") {
         return None;
     }
-    let mut lines: Vec<String> = ops.iter().map(|o| line(o)).collect();
+    // Shown as plain text in the Claude Code UI: no bold markers.
+    // Contracts first; operations no contract accounts for as plain sentences.
+    let mut lines: Vec<String> = merak_transition::render::contract_lines(t);
+    if lines.is_empty() {
+        lines = merak_transition::render::bullets(t).into_iter().map(|l| format!("- {}", l.replace("**", ""))).collect();
+    }
     let more = lines.len().saturating_sub(MAX_LINES);
     lines.truncate(MAX_LINES);
     if more > 0 {
         lines.push(format!("- … and {more} more (call merak_transition for all of them)"));
     }
+    let named = ops.iter().filter(|o| o.kind != "UNCLASSIFIED_CHANGE").count();
     Some(format!(
-        "Merak: semantic transition of this turn's edits ({} behavioural/design change(s)):\n{}\n\n\
-         Check each against what the user asked. If one is unintended (for example an access requirement or query \
-         filter removed, or a new effect), fix it. Otherwise continue and, in your reply, briefly mention the \
-         behavioural changes the user should know about. UNCLASSIFIED_CHANGE means Merak could not type the change: \
-         judge those yourself. This message is sent once per turn.",
-        ops.len(),
+        "Merak checked what this turn's edits do. {} the user should know about:\n{}\n\n\
+         Compare these with what the user asked. Fix any that are unintended (for example access that was widened, \
+         a query filter that was removed, or a new side effect). Otherwise finish, and mention the ones that matter \
+         in your reply in plain words. Changes Merak can't classify need your own judgement. This note comes once per turn.",
+        if named == 1 { "1 behaviour change".to_string() } else { format!("{named} behaviour changes") },
         lines.join("\n")
     ))
-}
-
-fn line(o: &Op) -> String {
-    let subject = o.subject.split(" → ").map(|p| p.rsplit("::").next().unwrap_or(p)).collect::<Vec<_>>().join(" → ");
-    let change = match (&o.before, &o.after) {
-        (Some(b), Some(a)) => format!(": {} → {}", clip(b), clip(a)),
-        (Some(b), None) => format!(": was {}", clip(b)),
-        (None, Some(a)) => format!(": {}", clip(a)),
-        (None, None) => String::new(),
-    };
-    let affects = if o.affects.is_empty() { String::new() } else { format!(" [affects {}]", o.affects.iter().take(3).cloned().collect::<Vec<_>>().join(", ")) };
-    let at = o.evidence_after.first().or(o.evidence_before.first()).map(|l| format!(" ({l})")).unwrap_or_default();
-    format!("- {} {subject}{change}{affects}{at}", o.kind)
-}
-
-fn clip(s: &str) -> String {
-    const MAX: usize = 160;
-    if s.chars().count() <= MAX {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(MAX).collect::<String>())
-    }
 }
