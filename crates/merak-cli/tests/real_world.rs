@@ -749,3 +749,23 @@ function findTypedPrefix(phrase: string, typed: string): [number, number] | null
     assert!(!v.contains("? calls"), "typed rows explain the change: {v}");
     assert!(v.contains("`a → b`: before → after"), "the legend explains the arrow: {v}");
 }
+
+#[test]
+fn a_changed_react_key_is_not_a_refactor() {
+    // kyzowebapp Navbar: keying the header branches so React mounts fresh DOM for each.
+    let header = |k1: &str, k2: &str| {
+        format!(
+            r#"export function MobileHeader(route: string) {{
+  if (route === "/") return <div{k1} className="h-14 bg-white">home</div>;
+  return <div{k2} className="h-14 bg-white">search</div>;
+}}"#
+        )
+    };
+    let (a, b) = (files(&[("src/Navbar.tsx", &header("", ""))]), files(&[("src/Navbar.tsx", &header(r#" key="home""#, r#" key="search""#))]));
+    let t = merak_cli::diff(&a, &b).unwrap();
+    assert!(t.ops.iter().all(|o| o.kind != "PURE_REFACTOR"), "{:#?}", t.ops);
+    assert!(t.ops.iter().any(|o| o.kind == "OUTPUT_CHANGED"), "{:#?}", t.ops);
+    let v = merak_cli::render(&t, "contracts", "test", &a, &b);
+    assert!(v.contains(r#"+ key="home""#) && v.contains(r#"+ key="search""#), "{v}");
+    assert!(v.contains("React remounts"), "{v}");
+}

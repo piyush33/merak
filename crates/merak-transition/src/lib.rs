@@ -456,6 +456,7 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
 
         query_filters(&mut out, idb, &fa, &fb);
         access_change(&mut out, idb, &sa.access, &sb.access);
+        output_change(&mut out, idb, ea, eb);
 
         for op in &mut out.ops[start..] {
             op.affects = affects.clone();
@@ -793,6 +794,31 @@ fn same_filters(a: &[&QueryFilter], b: &[&QueryFilter]) -> bool {
         v
     }
     sorted(a) == sorted(b)
+}
+
+/// What a function renders, or a literal it returns, changed. Other return values are left to
+/// the rest of the model: `return repo.update(x)` → `const r = …; return r` is a refactor.
+fn output_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity, eb: &merak_behaviour::Entity) {
+    let observable = |v: &str| v.starts_with('<') || matches!(v, "null" | "undefined" | "true" | "false") || v.starts_with('"') || v.parse::<f64>().is_ok();
+    let cases = |e: &merak_behaviour::Entity| -> Vec<String> {
+        let mut v: Vec<String> = e
+            .outputs
+            .iter()
+            .filter(|o| observable(&o.value))
+            .map(|o| format!("{}: {}", if o.when.is_empty() { "otherwise".into() } else { format!("when {}", o.when.join(" ∧ ")) }, o.value))
+            .collect();
+        v.sort();
+        v
+    };
+    let (ca, cb) = (cases(ea), cases(eb));
+    if ca == cb {
+        return;
+    }
+    let gone: Vec<&String> = ca.iter().filter(|c| !cb.contains(c)).collect();
+    let new: Vec<&String> = cb.iter().filter(|c| !ca.contains(c)).collect();
+    let join = |xs: &[&String]| (!xs.is_empty()).then(|| xs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; "));
+    let loc = |e: &merak_behaviour::Entity| e.outputs.first().map(|o| o.loc.clone()).into_iter().collect();
+    out.push("OUTPUT_CHANGED", Layer::Behaviour, subject, join(&gone), join(&new), loc(ea), loc(eb));
 }
 
 /// Access requirements reached before and after. Dropping a requirement or adding

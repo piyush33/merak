@@ -141,6 +141,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "Design rules",
         &["INVARIANT_VIOLATED", "LAYER_VIOLATION_INTRODUCED", "OWNERSHIP_VIOLATION_INTRODUCED", "LAYER_VIOLATION_RESOLVED", "OWNERSHIP_VIOLATION_RESOLVED"],
     ),
+    ("What it returns and renders", &["OUTPUT_CHANGED"]),
     ("Needs a human look", &["UNCLASSIFIED_CHANGE"]),
 ];
 
@@ -396,6 +397,7 @@ fn sentence(op: &Op) -> String {
         }
         "LAYER_VIOLATION_RESOLVED" | "OWNERSHIP_VIOLATION_RESOLVED" => format!("A declared rule is no longer broken in `{}`.", op.subject),
         "UNCLASSIFIED_CHANGE" => format!("{n} changed in a way Merak can't classify{}.", calls_summary(b, a)),
+        "OUTPUT_CHANGED" => format!("{n} returns or renders something different{}.", markup_delta(b, a).map(|d| format!(": {d}")).unwrap_or_default()),
         other => format!("{} {n}", other.replace('_', " ").to_lowercase()),
     }
 }
@@ -847,6 +849,26 @@ fn restyled(x: &crate::contract::Clause) -> Option<String> {
     }
 }
 
+/// The attributes and words that differ between two renderings of markup:
+/// `+ key="search"`, `- disabled`. `None` when nothing token-level differs.
+fn markup_delta(before: &str, after: &str) -> Option<String> {
+    let tokens =
+        |s: &str| -> Vec<String> { s.replace(['<', '>', '{', '}'], " ").split_whitespace().filter(|t| !t.starts_with('/')).map(str::to_string).collect() };
+    let (mut b, a) = (tokens(before), tokens(after));
+    let mut added = vec![];
+    for t in a {
+        match b.iter().position(|x| x == &t) {
+            Some(i) => {
+                b.remove(i);
+            }
+            None => added.push(format!("+ {t}")),
+        }
+    }
+    let removed: Vec<String> = b.into_iter().map(|t| format!("- {t}")).collect();
+    let all: Vec<String> = added.into_iter().chain(removed).collect();
+    (!all.is_empty() && all.len() <= 12).then(|| all.join(", "))
+}
+
 /// Each contract's changed clauses as one-liners (for the Claude Code hook).
 pub fn contract_lines(t: &Transition) -> Vec<String> {
     let mut out = vec![];
@@ -935,7 +957,15 @@ fn block(c: &crate::contract::ContractDiff, source: Option<SourceLine>, file: &s
             let markup = |v: &Option<String>| v.as_deref().is_some_and(|v| v.split_once(": ").is_some_and(|(_, val)| val.starts_with('<')));
             if row == "returns" && x.mark == '~' && markup(&x.before) && markup(&x.after) {
                 let case = x.after.as_deref().and_then(|v| v.split_once(": ")).map(|(c, _)| c).unwrap_or("");
-                out.push(format!("{head}{case}: renders differently (see renders)"));
+                // When styled content changed, `renders` shows it; otherwise say which attributes differ.
+                let restyled = c.clauses.iter().any(|r| r.row == "renders" && r.mark != ' ');
+                match markup_delta(x.before.as_deref().unwrap_or(""), x.after.as_deref().unwrap_or("")) {
+                    Some(delta) if !restyled => {
+                        let hint = if delta.contains("key=") { "   ← element keys: React remounts these elements instead of reusing them" } else { "" };
+                        out.extend(tagged(wrap(&head, &format!("{case}: markup changed: {delta}")), hint));
+                    }
+                    _ => out.push(format!("{head}{case}: renders differently (see renders)")),
+                }
                 if let Some(src) = source {
                     out.extend(code(x, src, file));
                 }

@@ -92,6 +92,8 @@ pub fn compute(model: &mut Model) {
                 && s.writes.is_empty()
                 && !s.effects.keys().any(|k| WRITE_EFFECTS.contains(&k.kind.as_str()))
                 && !model.routes.iter().any(|r| r.handler == e.id)
+                // A React hook (`useAuth`) throws outside its provider; calling it is not a check.
+                && !is_hook(&e.name)
         })
         .map(|e| e.id.clone())
         .collect();
@@ -133,6 +135,11 @@ pub fn compute(model: &mut Model) {
     model.summaries = sums;
     model.validators = validators;
     model.state_machines = state_machines(model);
+}
+
+/// `useAuth`, `useDeliveryLocation`: React's naming rule for hooks.
+fn is_hook(name: &str) -> bool {
+    name.strip_prefix("use").and_then(|r| r.chars().next()).is_some_and(char::is_uppercase)
 }
 
 fn handlers_by_event(model: &Model) -> BTreeMap<String, Vec<String>> {

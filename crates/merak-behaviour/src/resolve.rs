@@ -514,7 +514,8 @@ fn render_jsx(j: &ir::Jsx) -> String {
     let attrs: Vec<String> = j
         .attrs
         .iter()
-        .filter(|(k, _)| k != "key" && !(matches!(k.as_str(), "className" | "class") && j.class().is_some()))
+        // `key` stays: it decides whether React reuses an element or mounts a new one.
+        .filter(|(k, _)| !(matches!(k.as_str(), "className" | "class") && j.class().is_some()))
         .map(|(k, v)| match v {
             _ if k.starts_with("on") => k.clone(),
             Expr::Str(s) => format!("{k}={s:?}"),
