@@ -7,17 +7,18 @@ use std::process::{Command, Stdio};
 
 pub type Files = BTreeMap<String, String>;
 
-const SKIP_DIRS: &[&str] = &["node_modules", ".git", "dist", "build", "target", ".next", "coverage"];
+const SKIP_DIRS: &[&str] = &["node_modules", ".git", "dist", "build", "target", ".next", "coverage", "vendor", "testdata"];
 
 /// Test code is not product behaviour.
 const TEST_DIRS: &[&str] = &["test", "tests", "__tests__", "__mocks__", "e2e"];
 
 fn wanted(path: &str) -> bool {
-    if merak_front_ts::is_project_config(path) || path == "merak.toml" {
+    if merak_front_ts::is_project_config(path) || merak_front_go::is_project_config(path) || path == "merak.toml" {
         return true;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
-    merak_front_ts::is_supported(path) && !name.contains(".spec.") && !name.contains(".test.") && !path.split('/').any(|seg| TEST_DIRS.contains(&seg))
+    let source = merak_front_ts::is_supported(path) || merak_front_go::is_supported(path);
+    source && !name.contains(".spec.") && !name.contains(".test.") && !path.split('/').any(|seg| TEST_DIRS.contains(&seg))
 }
 
 /// Sources saved by `merak snapshot`.

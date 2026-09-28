@@ -346,7 +346,17 @@ impl<'s> Lowerer<'s> {
         }
         let loc = self.loc(class.span);
         let decorators = self.decorators(&class.decorators);
-        self.module.classes.push(ir::Class { id: self.entity_id(&name), name, extends, fields, methods, exported, loc, decorators });
+        self.module.classes.push(ir::Class {
+            id: self.entity_id(&name),
+            name,
+            extends,
+            fields,
+            methods,
+            field_tags: BTreeMap::new(),
+            exported,
+            loc,
+            decorators,
+        });
     }
 
     fn decorators(&mut self, decorators: &[Decorator]) -> Vec<ir::Call> {
@@ -899,29 +909,8 @@ fn callee_name(e: &Expression) -> Option<String> {
     }
 }
 
-/// Location-independent hash of a lowered body, used to detect moved/renamed entities.
 fn body_hash(body: &[ir::Stmt]) -> String {
-    fn strip_locs(v: &mut serde_json::Value) {
-        match v {
-            // Locations appear both as `loc` fields and inside tuple variants.
-            serde_json::Value::Object(map) if map.len() == 2 && map.contains_key("file") && map.contains_key("line") => {
-                *v = serde_json::Value::Null;
-            }
-            serde_json::Value::Object(map) => {
-                map.remove("loc");
-                // Closure ids carry the file path (`src/a.ts::f.map`); a moved function keeps its body.
-                if let Some(serde_json::Value::String(id)) = map.get_mut("Closure") {
-                    *id = id.rsplit("::").next().unwrap_or(id).to_string();
-                }
-                map.values_mut().for_each(strip_locs);
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(strip_locs),
-            _ => {}
-        }
-    }
-    let mut v = serde_json::to_value(body).unwrap_or_default();
-    strip_locs(&mut v);
-    ir::stable_hash(&v.to_string())
+    ir::body_hash(body)
 }
 
 #[cfg(test)]

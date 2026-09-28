@@ -1,0 +1,11 @@
+[package]
+name = "merak-front-go"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Merak: Go front end (tree-sitter) lowering Go packages into the structural IR"
+
+[dependencies]
+merak-ir.workspace = true
+tree-sitter = "0.25"
+tree-sitter-go = "0.23"

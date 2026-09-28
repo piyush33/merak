@@ -110,7 +110,11 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
     let mut seen = BTreeSet::new();
     for f in scoped_filters(model, kids, id) {
         if seen.insert(f.expr.clone()) {
-            let key = f.expr.trim_start_matches(['(', '¬']).split(' ').next().unwrap_or(&f.expr).to_string();
+            // By column: `status` in `status = ?`, `icons: status` for SQL; a subquery by its text.
+            let (table, pred) = f.expr.split_once(": ").unwrap_or(("", &f.expr));
+            let first = pred.trim_start_matches(['(', '¬']).split(' ').next().unwrap_or(pred);
+            let col = if matches!(first, "exists" | "not") { pred } else { first };
+            let key = if table.is_empty() { col.to_string() } else { format!("{table}: {col}") };
             out.push(Item { row: "where", key, text: f.expr.clone(), loc: Some(f.loc.clone()) });
         }
     }

@@ -10,6 +10,7 @@ pub mod model;
 pub mod pred;
 pub mod resolve;
 pub mod schema;
+pub mod sql;
 pub mod summary;
 
 pub use model::*;

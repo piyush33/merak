@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 merak-ir = { path = "crates/merak-ir" }
 merak-front-ts = { path = "crates/merak-front-ts" }
+merak-front-go = { path = "crates/merak-front-go" }
 merak-behaviour = { path = "crates/merak-behaviour" }
 merak-transition = { path = "crates/merak-transition" }
 oxc_allocator = "0.151.0"

@@ -25,6 +25,8 @@ pub enum Ty {
     },
     /// A function value (entity id).
     Function(String),
+    /// A program module referred to as a whole: a Go package, `import * as x`.
+    Namespace(String),
     Unknown,
 }
 
@@ -42,6 +44,7 @@ enum Symbol {
     Const { module: String, name: String },
     Enum { module: String, name: String },
     Record { module: String, name: String },
+    Namespace(String),
     External(String),
 }
 
@@ -49,6 +52,8 @@ pub struct Index<'p> {
     pub program: &'p ir::Program,
     functions: HashMap<String, &'p ir::Function>,
     classes: HashMap<String, &'p ir::Class>,
+    /// Interfaces of methods (Go's) implemented by exactly one class: (module, name) → class id.
+    implementers: HashMap<(String, String), String>,
 }
 
 impl<'p> Index<'p> {
@@ -63,7 +68,21 @@ impl<'p> Index<'p> {
                 classes.insert(c.id.clone(), c);
             }
         }
-        Index { program, functions, classes }
+        let mut implementers = HashMap::new();
+        for m in program.modules.values() {
+            for i in &m.interfaces {
+                let methods: Vec<&String> = i.fields.iter().filter(|(_, t)| matches!(t, TypeRef::Named(n, _) if n == "func")).map(|(k, _)| k).collect();
+                if methods.is_empty() || methods.len() != i.fields.len() {
+                    continue;
+                }
+                let found: Vec<&&ir::Class> =
+                    classes.values().filter(|c| methods.iter().all(|mname| c.methods.iter().any(|id| id.rsplit('.').next() == Some(mname.as_str())))).collect();
+                if let [c] = found.as_slice() {
+                    implementers.insert((m.path.clone(), i.name.clone()), c.id.clone());
+                }
+            }
+        }
+        Index { program, functions, classes, implementers }
     }
 
     pub fn function(&self, id: &str) -> Option<&'p ir::Function> {
@@ -141,8 +160,10 @@ impl<'p> Index<'p> {
         let imp = m.imports.iter().find(|i| i.local == name)?;
         match self.resolve_module(module, &imp.source) {
             Some(target) => {
-                if imp.imported == "*" || imp.imported == "default" {
-                    // Namespace/default imports of program modules: not modelled yet.
+                if imp.imported == "*" {
+                    Some(Symbol::Namespace(target))
+                } else if imp.imported == "default" {
+                    // Default imports of program modules: not modelled yet.
                     None
                 } else {
                     self.resolve_symbol_depth(&target, &imp.imported, depth + 1)
@@ -164,6 +185,16 @@ impl<'p> Index<'p> {
         let t = t.unwrap_async();
         if let Some(el) = t.element() {
             return Ty::Array(Box::new(self.resolve_type_depth(module, el, depth)));
+        }
+        // `orders.Order`, `sql.DB`: a type of another package.
+        if let TypeRef::Named(name, args) = t {
+            if let Some((ns, rest)) = name.split_once('.') {
+                match self.resolve_symbol(module, ns) {
+                    Some(Symbol::Namespace(m)) => return self.resolve_type_depth(&m, &TypeRef::Named(rest.to_string(), args.clone()), depth + 1),
+                    Some(Symbol::External(canon)) => return Ty::External(format!("{canon}.{rest}#")),
+                    _ => {}
+                }
+            }
         }
         match t {
             TypeRef::Named(name, _) => match self.resolve_symbol(module, name) {
@@ -218,10 +249,19 @@ impl<'p> Index<'p> {
         if let Some(i) = m.interfaces.iter().find(|i| i.name == name) {
             return Some(i.fields.clone());
         }
+        if let Some(c) = m.classes.iter().find(|c| c.name == name) {
+            return Some(c.fields.clone());
+        }
         match m.type_aliases.get(name) {
             Some(TypeRef::Object(fields)) => Some(fields.iter().cloned().collect()),
             _ => None,
         }
+    }
+
+    fn is_method_interface(&self, module: &str, name: &str) -> bool {
+        self.module(module)
+            .and_then(|m| m.interfaces.iter().find(|i| i.name == name))
+            .is_some_and(|i| !i.fields.is_empty() && i.fields.values().all(|t| matches!(t, TypeRef::Named(n, _) if n == "func")))
     }
 
     /// Finite value domain of a record field typed as an enum or string-literal union.
@@ -276,6 +316,8 @@ pub struct Env {
     pub module: String,
     pub this_class: Option<String>,
     pub vars: HashMap<String, Ty>,
+    /// Locals bound once to a constant value and never reassigned.
+    pub consts: HashMap<String, Expr>,
 }
 
 impl<'p> Index<'p> {
@@ -291,12 +333,14 @@ impl<'p> Index<'p> {
                     Some(Symbol::Enum { module, name }) => Ty::EnumObject { module, name },
                     Some(Symbol::External(canon)) => Ty::External(canon),
                     Some(Symbol::Function(id)) => Ty::Function(id),
+                    Some(Symbol::Namespace(m)) => Ty::Namespace(m),
                     _ => Ty::Unknown,
                 }
             }
             Expr::Member { object, property } => {
                 let ot = self.type_of(env, object);
                 match &ot {
+                    Ty::Namespace(m) => self.type_of(&Env { module: m.clone(), ..Default::default() }, &Expr::Ident(property.clone())),
                     Ty::Class(id) => match self.lookup_method(id, property) {
                         Ok(Some(_)) => Ty::Unknown,
                         Err(ext) => {
@@ -324,6 +368,15 @@ impl<'p> Index<'p> {
                     Some(Symbol::External(canon)) => Ty::External(format!("{canon}#")),
                     _ => Ty::Unknown,
                 },
+                // `new orders.Order(…)`, Go's `orders.Order{…}`.
+                Expr::Member { object, property } => match self.type_of(env, object) {
+                    Ty::Namespace(m) => self.type_of(
+                        &Env { module: m, ..Default::default() },
+                        &Expr::New { callee: Box::new(Expr::Ident(property.clone())), args: vec![], loc: ir::Loc { file: String::new(), line: 0 } },
+                    ),
+                    Ty::External(canon) => Ty::External(format!("{canon}.{property}#")),
+                    _ => Ty::Unknown,
+                },
                 _ => Ty::Unknown,
             },
             Expr::Call(call) => match self.resolve_call(env, &call.callee) {
@@ -335,6 +388,7 @@ impl<'p> Index<'p> {
                 Callee::Unresolved(_) => Ty::Unknown,
             },
             Expr::Closure(id) => Ty::Function(id.clone()),
+            Expr::Spawn(x) => self.type_of(env, x),
             Expr::Object(props) => Ty::Object(props.iter().map(|(k, v)| (k.clone(), self.type_of(env, v))).collect()),
             _ => Ty::Unknown,
         }
@@ -372,6 +426,20 @@ impl<'p> Index<'p> {
                     },
                     Ty::External(canon) => Callee::External(format!("{canon}.{property}()")),
                     Ty::Array(_) => Callee::External(format!("Array#.{property}()")),
+                    Ty::Namespace(m) => {
+                        let menv = Env { module: m.clone(), ..Default::default() };
+                        match self.type_of(&menv, &Expr::Ident(property.clone())) {
+                            Ty::Function(id) => Callee::Internal(id),
+                            _ => Callee::Unresolved(render(callee)),
+                        }
+                    }
+                    // A Go interface with one implementation calls that implementation.
+                    Ty::Record { name, module } if self.implementers.contains_key(&(module.clone(), name.clone())) => {
+                        match self.lookup_method(&self.implementers[&(module.clone(), name.clone())], property) {
+                            Ok(Some(m)) => Callee::Internal(m),
+                            _ => Callee::Unresolved(render(callee)),
+                        }
+                    }
                     Ty::EnumObject { .. } | Ty::Record { .. } | Ty::Object(_) | Ty::Function(_) | Ty::Unknown => {
                         // Well-known globals: `JSON.stringify`, `Math.max`, `console.log` …
                         match object.as_ref() {
@@ -388,6 +456,8 @@ impl<'p> Index<'p> {
                 // Unbound identifier: a global such as `fetch`.
                 _ => Callee::External(format!("{n}()")),
             },
+            // `(() => …)()`, Go's `func() { … }()`.
+            Expr::Closure(id) => Callee::Internal(id.clone()),
             other => Callee::Unresolved(render(other)),
         }
     }
@@ -416,6 +486,7 @@ impl<'p> Index<'p> {
                 }
                 Some(out)
             }
+            Expr::Ident(n) if env.consts.contains_key(n) => self.const_str_depth(env, &env.consts[n], depth + 1),
             Expr::Ident(n) if !env.vars.contains_key(n) => match self.resolve_symbol(&env.module, n)? {
                 Symbol::Const { module, name } => {
                     let c = self.module(&module)?.consts.iter().find(|c| c.name == name)?;
@@ -429,6 +500,8 @@ impl<'p> Index<'p> {
                     let en = self.module(&module)?.enums.iter().find(|x| x.name == name)?;
                     en.members.get(property).cloned()
                 }
+                // `orders.StatusPending`: a constant of another package.
+                Ty::Namespace(module) => self.const_str_depth(&Env { module, ..Default::default() }, &Expr::Ident(property.clone()), depth + 1),
                 _ => None,
             },
             _ => None,
@@ -459,6 +532,7 @@ impl<'p> Index<'p> {
                 }
                 Some(out)
             }
+            Expr::Ident(n) if env.consts.contains_key(n) => self.string_skeleton_depth(env, &env.consts[n], depth + 1),
             Expr::Ident(n) if !env.vars.contains_key(n) => match self.resolve_symbol(&env.module, n)? {
                 Symbol::Const { module, name } => {
                     let c = self.module(&module)?.consts.iter().find(|c| c.name == name)?;
@@ -478,8 +552,12 @@ impl<'p> Index<'p> {
             Ty::Class(id) => {
                 let c = self.class(&id)?;
                 // Only data fields count, not injected collaborators or methods.
-                let is_data =
-                    c.fields.get(property).map(|t| !matches!(self.resolve_type(id.split("::").next().unwrap_or(""), t), Ty::Class(_) | Ty::External(_)));
+                let is_data = c.fields.get(property).map(|t| match self.resolve_type(id.split("::").next().unwrap_or(""), t) {
+                    Ty::Class(_) | Ty::External(_) | Ty::Namespace(_) => false,
+                    // A collaborator behind an interface of methods (Go's `repo Repository`).
+                    Ty::Record { module, name } => !self.is_method_interface(&module, &name),
+                    _ => true,
+                });
                 if is_data == Some(true) {
                     Some(format!("{}.{property}", c.name))
                 } else {
@@ -539,6 +617,7 @@ pub fn render(e: &Expr) -> String {
         Expr::Conditional { test, then, otherwise } => format!("{} ? {} : {}", render(test), render(then), render(otherwise)),
         Expr::Assign { target, value, .. } => format!("{} = {}", render(target), render(value)),
         Expr::Jsx(j) => render_jsx(j),
+        Expr::Spawn(x) => format!("go {}", render(x)),
         Expr::Opaque(t) => t.clone(),
     }
 }

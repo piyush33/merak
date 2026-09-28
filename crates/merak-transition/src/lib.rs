@@ -720,6 +720,9 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         let validations_explained = has(&["VALIDATION_"]);
         let policies_explained = has(&["AUTH_", "GUARD_"]);
         let explained_call = |model: &Model, c: &CallShape| {
+            if c.effect {
+                return effects_explained;
+            }
             let Some(t) = c.target.as_ref() else { return false };
             (effects_explained && model.summaries.get(t).is_some_and(|s| !s.effects.is_empty() || !s.writes.is_empty()))
                 || (validations_explained && model.validators.contains(t))

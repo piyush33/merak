@@ -34,6 +34,9 @@ pub struct CallFact {
     pub loc: Loc,
     /// The call only happens on some paths (inside an `if`, loop, or `catch`).
     pub conditional: bool,
+    /// Started concurrently and not waited for (`go f()`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spawned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -235,6 +238,10 @@ pub struct CallShape {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guards: Vec<String>,
     pub loc: Loc,
+    /// A call to a catalogued effect: its effect facts say what it does, and typed effect
+    /// ops explain a change to it. Kept so a change they do not see stays visible.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub effect: bool,
 }
 
 impl CallShape {

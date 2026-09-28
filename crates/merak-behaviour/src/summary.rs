@@ -43,7 +43,7 @@ pub fn compute(model: &mut Model) {
                     add.push((
                         k.clone(),
                         EffectInfo {
-                            modes: info.modes.clone(),
+                            modes: if c.spawned { BTreeSet::from(["async via goroutine".to_string()]) } else { info.modes.clone() },
                             via: BTreeSet::from([c.target.clone()]),
                             evidence: info.evidence.clone(),
                             payloads: info.payloads.clone(),

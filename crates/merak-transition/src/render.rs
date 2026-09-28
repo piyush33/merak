@@ -980,7 +980,12 @@ fn block(c: &crate::contract::ContractDiff, source: Option<SourceLine>, file: &s
         if !short.is_empty() {
             out.extend(wrap_items(&format!("{mark} {row:<9} "), &short));
         }
-        if !long.is_empty() && c.status != "new" {
+        if c.status == "new" && row != "renders" {
+            // New and long: each on its own lines, never dropped.
+            for t in &long {
+                out.extend(wrap(&format!("{mark} {row:<9} "), t));
+            }
+        } else if !long.is_empty() && c.status != "new" {
             let what = if row == "renders" { "piece of content" } else { "case" };
             out.push(format!("{mark} {row:<9} {} unchanged", plural(long.len(), what, &format!("{what}s").replace("piece of contents", "pieces of content"))));
         }

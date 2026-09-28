@@ -11,10 +11,28 @@ use std::collections::BTreeMap;
 pub fn extract(ix: &Index, cat: &Catalog, module: &ir::Module) -> Vec<(String, SchemaFact)> {
     let env = Env { module: module.path.clone(), ..Default::default() };
     let r = Renderer { ix, cat, env: &env };
-    module
-        .consts
-        .iter()
-        .filter_map(|c| {
+    // Records with serialisation tags (Go `json:"…"`) are wire formats: each exported field as
+    // its type and tag.
+    let tagged = module.classes.iter().filter(|c| !c.field_tags.is_empty()).map(|c| {
+        let fields = c
+            .fields
+            .iter()
+            .filter(|(k, _)| c.field_tags.contains_key(*k) || k.chars().next().is_some_and(char::is_uppercase))
+            .map(|(k, t)| {
+                let ty = crate::extract::type_text(t);
+                let v = match c.field_tags.get(k) {
+                    Some(tag) => format!("{ty} `{tag}`"),
+                    None => ty,
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        (c.id.clone(), SchemaFact { fields, loc: c.loc.clone() })
+    });
+    let tagged: Vec<(String, SchemaFact)> = tagged.collect();
+    tagged
+        .into_iter()
+        .chain(module.consts.iter().filter_map(|c| {
             let init = c.init.as_ref()?;
             if !r.is_schema(init) {
                 return None;
@@ -26,7 +44,7 @@ pub fn extract(ix: &Index, cat: &Catalog, module: &ir::Module) -> Vec<(String, S
                 fields.insert("*".to_string(), whole);
             }
             Some((format!("{}::{}", module.path, c.name), SchemaFact { fields, loc: c.loc.clone() }))
-        })
+        }))
         .collect()
 }
 

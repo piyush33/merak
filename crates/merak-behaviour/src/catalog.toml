@@ -132,6 +132,172 @@ prefix = "@nestjs/common.Controller()"
 [[log]]
 api = "{console.*(),**.Logger#.*(),**.*Logger#.*(),**.*::*Logger.*(),**.*::LoggingRepository.*()}"
 
+# ============================================================================
+# Go. Canonical names drop the import path's host and major version:
+# `github.com/go-chi/chi/v5` is `go-chi/chi`, `gorm.io/gorm` is `gorm`.
+# `kind = "sql"` reads the statement in argument N (`target = "sql:N"`): its verb
+# decides read or write, its table is the target and its WHERE clause the filters.
+# ============================================================================
+
+# ---- Go: databases -----------------------------------------------------------
+[[effect]]
+api = "{database/sql,jmoiron/sqlx}.**.{Exec,Query,QueryRow,Queryx,QueryRowx,MustExec,NamedExec,NamedQuery,Prepare}()"
+kind = "sql"
+target = "sql:0"
+
+[[effect]]
+api = "{database/sql,jmoiron/sqlx}.**.{ExecContext,QueryContext,QueryRowContext,QueryxContext,QueryRowxContext,MustExecContext,NamedExecContext,NamedQueryContext,PrepareContext}()"
+kind = "sql"
+target = "sql:1"
+
+[[effect]]
+api = "jmoiron/sqlx.**.{Get,Select}()"
+kind = "sql"
+target = "sql:1"
+
+[[effect]]
+api = "jmoiron/sqlx.**.{GetContext,SelectContext}()"
+kind = "sql"
+target = "sql:2"
+
+[[effect]]
+api = "{jackc/pgx,jackc/pgx/pgxpool,jackc/pgx/pgconn}.**.{Exec,Query,QueryRow}()"
+kind = "sql"
+target = "sql:1"
+
+[[effect]]
+api = "gorm.DB#.**.{Create,CreateInBatches,Save,Update,Updates,UpdateColumn,UpdateColumns,Delete,FirstOrCreate}()"
+kind = "db_write"
+target = "type:0|gorm"
+
+[[effect]]
+api = "gorm.DB#.**.{First,Last,Take,Find,Scan,Count,Pluck,FirstOrInit}()"
+kind = "db_read"
+target = "type:0|gorm"
+
+[[effect]]
+api = "mongo-driver/mongo.**.{InsertOne,InsertMany,UpdateOne,UpdateMany,UpdateByID,ReplaceOne,DeleteOne,DeleteMany,FindOneAndUpdate,FindOneAndDelete,FindOneAndReplace,BulkWrite}()"
+kind = "db_write"
+target = "lit:mongo"
+
+[[effect]]
+api = "mongo-driver/mongo.**.{Find,FindOne,CountDocuments,Aggregate,Distinct}()"
+kind = "db_read"
+target = "lit:mongo"
+
+# ---- Go: outbound HTTP -------------------------------------------------------
+[[effect]]
+api = "net/http.{Get,Head,Post}()"
+kind = "http"
+target = "host:0"
+method = "seg:-1:upper"
+
+[[effect]]
+api = "net/http.{Client#,DefaultClient}.{Get,Head,Post}()"
+kind = "http"
+target = "host:0"
+method = "seg:-1:upper"
+
+[[effect]]
+api = "{net/http.PostForm(),net/http.Client#.PostForm(),net/http.DefaultClient.PostForm()}"
+kind = "http"
+target = "host:0"
+method = "lit:POST"
+
+# `http.NewRequest` + `client.Do(req)`: the request says where it goes.
+[[effect]]
+api = "net/http.NewRequest()"
+kind = "http"
+target = "host:1"
+method = "arg:0|?"
+
+[[effect]]
+api = "net/http.NewRequestWithContext()"
+kind = "http"
+target = "host:2"
+method = "arg:1|?"
+
+[[effect]]
+api = "go-resty/resty.**.{Get,Post,Put,Patch,Delete,Head}()"
+kind = "http"
+target = "host:0"
+method = "seg:-1:upper"
+
+# ---- Go: messaging, caches, files ---------------------------------------------
+[[effect]]
+api = "nats-io/nats_go.**.{Publish,PublishMsg,Request}()"
+kind = "queue"
+target = "arg:0"
+
+[[effect]]
+api = "segmentio/kafka-go.Writer#.WriteMessages()"
+kind = "queue"
+target = "lit:kafka"
+
+[[effect]]
+api = "redis/go-redis.**.{Set,SetNX,SetEx,SetEX,GetSet,Del,Unlink,HSet,HMSet,HDel,Expire,Incr,IncrBy,Decr,LPush,RPush,SAdd,SRem,ZAdd,ZRem}()"
+kind = "cache_write"
+target = "lit:redis"
+
+[[effect]]
+api = "redis/go-redis.**.{Get,MGet,HGet,HGetAll,Exists,LRange,SMembers,ZRange}()"
+kind = "cache_read"
+target = "lit:redis"
+
+[[effect]]
+api = "redis/go-redis.**.Publish()"
+kind = "event_emit"
+target = "arg:1"
+
+[[effect]]
+api = "os.{WriteFile,Remove,RemoveAll,Mkdir,MkdirAll,Rename,Create,Chmod}()"
+kind = "fs_write"
+target = "arg:0"
+
+[[effect]]
+api = "os.{ReadFile,ReadDir,Open,Stat}()"
+kind = "fs_read"
+target = "arg:0"
+
+[[subscribe]]
+api = "nats-io/nats_go.**.{Subscribe,QueueSubscribe}()"
+event = "arg:0"
+handler_arg = -1
+
+# ---- Go: routes ----------------------------------------------------------------
+# net/http (Go 1.22 patterns carry the method: "POST /orders/{id}").
+[[route]]
+api = "net/http.**.{HandleFunc,Handle}()"
+method = "verb:0|ANY"
+path = "route:0"
+handler_arg = -1
+
+[[route]]
+api = "{go-chi/chi,labstack/echo,gofiber/fiber}.**.{Get,Post,Put,Patch,Delete,Head,Options}()"
+method = "seg:-1:upper"
+path = "arg:0"
+handler_arg = -1
+
+[[route]]
+api = "{gin-gonic/gin,labstack/echo}.**.{GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS,Any}()"
+method = "seg:-1:upper"
+path = "arg:0"
+handler_arg = -1
+
+[[route]]
+api = "gorilla/mux.**.HandleFunc()"
+method = "lit:ANY"
+path = "arg:0"
+handler_arg = -1
+
+# ---- Go: logging -----------------------------------------------------------------
+[[log]]
+api = "{log.*(),log/slog.**,fmt.{Print,Println,Printf}(),zap.**,sirupsen/logrus.**,rs/zerolog.**,rs/zerolog/log.**}"
+
+# ---- Go: query predicates ---------------------------------------------------------
+[[filter]]
+api = "gorm.DB#.**.{Where,Or,Not}()"
+
 # ---- validation schemas ----------------------------------------------------
 # Module constants built from these roots are validation schemas. `docs` methods
 # document a schema without changing what it accepts.

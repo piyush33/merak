@@ -155,6 +155,8 @@ pub enum Expr {
     },
     /// A JSX element or fragment: what a component renders.
     Jsx(Box<Jsx>),
+    /// A call started concurrently and not waited for (Go's `go f()`).
+    Spawn(Box<Expr>),
     /// Anything we don't model; keeps the source text for evidence/debugging.
     Opaque(String),
 }
@@ -269,6 +271,9 @@ pub struct Class {
     pub fields: BTreeMap<String, TypeRef>,
     /// Method entity ids.
     pub methods: Vec<String>,
+    /// Serialisation annotations per field: Go struct tags (`json:"id,omitempty"`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub field_tags: BTreeMap<String, String>,
     pub exported: bool,
     pub loc: Loc,
     /// Decorators, as calls (`@Get(':id')`; a bare `@Injectable` has no args).
@@ -344,6 +349,31 @@ impl Program {
     pub fn functions(&self) -> impl Iterator<Item = &Function> {
         self.modules.values().flat_map(|m| m.functions.iter())
     }
+}
+
+/// Location-independent hash of a lowered body, used to detect moved/renamed entities.
+pub fn body_hash(body: &[Stmt]) -> String {
+    fn strip_locs(v: &mut serde_json::Value) {
+        match v {
+            // Locations appear both as `loc` fields and inside tuple variants.
+            serde_json::Value::Object(map) if map.len() == 2 && map.contains_key("file") && map.contains_key("line") => {
+                *v = serde_json::Value::Null;
+            }
+            serde_json::Value::Object(map) => {
+                map.remove("loc");
+                // Closure ids carry the module path (`src/a.ts::f.map`); a moved function keeps its body.
+                if let Some(serde_json::Value::String(id)) = map.get_mut("Closure") {
+                    *id = id.rsplit("::").next().unwrap_or(id).to_string();
+                }
+                map.values_mut().for_each(strip_locs);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip_locs),
+            _ => {}
+        }
+    }
+    let mut v = serde_json::to_value(body).unwrap_or_default();
+    strip_locs(&mut v);
+    stable_hash(&v.to_string())
 }
 
 /// Stable, location-independent hashing helper used by front ends.

@@ -7,9 +7,18 @@ use merak_behaviour::Model;
 use source::Files;
 use std::time::Instant;
 
+/// Lower every supported language in the source set into one program.
+pub fn lower(files: &Files) -> merak_ir::Program {
+    let mut program = merak_front_ts::lower_program(files);
+    let go = merak_front_go::lower_program(files);
+    program.modules.extend(go.modules);
+    program.aliases.extend(go.aliases);
+    program
+}
+
 pub fn model(files: &Files) -> Result<Model> {
     let t = Instant::now();
-    let program = merak_front_ts::lower_program(files);
+    let program = lower(files);
     timing("lower", t);
     let t = Instant::now();
     let m = merak_behaviour::analyze(&program, files.get("merak.toml").map(String::as_str)).map_err(anyhow::Error::msg);

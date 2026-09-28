@@ -63,8 +63,8 @@ The snapshot model is only the substrate. **The transition is the product.**
 
 ## Status
 
-Early (v0). The engine is written in Rust, and TypeScript/JavaScript is the first
-supported source language. Integrations (a Claude Code plugin and a GitHub PR
+Early (v0). The engine is written in Rust. Supported source languages: TypeScript/JavaScript
+(including JSX) and Go, alone or mixed in one repository. Integrations (a Claude Code plugin and a GitHub PR
 comment) come after the transitions are trustworthy. See [Roadmap](#roadmap).
 
 ## Quick start
@@ -159,6 +159,7 @@ source ──► merak-front-ts ──► Structural IR ──► merak-behaviou
 |---|---|
 | `merak-ir` | Language-neutral structural IR (functions, classes, statements, expressions, types) |
 | `merak-front-ts` | Lowers TS/JS into the IR, using [oxc](https://github.com/oxc-project/oxc) |
+| `merak-front-go` | Lowers Go into the IR, using [tree-sitter-go](https://github.com/tree-sitter/tree-sitter-go) |
 | `merak-behaviour` | Symbol/type/call resolution, fact extraction, the effect catalog, transitive summaries, state machines, invariant mining, design rules |
 | `merak-transition` | Entity matching across versions (including moves and renames), transition ops, Markdown rendering |
 | `merak-cli` | `merak model`, `merak diff` (directories or git revisions) |
@@ -212,6 +213,21 @@ derived transition for each:
 | 06 force PAID without payment | `INVARIANT_VIOLATED Order.status := PAID ⇒ Order.paymentId is set` |
 | 07 refund via event | `EFFECT_MADE_ASYNC`, `EVENT_HANDLER_ADDED` |
 | 08 rename file + extract helper | `PURE_REFACTOR` only |
+
+### Go
+
+The Go front end lowers into the same IR, so everything after it (summaries, invariants,
+transitions, contracts, the plugin) works unchanged. How Go maps:
+
+- **Packages are modules.** A package directory is one module (`internal/orders::Service.Cancel`), so moving code between files of a package is not a change. Imports of the repository's own packages resolve through `go.mod`. External packages get canonical names without host or major version (`github.com/go-chi/chi/v5` is `go-chi/chi`, `gorm.io/gorm` is `gorm`).
+- **Structs are classes, the receiver is `this`**, and a call through an interface with exactly one implementation (`s.repo.Save` on `repo Repository`) resolves to that implementation. Typed constant groups (`const ( StatusPending OrderStatus = "PENDING" … )`, `iota`) are enums, so field writes give state machines.
+- **Errors are exceptions.** Returning a new error (`errors.New`, `fmt.Errorf` without wrapping, a sentinel `ErrX`, an error struct) is a throw, so `if o.Status != StatusPending { return ErrNotCancellable }` is a guard. Handing on a callee's error (`if err != nil { return …, err }`, with or without a wrap, in `if` or `switch` form) is propagation, left implicit as exceptions are. Rewording a wrap message is not a change. Other error checks are named after the call that set the error: `err(svc.Cancel) ∈ {null}`.
+- **`go f()` is async.** Effects reached through a goroutine are `async via goroutine`, so moving work into one is `EFFECT_MADE_ASYNC`.
+- **Raw SQL is read.** For `database/sql`, sqlx and pgx, the statement (a literal, a constant, or a local's current value, followed through reassignments) gives read or write, the table, and the `WHERE` conjuncts as query filters (`orders: deleted_at is null`). The rest of the statement is part of the call's shape, so a changed `SET` or `JOIN` is not lost. gorm's `Where("status = ?", s)` is a filter with its placeholders filled in.
+- **Struct tags are the wire contract.** A struct with `json`/`xml`/`db` tags is a schema: a changed tag or field is `SCHEMA_FIELD_*`.
+- **Catalog:** net/http (Go 1.22 `"POST /orders/{id}"` patterns), chi, gin, echo, fiber and gorilla/mux routes; `net/http` clients (`http.NewRequest…` + `Do`), resty; database/sql, sqlx, pgx, gorm, mongo; go-redis, NATS, kafka-go; `os` files; log, slog, zap, logrus, zerolog as logging.
+
+Limits: route groups and prefixes (`r.Route("/api", …)`, `r.Group(…)`) are not joined to their routes, and middleware is invisible. Interfaces with several implementations stay unresolved, and embedded structs promote their first embedded type only.
 
 ## Benchmark
 
@@ -305,6 +321,7 @@ correctness risk. `MERAK_TIMINGS=1` prints the phase timings.
 - [x] Claude Code plugin: MCP server (`merak_transition`, `merak_context`), `/merak:review` skill, and a per-turn ledger (UserPromptSubmit snapshot, Stop review once per turn); verified in live headless sessions
 - [ ] GitHub Action: semantic transition as a PR comment
 - [ ] Intent layer: task/PR description → expected transition (LLM), compared against the actual transition
+- [x] **Go** front end (tree-sitter): packages as modules, receivers, interface dispatch, error returns as throws and propagation, goroutines, raw SQL, struct tags, Go framework catalog. On the last 60 commits of [miniflux](https://github.com/miniflux/v2) (net/http, gorilla/mux, hand-written SQL): median 0.81 s per diff, 28 commits typed, 14 flagged unclassified, 18 quiet (17 with no non-test Go change, 1 struct-field reorder), no false `PURE_REFACTOR`
 - [ ] More languages through tree-sitter front ends (Python next)
 
 ## Related work

@@ -114,6 +114,10 @@ pub trait CallSite {
     fn arg_count(&self) -> usize;
     fn arg_str(&self, i: usize) -> Option<String>;
     fn arg_prop(&self, i: usize, key: &str) -> Option<String>;
+    /// The program type argument `i` is a value of (`Order` for `&order`, or for `&orders`).
+    fn arg_type(&self, _i: usize) -> Option<String> {
+        None
+    }
 }
 
 impl Catalog {
@@ -268,6 +272,13 @@ pub fn eval_spec(spec: &str, site: &dyn CallSite) -> Option<String> {
         site.arg_str(n.parse().ok()?)
     } else if let Some(n) = spec.strip_prefix("host:") {
         site.arg_str(n.parse().ok()?).map(|url| url_host(&url))
+    } else if let Some(n) = spec.strip_prefix("type:") {
+        site.arg_type(n.parse().ok()?)
+    } else if let Some(n) = spec.strip_prefix("verb:") {
+        // `"POST /orders/{id}"` (Go 1.22 patterns): the method, if the pattern names one.
+        site.arg_str(n.parse().ok()?).and_then(|p| split_verb(&p).0.map(str::to_string))
+    } else if let Some(n) = spec.strip_prefix("route:") {
+        site.arg_str(n.parse().ok()?).map(|p| split_verb(&p).1.to_string())
     } else if let Some(rest) = spec.strip_prefix("opt:") {
         let (n, key) = rest.split_once('.')?;
         site.arg_prop(n.parse().ok()?, key)
@@ -275,6 +286,14 @@ pub fn eval_spec(spec: &str, site: &dyn CallSite) -> Option<String> {
         spec.strip_prefix("lit:").map(str::to_string)
     };
     value.or(default).map(|v| if upper { v.to_uppercase() } else { v })
+}
+
+/// `"POST /orders"` → (`POST`, `/orders`); `"/orders"` → (none, `/orders`).
+fn split_verb(pattern: &str) -> (Option<&str>, &str) {
+    match pattern.trim().split_once(' ') {
+        Some((v, rest)) if !v.is_empty() && v.chars().all(|c| c.is_ascii_uppercase()) => (Some(v), rest.trim()),
+        _ => (None, pattern.trim()),
+    }
 }
 
 pub fn url_host(url: &str) -> String {
