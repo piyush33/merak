@@ -60,6 +60,10 @@ pub struct EffectFact {
     pub key: EffectKey,
     /// The external API that produced this effect, e.g. `axios.post()`.
     pub api: String,
+    /// What it sends, when that is visible: the fields of an HTTP request body,
+    /// `{query, top_k, attrs?}` (`?`: sent only under a condition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
     pub loc: Loc,
 }
 
@@ -259,6 +263,9 @@ pub struct EffectInfo {
     pub via: BTreeSet<String>,
     /// Where the effect actually happens.
     pub evidence: BTreeSet<Loc>,
+    /// What is sent, across the places it happens (see [`EffectFact::payload`]).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub payloads: BTreeSet<String>,
 }
 
 /// Transitive behaviour of an entity: its own facts plus everything reached.

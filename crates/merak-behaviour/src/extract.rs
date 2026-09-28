@@ -270,6 +270,7 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
         depth: 0,
         // A filter callback's predicate belongs to the call it is passed to.
         filter_depth: u32::from(envs.filter_callbacks.contains(&f.id)),
+        request_depth: 0,
         ctes: scope_ctes(ix, f),
         path: vec![],
         consumed_closures: BTreeSet::new(),
@@ -350,6 +351,8 @@ struct Walker<'a, 'p> {
     depth: u32,
     /// Nesting depth inside query-filter arguments: only the outermost filter is recorded.
     filter_depth: u32,
+    /// Inside the arguments of an HTTP call: serialising its body is part of the request.
+    request_depth: u32,
     /// CTE names in scope: reading one is not a table read.
     ctes: BTreeSet<String>,
     /// Conditions under which the current statement runs: enclosing `if` tests and the
@@ -527,7 +530,9 @@ impl Walker<'_, '_> {
                 if !self.consumed_closures.contains(id) => {
                     self.e.calls.push(CallFact { target: id.clone(), loc: loc.clone(), conditional: true });
                     // By its name within this entity, so the conditions it is used under count.
+                    // By kind, not position: inserting a sibling renumbers `useMemo#4` to `#5`.
                     let name = id.strip_prefix(&format!("{}.", self.e.id)).unwrap_or(id);
+                    let name = name.split('#').next().unwrap_or(name);
                     let shape = format!("<fn {name}>");
                     self.e.call_shapes.push(CallShape { shape, target: Some(id.clone()), when: self.conditions(false), guards: self.conditions(true), loc: loc.clone() });
                 }
@@ -571,6 +576,13 @@ impl Walker<'_, '_> {
             }
             // A literal inside a predicate is part of the predicate's text.
             Callee::External(api) if self.filter_depth > 0 && self.cat.is_literal(&api) => {}
+            // `JSON.stringify` of a request body is part of the request (its payload).
+            Callee::External(api) if self.request_depth > 0 && api == "JSON.stringify()" => {}
+            // Running a query (`…selectFrom(…).where(…).execute()`) is its effect, already recorded.
+            Callee::External(api) if self.runs_effect_chain(&api) => {}
+            // A builder call that hands over a callback (`$if(c, (qb) => …)`, `select((eb) => …)`)
+            // is described by the callback's own facts and calls.
+            Callee::External(api) if c.args.iter().enumerate().any(|(i, a)| matches!(a, Expr::Closure(_)) && self.cat.callback_for(&api, i).is_some()) => {}
             Callee::External(api) => {
                 if !self.external_call(&api, c) {
                     self.e.call_shapes.push(CallShape { shape, target: None, when: self.conditions(false), guards: self.conditions(true), loc: loc.clone() });
@@ -584,9 +596,12 @@ impl Walker<'_, '_> {
         if let Expr::Member { object, .. } = &c.callee {
             self.expr(object, loc);
         }
+        let request = self.api_name(&c.callee).is_some_and(|api| self.cat.effect_for(&api).is_some_and(|r| r.kind == "http"));
+        self.request_depth += u32::from(request);
         for a in &c.args {
             self.expr(a, loc);
         }
+        self.request_depth -= u32::from(request);
     }
 
     /// `target(args)`: the target by short name (stable across moves), constant
@@ -714,6 +729,12 @@ impl Walker<'_, '_> {
                 }
                 let method = rule.method.as_ref().and_then(|m| catalog::eval_spec(m, &site));
                 let dynamic = target.is_none();
+                // A target built at runtime still has a readable shape: `…/search`.
+                let target = target.or_else(|| {
+                    let i: usize = rule.target.split(':').nth(1)?.split(['|', ':']).next()?.parse().ok()?;
+                    let skeleton = self.ix.string_skeleton(self.env, c.args.get(i)?)?;
+                    (skeleton != "…").then_some(skeleton)
+                });
                 Found::Effect(EffectKey { kind: rule.kind.clone(), target: target.unwrap_or_else(|| "<dynamic>".into()), method }, dynamic)
             } else if let Some(rule) = self.cat.subscription_for(api, false) {
                 Found::Subscribe(catalog::eval_spec(&rule.event, &site).unwrap_or_else(|| "<dynamic>".into()), rule.handler_arg.unwrap_or(-1))
@@ -732,7 +753,8 @@ impl Walker<'_, '_> {
                 if dynamic {
                     self.e.unknowns.push(Unknown { question: format!("effect target of `{api}` is not a constant"), loc: c.loc.clone() });
                 }
-                self.e.effects.push(EffectFact { key, api: api.to_string(), loc: c.loc.clone() });
+                let payload = if key.kind == "http" { self.request_body(c) } else { None };
+                self.e.effects.push(EffectFact { key, api: api.to_string(), payload, loc: c.loc.clone() });
             }
             Found::Subscribe(event, idx) => {
                 if let Some(handler) = self.handler_arg(c, idx) {
@@ -747,6 +769,57 @@ impl Walker<'_, '_> {
             Found::Nothing => return false,
         }
         true
+    }
+
+    /// `kysely.Kysely#.selectFrom().where().execute()`: the last link only runs a chain whose
+    /// root is a catalogued effect.
+    fn runs_effect_chain(&self, api: &str) -> bool {
+        let links: Vec<&str> = api.trim_end_matches("()").split("().").collect();
+        let Some(last) = links.last() else { return false };
+        if !(last.starts_with("execute") || *last == "stream") || links.len() < 2 {
+            return false;
+        }
+        (1..links.len()).any(|n| self.cat.effect_for(&format!("{}()", links[..n].join("()."))).is_some())
+    }
+
+    /// The fields an HTTP call sends: the `body` of its options (through `JSON.stringify`),
+    /// or an object passed as the data argument (`axios.post(url, { … })`).
+    fn request_body(&self, c: &ir::Call) -> Option<String> {
+        let body = c.args.iter().skip(1).find_map(|a| match a {
+            Expr::Object(props) => Some(props.iter().find(|(k, _)| k == "body" || k == "data").map(|(_, v)| v).unwrap_or(a)),
+            _ => None,
+        })?;
+        let body = match body {
+            Expr::Call(inner) if matches!(&inner.callee, Expr::Member { object, property } if property == "stringify" && matches!(object.as_ref(), Expr::Ident(n) if n == "JSON")) => {
+                inner.args.first()?
+            }
+            other => other,
+        };
+        let Expr::Object(props) = body else { return None };
+        // Fields in source order; a conditional spread `...(c ? { x } : {})` sends `x?`.
+        let mut fields = vec![];
+        for (k, v) in props {
+            if k != "..." {
+                fields.push(k.clone());
+                continue;
+            }
+            match v {
+                Expr::Conditional { then, otherwise, .. } => {
+                    for side in [then, otherwise] {
+                        if let Expr::Object(inner) = side.as_ref() {
+                            fields.extend(inner.iter().map(|(k, _)| format!("{k}?")));
+                        }
+                    }
+                }
+                Expr::Logical { op: ir::LogicOp::And, right, .. } => {
+                    if let Expr::Object(inner) = right.as_ref() {
+                        fields.extend(inner.iter().map(|(k, _)| format!("{k}?")));
+                    }
+                }
+                other => fields.push(format!("...{}", render(other))),
+            }
+        }
+        Some(format!("{{{}}}", fields.join(", ")))
     }
 
     /// Resolve the handler argument of a subscription/route call to an entity id.

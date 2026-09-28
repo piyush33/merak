@@ -19,6 +19,7 @@ pub fn compute(model: &mut Model) {
             info.modes.insert("sync".into());
             info.via.insert("direct".into());
             info.evidence.insert(eff.loc.clone());
+            info.payloads.extend(eff.payload.clone());
         }
         s.reads = e.reads.keys().cloned().collect();
         for a in &e.access {
@@ -39,7 +40,15 @@ pub fn compute(model: &mut Model) {
                 // A callee's dynamic requirement is the caller's to fill in.
                 access.extend(cs.access.values().filter(|a| !a.dynamic()).cloned());
                 for (k, info) in &cs.effects {
-                    add.push((k.clone(), EffectInfo { modes: info.modes.clone(), via: BTreeSet::from([c.target.clone()]), evidence: info.evidence.clone() }));
+                    add.push((
+                        k.clone(),
+                        EffectInfo {
+                            modes: info.modes.clone(),
+                            via: BTreeSet::from([c.target.clone()]),
+                            evidence: info.evidence.clone(),
+                            payloads: info.payloads.clone(),
+                        },
+                    ));
                 }
                 reads.extend(cs.reads.iter().cloned());
                 writes.extend(cs.writes.iter().cloned());
@@ -54,6 +63,7 @@ pub fn compute(model: &mut Model) {
                                 modes: BTreeSet::from([format!("async via {}", eff.key.target)]),
                                 via: BTreeSet::from([format!("event:{}", eff.key.target)]),
                                 evidence: info.evidence.clone(),
+                                payloads: info.payloads.clone(),
                             },
                         ));
                     }
@@ -62,11 +72,12 @@ pub fn compute(model: &mut Model) {
             let s = sums.get_mut(&e.id).unwrap();
             for (k, info) in add {
                 let slot = s.effects.entry(k).or_default();
-                let before = (slot.modes.len(), slot.via.len(), slot.evidence.len());
+                let before = (slot.modes.len(), slot.via.len(), slot.evidence.len(), slot.payloads.len());
                 slot.modes.extend(info.modes);
                 slot.via.extend(info.via);
                 slot.evidence.extend(info.evidence);
-                changed |= before != (slot.modes.len(), slot.via.len(), slot.evidence.len());
+                slot.payloads.extend(info.payloads);
+                changed |= before != (slot.modes.len(), slot.via.len(), slot.evidence.len(), slot.payloads.len());
             }
             let before = (s.reads.len(), s.writes.len(), s.access.len());
             s.reads.extend(reads);

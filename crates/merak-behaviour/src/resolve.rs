@@ -435,6 +435,42 @@ impl<'p> Index<'p> {
         }
     }
 
+    /// A string whose parts are only partly known, with `…` for the unknown ones:
+    /// `${process.env.API}/search` (directly or through a const) is `…/search`.
+    pub fn string_skeleton(&self, env: &Env, e: &Expr) -> Option<String> {
+        self.string_skeleton_depth(env, e, 0)
+    }
+
+    fn string_skeleton_depth(&self, env: &Env, e: &Expr, depth: u32) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        if let Some(v) = self.const_str(env, e) {
+            return Some(v);
+        }
+        match e {
+            Expr::Template { quasis, exprs } => {
+                let mut out = String::new();
+                for (i, q) in quasis.iter().enumerate() {
+                    out.push_str(q);
+                    if let Some(x) = exprs.get(i) {
+                        out.push_str(&self.string_skeleton_depth(env, x, depth + 1).unwrap_or_else(|| "…".into()));
+                    }
+                }
+                Some(out)
+            }
+            Expr::Ident(n) if !env.vars.contains_key(n) => match self.resolve_symbol(&env.module, n)? {
+                Symbol::Const { module, name } => {
+                    let c = self.module(&module)?.consts.iter().find(|c| c.name == name)?;
+                    let cenv = Env { module: module.clone(), ..Default::default() };
+                    self.string_skeleton_depth(&cenv, c.init.as_ref()?, depth + 1)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// `Type.field` name for a member access on a typed record, if any.
     pub fn field_path(&self, env: &Env, object: &Expr, property: &str) -> Option<String> {
         match self.type_of(env, object) {

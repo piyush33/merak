@@ -142,7 +142,15 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
     }
     for (k, i) in model.effects_outside_checks(id) {
         let later: Vec<&str> = i.modes.iter().filter(|m| m.starts_with("async")).map(String::as_str).collect();
-        let text = if later.is_empty() || i.modes.contains("sync") { k.render() } else { format!("{} ({})", k.render(), later.join(", ")) };
+        // What a request sends is part of the effect: `POST …/search {query, attrs?}`,
+        // then when it happens: `(async via OrderCancelled)`.
+        let mut text = k.render();
+        if !i.payloads.is_empty() {
+            text = format!("{text} {}", i.payloads.iter().cloned().collect::<Vec<_>>().join(" | "));
+        }
+        if !later.is_empty() && !i.modes.contains("sync") {
+            text = format!("{text} ({})", later.join(", "));
+        }
         out.push(Item { row: "effects", key: format!("{} {}", k.kind, k.target), text, loc: i.evidence.iter().next().cloned() });
     }
     out
@@ -165,6 +173,8 @@ fn compare(before: &[Item], after: &[Item]) -> Vec<Clause> {
         for a in left {
             out.push(clause(row, '-', Some(a), None));
         }
+        // "none found" says nothing when effects appear or disappear: the real items do.
+        out.retain(|c| !(c.row == "effects" && c.mark != ' ' && (c.before.as_deref() == Some("none found") || c.after.as_deref() == Some("none found"))));
     }
     out
 }
@@ -212,11 +222,35 @@ fn tag(row: &str, mark: char, before: Option<&str>, after: Option<&str>) -> Opti
         ("post", '~') => "writes a different value",
         ("effects", '+') => "new effect",
         ("effects", '-') => "effect dropped",
+        ("effects", '~') if body_delta(before, after).is_some() => return body_delta(before, after),
         ("effects", '~') if after.is_some_and(|a| a.contains("async")) => "now happens later",
         ("effects", '~') => "now happens right away",
         _ => return None,
     };
     Some(t.into())
+}
+
+/// `POST …/search {query}` → `{query, attrs?}`: "now also sends attrs".
+fn body_delta(before: Option<&str>, after: Option<&str>) -> Option<String> {
+    let fields = |s: &str| -> Option<Vec<String>> {
+        let s = match s.rfind(" (") {
+            Some(i) if s.ends_with(')') => &s[..i],
+            _ => s,
+        };
+        let body = s.rsplit_once(" {")?.1.strip_suffix('}')?;
+        Some(body.split(", ").map(|f| f.trim_end_matches('?').to_string()).filter(|f| !f.is_empty()).collect())
+    };
+    let (b, a) = (fields(before?)?, fields(after?)?);
+    let added: Vec<&String> = a.iter().filter(|f| !b.contains(f)).collect();
+    let removed: Vec<&String> = b.iter().filter(|f| !a.contains(f)).collect();
+    let list = |xs: &[&String]| xs.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(", ");
+    match (added.is_empty(), removed.is_empty()) {
+        // Same fields: something else changed (timing, the endpoint), and says so itself.
+        (true, true) => None,
+        (false, true) => Some(format!("now also sends {}", list(&added))),
+        (true, false) => Some(format!("no longer sends {}", list(&removed))),
+        (false, false) => Some(format!("now also sends {}, no longer sends {}", list(&added), list(&removed))),
+    }
 }
 
 /// `x ∈ {A}` → `x ∈ {A, B}`: widened, narrowed or changed.

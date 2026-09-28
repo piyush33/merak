@@ -689,7 +689,7 @@ fn contract_view_of_an_unchecked_new_endpoint() {
 #[test]
 fn contract_view_of_an_effect_moved_to_an_event_handler() {
     let v = contract_view("07-refund-via-event");
-    assert!(v.contains("→ POST payments.example.com (later, via OrderCancelled)   ← now happens later"), "{v}");
+    assert!(v.contains("→ POST payments.example.com {paymentId} (later, via OrderCancelled)   ← now happens later"), "{v}");
     assert!(v.contains("### `registerRefundHandler, on OrderCancelled` · new"), "{v}");
     assert!(v.contains("event `OrderCancelled` (new handler)"), "{v}");
     assert!(!v.contains("! rule"), "a new handler is not a broken rule: {v}");
@@ -768,4 +768,104 @@ fn a_changed_react_key_is_not_a_refactor() {
     let v = merak_cli::render(&t, "contracts", "test", &a, &b);
     assert!(v.contains(r#"+ key="home""#) && v.contains(r#"+ key="search""#), "{v}");
     assert!(v.contains("React remounts"), "{v}");
+}
+
+#[test]
+fn inserting_a_callback_does_not_shift_its_siblings() {
+    // kyzowebapp SearchResults: a new useMemo before three existing ones renumbered them
+    // (`useMemo#4` became `useMemo#5`), and Merak compared the wrong closures.
+    let page = |extra: &str| {
+        format!(
+            r#"import {{ useMemo }} from "react";
+export function SearchResults(data: any, code: any, q: string) {{
+  {extra}
+  const primary = useMemo(() => data.primary ?? [], [data]);
+  const searchedFor = useMemo(() => q.trim(), [q]);
+  const missingCode = useMemo(() => {{ if (!code || code.exact) return null; return code.value; }}, [code]);
+  return primary.length + searchedFor.length + (missingCode ? 1 : 0);
+}}"#
+        )
+    };
+    let (a, b) = (files(&[("src/page.tsx", &page(""))]), files(&[("src/page.tsx", &page("const attrs = useMemo(() => parseAttrs(q), [q]);"))]));
+    let t = merak_cli::diff(&a, &b).unwrap();
+    let kinds: Vec<String> = t.ops.iter().map(|o| format!("{} {}", o.kind, o.subject.rsplit("::").next().unwrap())).collect();
+    assert!(!kinds.iter().any(|k| k.starts_with("GUARD_") || k.starts_with("OUTPUT_CHANGED") || k.starts_with("DATAFLOW")), "{kinds:#?}");
+    // The one new closure is new; its siblings are matched to themselves.
+    assert!(kinds.iter().any(|k| k.starts_with("ENTITY_ADDED") && k.contains("useMemo")), "{kinds:#?}");
+    assert_eq!(kinds.iter().filter(|k| k.starts_with("ENTITY_ADDED") || k.starts_with("ENTITY_REMOVED")).count(), 1, "{kinds:#?}");
+}
+
+#[test]
+fn calls_counted_by_top_level_arguments_and_no_placeholder_effects() {
+    // `JSON.stringify({ q, limit, attrs })` has one argument, not three.
+    let src =
+        |body: &str| files(&[("src/s.ts", &format!("export function key(q: string, limit: number, attrs: string[]) {{ return JSON.stringify({body}); }}"))]);
+    let t = merak_cli::diff(&src("{ q, limit }"), &src("{ q, limit, attrs }")).unwrap();
+    let v = merak_cli::render(&t, "plain", "test", &src("{ q, limit }"), &src("{ q, limit, attrs }"));
+    assert!(!v.contains("arguments instead of"), "{v}");
+    // A pure function that starts writing does not "drop" its "none found" effects.
+    let (a, b) = (
+        files(&[("src/r.ts", "type Entry = { term: string }; export function make(t: string): Entry | null { if (!t) return null; return null; }")]),
+        files(&[(
+            "src/r.ts",
+            "type Entry = { term: string }; export function make(t: string): Entry | null { if (!t) return null; const e: Entry = { term: t }; return e; }",
+        )]),
+    );
+    let t = merak_cli::diff(&a, &b).unwrap();
+    let v = merak_cli::render(&t, "contracts", "test", &a, &b);
+    assert!(!v.contains("none found   ← effect dropped") && !v.contains("- effects   none found"), "{v}");
+    let plain = merak_cli::render(&t, "plain", "test", &a, &b);
+    assert!(!plain.contains("- when,"), "no token soup for non-markup outputs: {plain}");
+}
+
+#[test]
+fn a_new_field_in_a_request_body_is_a_behaviour_change() {
+    // kyzowebapp: the search request now sends the suggestion's attrs when there are any.
+    let page = |extra: &str| {
+        format!(
+            r#"const SEARCH_URL = `${{process.env.NEXT_PUBLIC_API}}/search`;
+export async function search(q: string, attrs: string[]) {{
+  const res = await fetch(SEARCH_URL, {{
+    method: "POST",
+    body: JSON.stringify({{ query: q, top_k: 40{extra} }}),
+  }});
+  return res.json();
+}}"#
+        )
+    };
+    let (a, b) = (files(&[("src/page.tsx", &page(""))]), files(&[("src/page.tsx", &page(", ...(attrs.length ? { attrs } : {})"))]));
+    let t = merak_cli::diff(&a, &b).unwrap();
+    let kinds: Vec<&str> = t.ops.iter().map(|o| o.kind.as_str()).collect();
+    assert!(kinds.contains(&"EFFECT_CHANGED"), "{kinds:?}");
+    let v = merak_cli::render(&t, "contracts", "test", &a, &b);
+    assert!(v.contains("POST …/search {query, top_k}  →  POST …/search {query, top_k, attrs?}"), "{v}");
+    assert!(v.contains("now also sends attrs"), "{v}");
+    let plain = merak_cli::render(&t, "plain", "test", &a, &b);
+    assert!(plain.contains("`search` now sends `{query, top_k, attrs?}` instead of `{query, top_k}` to POST …/search"), "{plain}");
+}
+
+#[test]
+fn a_typed_change_does_not_hide_other_changes_in_the_same_function() {
+    // kyzowebapp: attrs now come from the URL *and* go into the search request. The request
+    // change is typed; reading them from the URL must still be visible.
+    let page = |read: &str, send: &str| {
+        format!(
+            r#"export async function search(q: string, searchParams: URLSearchParams) {{
+  {read}
+  const res = await fetch("https://api.example.com/search", {{
+    method: "POST",
+    body: JSON.stringify({{ query: q{send} }}),
+  }});
+  return res.json();
+}}"#
+        )
+    };
+    let a = files(&[("src/page.tsx", &page("", ""))]);
+    let b = files(&[("src/page.tsx", &page(r#"const attrs = searchParams.getAll("attr");"#, ", attrs"))]);
+    let t = merak_cli::diff(&a, &b).unwrap();
+    let kinds: Vec<&str> = t.ops.iter().map(|o| o.kind.as_str()).collect();
+    assert!(kinds.contains(&"EFFECT_CHANGED"), "{kinds:?}");
+    let residue: Vec<&str> = t.ops.iter().filter(|o| o.kind == "UNCLASSIFIED_CHANGE").filter_map(|o| o.after.as_deref()).collect();
+    assert!(residue.iter().any(|r| r.contains("getAll")), "reading from the URL stays visible: {:#?}", t.ops);
+    assert!(!residue.iter().any(|r| r.contains("JSON.stringify")), "the request body is part of the request: {:#?}", t.ops);
 }

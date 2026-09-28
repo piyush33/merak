@@ -127,10 +127,62 @@ impl Matching {
     }
 }
 
+/// Closures follow their parents, level by level. Under each matched parent pair, the
+/// children of one kind (`useMemo`, `on("X")`, `$if`) pair up by identical body first and
+/// then in source order, so inserting one closure leaves its siblings matched to themselves.
+fn match_closures(a: &Model, b: &Model, m: &mut Matching) {
+    let children = |model: &Model| -> BTreeMap<String, Vec<String>> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for e in model.entities.values() {
+            if let Some(p) = &e.parent {
+                out.entry(p.clone()).or_default().push(e.id.clone());
+            }
+        }
+        for ids in out.values_mut() {
+            ids.sort_by_key(|id| (model.entities[id].loc.line, id.clone()));
+        }
+        out
+    };
+    let (kids_a, kids_b) = (children(a), children(b));
+    // `Parent.useMemo#4` → `useMemo`: the kind of closure, without its position.
+    let kind = |parent: &str, id: &str| id.strip_prefix(parent).unwrap_or(id).trim_start_matches('.').split('#').next().unwrap_or("").to_string();
+    let mut queue: Vec<(String, String)> = m.forward.iter().map(|(x, y)| (x.clone(), y.clone())).collect();
+    while let Some((pa, pb)) = queue.pop() {
+        let (Some(ca), Some(cb)) = (kids_a.get(&pa), kids_b.get(&pb)) else { continue };
+        let mut groups: BTreeMap<String, (Vec<&String>, Vec<&String>)> = BTreeMap::new();
+        for id in ca {
+            groups.entry(kind(&pa, id)).or_default().0.push(id);
+        }
+        for id in cb {
+            groups.entry(kind(&pb, id)).or_default().1.push(id);
+        }
+        for (_, (xs, mut ys)) in groups {
+            let mut rest = vec![];
+            for x in xs {
+                match ys.iter().position(|y| b.entities[*y].body_hash == a.entities[x].body_hash) {
+                    Some(i) => {
+                        let y = ys.remove(i);
+                        m.forward.insert(x.clone(), y.clone());
+                        queue.push((x.clone(), y.clone()));
+                    }
+                    None => rest.push(x),
+                }
+            }
+            // What's left changed in place: pair in source order.
+            for (x, y) in rest.into_iter().zip(ys) {
+                m.forward.insert(x.clone(), y.clone());
+                queue.push((x.clone(), y.clone()));
+            }
+        }
+    }
+}
+
 pub fn match_entities(a: &Model, b: &Model) -> Matching {
     let mut m = Matching::default();
-    for id in a.entities.keys() {
-        if b.entities.contains_key(id) {
+    // Top-level functions and methods by id. Closures are matched later, by content: their
+    // ids are positional (`useMemo#4`), so the same id can name different code.
+    for (id, e) in &a.entities {
+        if e.parent.is_none() && b.entities.get(id).is_some_and(|eb| eb.parent.is_none()) {
             m.forward.insert(id.clone(), id.clone());
         }
     }
@@ -177,16 +229,7 @@ pub fn match_entities(a: &Model, b: &Model) -> Matching {
             m.moved_functions.insert(ida.clone(), idb);
         }
     }
-    // Closures follow their parents: `a::f.on("X")` ↔ `b::g.on("X")` when f ↔ g.
-    let parents: Vec<(String, String)> = m.forward.iter().filter(|(x, y)| x != y).map(|(x, y)| (x.clone(), y.clone())).collect();
-    for (pa, pb) in parents {
-        for ida in a.entities.keys().filter(|k| k.starts_with(&format!("{pa}."))) {
-            let idb = format!("{pb}{}", &ida[pa.len()..]);
-            if b.entities.contains_key(&idb) {
-                m.forward.insert(ida.clone(), idb);
-            }
-        }
-    }
+    match_closures(a, b, &mut m);
     // Whole-module moves: every entity of module A now lives in module B.
     let mut module_votes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (x, y) in &m.forward {
@@ -414,6 +457,19 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
                         ib.evidence.iter().cloned().collect(),
                     );
                 }
+                // Same call, different data: a request that now sends another field.
+                Some(ia) if ia.payloads != ib.payloads && !ia.payloads.is_empty() && !ib.payloads.is_empty() => {
+                    let show = |i: &EffectInfo| i.payloads.iter().cloned().collect::<Vec<_>>().join(" | ");
+                    out.push(
+                        "EFFECT_CHANGED",
+                        Layer::Behaviour,
+                        idb.clone(),
+                        Some(format!("{} {}", k.render(), show(ia))),
+                        Some(format!("{} {}", k.render(), show(ib))),
+                        ia.evidence.iter().cloned().collect(),
+                        ib.evidence.iter().cloned().collect(),
+                    );
+                }
                 Some(_) => {}
             }
         }
@@ -630,18 +686,47 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
     // ------------------------------------------------------------ unclassified
     // A changed entity whose calls changed, but which no typed op explains: say so
     // rather than let it count towards a pure refactor.
-    let explained: BTreeSet<&str> = out.ops.iter().filter(|o| o.layer != Layer::Structural).map(|o| o.subject.as_str()).collect();
+    // Typed ops explain some call differences, never all of them: a changed guard explains
+    // the same call running under another condition, a changed effect explains a new call to
+    // a helper that has effects. Everything else stays visible.
+    let mut typed: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for o in out.ops.iter().filter(|o| o.layer != Layer::Structural) {
+        typed.entry(o.subject.as_str()).or_default().insert(o.kind.as_str());
+    }
     let mut unclassified = vec![];
     for (ida, idb) in &m.forward {
         let (ea, eb) = (&a.entities[ida], &b.entities[idb]);
-        if ea.body_hash == eb.body_hash || explained.contains(idb.as_str()) {
+        if ea.body_hash == eb.body_hash {
             continue;
         }
+        let kinds = typed.get(idb.as_str());
+        let has = |prefixes: &[&str]| kinds.is_some_and(|k| k.iter().any(|x| prefixes.iter().any(|p| x.starts_with(p))));
+        let conditions_explained = has(&["GUARD_", "AUTH_", "QUERY_FILTER_", "VALIDATION_", "STATE_TRANSITION_"]);
+        let effects_explained = has(&["EFFECT_", "DATAFLOW_"]);
         // Calls into helpers that exist on one side only (extracted or inlined) count as their bodies.
-        let sa = inline_shapes(a, ida, &|t| m.forward.contains_key(t));
-        let sb = inline_shapes(b, idb, &|t| m.backward.contains_key(t));
+        let unconditioned = |v: Vec<CallShape>| -> Vec<CallShape> {
+            if conditions_explained {
+                v.into_iter().map(|c| CallShape { when: vec![], guards: vec![], ..c }).collect()
+            } else {
+                v
+            }
+        };
+        let sa = unconditioned(inline_shapes(a, ida, &|t| m.forward.contains_key(t)));
+        let sb = unconditioned(inline_shapes(b, idb, &|t| m.backward.contains_key(t)));
         let (sa, sb): (Vec<&CallShape>, Vec<&CallShape>) = (sa.iter().collect(), sb.iter().collect());
-        let (gone, new) = multiset_diff(&sa, &sb);
+        let (mut gone, mut new) = multiset_diff(&sa, &sb);
+        // Calls whose meaning a typed op already reports: helpers with effects or writes, the
+        // validators behind VALIDATION_*, the policy functions behind AUTH_* and GUARD_*.
+        let validations_explained = has(&["VALIDATION_"]);
+        let policies_explained = has(&["AUTH_", "GUARD_"]);
+        let explained_call = |model: &Model, c: &CallShape| {
+            let Some(t) = c.target.as_ref() else { return false };
+            (effects_explained && model.summaries.get(t).is_some_and(|s| !s.effects.is_empty() || !s.writes.is_empty()))
+                || (validations_explained && model.validators.contains(t))
+                || (policies_explained && model.entities.get(t).is_some_and(|e| e.returns.is_some()))
+        };
+        gone.retain(|c| !explained_call(a, c));
+        new.retain(|c| !explained_call(b, c));
         if gone.is_empty() && new.is_empty() {
             continue;
         }
@@ -683,6 +768,30 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         out.push("PURE_REFACTOR", Layer::Structural, "*", None, Some(format!("{changed} entities changed; behaviour summaries unchanged")), vec![], vec![]);
     }
 
+    // A change seen from a function and from its own callback (a request made inside a
+    // `queryFn`) is one change: keep it on the outermost function.
+    let top = |id: &str| {
+        let mut cur = id.to_string();
+        while let Some(p) = b.entities.get(&cur).and_then(|e| e.parent.clone()) {
+            cur = p;
+        }
+        cur
+    };
+    let mut seen: BTreeSet<(String, String, Option<String>, Option<String>)> = BTreeSet::new();
+    let mut order: Vec<usize> = (0..out.ops.len()).collect();
+    order.sort_by_key(|&i| out.ops[i].subject.len());
+    let mut keep = vec![true; out.ops.len()];
+    for i in order {
+        let o = &out.ops[i];
+        if o.layer == Layer::Structural || !b.entities.contains_key(&o.subject) {
+            continue;
+        }
+        if !seen.insert((o.kind.clone(), top(&o.subject), o.before.clone(), o.after.clone())) {
+            keep[i] = false;
+        }
+    }
+    let mut kept = keep.into_iter();
+    out.ops.retain(|_| kept.next().unwrap_or(true));
     let contracts = contract::build(a, b, &m, &out.ops);
     Transition { ops: out.ops, contracts, stats: Stats { entities_before: a.entities.len(), entities_after: b.entities.len(), entities_changed: changed } }
 }

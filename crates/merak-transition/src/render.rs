@@ -116,6 +116,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "ENTRYPOINT_REMOVED",
             "EFFECT_ADDED",
             "EFFECT_REMOVED",
+            "EFFECT_CHANGED",
             "EFFECT_MADE_ASYNC",
             "EFFECT_MADE_SYNC",
             "EVENT_HANDLER_ADDED",
@@ -348,6 +349,19 @@ fn sentence(op: &Op) -> String {
         k if k.starts_with("STATE_TRANSITION") => state(op),
         "EFFECT_ADDED" => format!("{n} now {}.", effect(a)),
         "EFFECT_REMOVED" => format!("{n} no longer {}.", effect(b)),
+        "EFFECT_CHANGED" => {
+            // `http POST …/search {query}` → "sends `{query, attrs?}` instead of `{query}` to POST …/search".
+            let split = |s: &str| s.rsplit_once(" {").map(|(call, body)| (call.to_string(), format!("{{{body}")));
+            match (split(b), split(a)) {
+                (Some((call, bb)), Some((_, ab))) => {
+                    format!(
+                        "{n} now sends `{ab}` instead of `{bb}` to {}.",
+                        call.trim_start_matches("http ").trim_start_matches("queue ").trim_start_matches("event_emit ")
+                    )
+                }
+                _ => format!("{n} changed what it sends: `{b}` → `{a}`."),
+            }
+        }
         "EFFECT_MADE_ASYNC" => format!("{n} now {} later, via {}, instead of right away.", effect(strip_mode(a)), via(a)),
         "EFFECT_MADE_SYNC" => format!("{n} now {} right away instead of later via {}.", effect(strip_mode(a)), via(b)),
         "ENTRYPOINT_ADDED" => match effects_list(a) {
@@ -397,7 +411,14 @@ fn sentence(op: &Op) -> String {
         }
         "LAYER_VIOLATION_RESOLVED" | "OWNERSHIP_VIOLATION_RESOLVED" => format!("A declared rule is no longer broken in `{}`.", op.subject),
         "UNCLASSIFIED_CHANGE" => format!("{n} changed in a way Merak can't classify{}.", calls_summary(b, a)),
-        "OUTPUT_CHANGED" => format!("{n} returns or renders something different{}.", markup_delta(b, a).map(|d| format!(": {d}")).unwrap_or_default()),
+        "OUTPUT_CHANGED" if b.contains('<') && a.contains('<') => {
+            format!("{n} renders something different{}.", markup_delta(b, a).map(|d| format!(": {d}")).unwrap_or_default())
+        }
+        "OUTPUT_CHANGED" => match (b.is_empty(), a.is_empty()) {
+            (true, _) => format!("{n} now returns `{a}`."),
+            (_, true) => format!("{n} no longer returns `{b}`."),
+            _ => format!("{n} returns something different: `{b}` → `{a}`."),
+        },
         other => format!("{} {n}", other.replace('_', " ").to_lowercase()),
     }
 }
@@ -687,10 +708,21 @@ fn calls_summary(before: &str, after: &str) -> String {
                 let args = x.split(" when ").next().unwrap_or(x);
                 let inner = args.find('(').map(|i| &args[i + 1..args.len().saturating_sub(1)]).unwrap_or("");
                 if inner.trim().is_empty() {
-                    0
-                } else {
-                    inner.split(", ").count()
+                    return 0;
                 }
+                // Top-level commas only: `f({a, b}, c)` has two arguments.
+                let mut depth = 0i32;
+                1 + inner
+                    .chars()
+                    .filter(|c| {
+                        match c {
+                            '(' | '{' | '[' => depth += 1,
+                            ')' | '}' | ']' => depth -= 1,
+                            _ => {}
+                        }
+                        *c == ',' && depth == 0
+                    })
+                    .count()
             })
         };
         let arities: Vec<String> = a
@@ -738,6 +770,8 @@ fn call_name(shape: &str) -> String {
     let segs: Vec<&str> = target.split('.').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
         [.., class, method] if class.chars().next().is_some_and(char::is_uppercase) && !class.contains('#') => format!("{class}.{method}"),
+        // `<fn useMemo>`: a callback passed to `useMemo`.
+        [.., last] if last.starts_with("<fn ") => format!("{} callback", last.trim_start_matches("<fn ").trim_end_matches('>')),
         [.., last] => last.trim_start_matches('<').trim_end_matches('>').to_string(),
         [] => target.to_string(),
     }
