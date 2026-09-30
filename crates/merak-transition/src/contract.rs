@@ -64,7 +64,25 @@ impl ContractDiff {
     }
 }
 
-pub const ROWS: &[&str] = &["takes", "who", "returns", "pre", "where", "post", "effects", "renders", "lifecycle", "rule", "input", "calls", "other"];
+pub const ROWS: &[&str] = &[
+    "takes",
+    "who",
+    "returns",
+    "computes",
+    "pre",
+    "skips",
+    "where",
+    "post",
+    "reads",
+    "effects",
+    "consts",
+    "renders",
+    "lifecycle",
+    "rule",
+    "input",
+    "calls",
+    "other",
+];
 
 /// One item of a contract clause.
 #[derive(Debug, Clone)]
@@ -107,13 +125,49 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
         let name = short(v).to_string();
         out.push(Item { row: "pre", key: format!("check {name}"), text: format!("passes {name}"), loc: Some(l.clone()) });
     }
+    // What its local functions compute (`score = 0.25 * math.Log1p(breadth) + …`), and the
+    // constants it and they use.
+    let mut stack: Vec<&str> = kids.get(id).cloned().unwrap_or_default();
+    let mut scope = vec![id];
+    while let Some(k) = stack.pop() {
+        scope.push(k);
+        stack.extend(kids.get(k).into_iter().flatten());
+        let Some(ke) = model.entities.get(k) else { continue };
+        for o in ke.outputs.iter().filter(|o| o.formula) {
+            let when = if o.when.is_empty() { String::new() } else { format!(" when {}", o.when.join(" ∧ ")) };
+            out.push(Item { row: "computes", key: format!("{}{when}", ke.name), text: format!("{}{when} = {}", ke.name, o.value), loc: Some(o.loc.clone()) });
+        }
+    }
+    if let Some(me) = model.entities.get(id) {
+        for s in &me.skips {
+            let text = format!("{}: skipped when {}", s.over, s.when);
+            out.push(Item { row: "skips", key: text.clone(), text, loc: Some(s.loc.clone()) });
+        }
+    }
+    let mut consts: BTreeMap<&String, &String> = BTreeMap::new();
+    for k in scope {
+        if let Some(ke) = model.entities.get(k) {
+            consts.extend(ke.consts.iter());
+        }
+    }
+    for (k, v) in consts {
+        out.push(Item { row: "consts", key: k.clone(), text: format!("{k} = {v}"), loc: None });
+    }
     let mut seen = BTreeSet::new();
     for f in scoped_filters(model, kids, id) {
         if seen.insert(f.expr.clone()) {
             // By column: `status` in `status = ?`, `icons: status` for SQL; a subquery by its text.
             let (table, pred) = f.expr.split_once(": ").unwrap_or(("", &f.expr));
             let first = pred.trim_start_matches(['(', '¬']).split(' ').next().unwrap_or(pred);
-            let col = if matches!(first, "exists" | "not") { pred } else { first };
+            let joins = ["join", "left", "right", "full", "inner", "cross"];
+            let col = if matches!(first, "exists" | "not") {
+                pred
+            } else if joins.contains(&first) {
+                // A join by what it joins: `left join warehouses w`.
+                pred.split(" on ").next().unwrap_or(pred)
+            } else {
+                first
+            };
             let key = if table.is_empty() { col.to_string() } else { format!("{table}: {col}") };
             out.push(Item { row: "where", key, text: f.expr.clone(), loc: Some(f.loc.clone()) });
         }
@@ -163,7 +217,7 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
 /// Item-by-item comparison of two contracts, in clause order.
 fn compare(before: &[Item], after: &[Item]) -> Vec<Clause> {
     let mut out = vec![];
-    for row in ["takes", "who", "returns", "pre", "where", "post", "effects", "renders"] {
+    for row in ["takes", "who", "returns", "computes", "pre", "skips", "where", "post", "effects", "consts", "renders"] {
         let mut left: Vec<&Item> = before.iter().filter(|i| i.row == row).collect();
         for b in after.iter().filter(|i| i.row == row) {
             // Same text first (unchanged), then same key (changed).
@@ -206,6 +260,14 @@ fn tag(row: &str, mark: char, before: Option<&str>, after: Option<&str>) -> Opti
         ("who", '-') => "requirement dropped",
         ("who", '~') => return Some(set_change(before.unwrap_or(""), after.unwrap_or(""))),
         ("returns", '~') => "returns something else",
+        ("computes", '~') => "computes something else",
+        ("computes", '+') => "new computation",
+        ("computes", '-') => "computation removed",
+        ("skips", '+') => "leaves more items out",
+        ("skips", '-') => "no longer leaves these out",
+        ("consts", '~') => "value changed",
+        ("consts", '+') => "now used",
+        ("consts", '-') => "no longer used",
         ("returns", '+') => "new output case",
         ("returns", '-') => "output case removed",
         ("takes", '+') => "new parameter",
@@ -218,9 +280,23 @@ fn tag(row: &str, mark: char, before: Option<&str>, after: Option<&str>) -> Opti
         ("pre", '+') => "new check",
         ("pre", '-') => "check dropped",
         ("pre", '~') => return Some(set_change(before.unwrap_or(""), after.unwrap_or(""))),
+        // An outer join keeps every row: it brings data in rather than filtering.
+        ("where", '+' | '-') if [before, after].iter().flatten().any(|t| [": left join", ": right join", ": full join"].iter().any(|j| t.contains(j))) => {
+            if mark == '+' {
+                "joins in more data"
+            } else {
+                "joins in less data"
+            }
+        }
         ("where", '+') => "reaches fewer rows",
         ("where", '-') => "reaches more rows",
-        ("where", '~') => "reaches different rows",
+        ("where", '~') => return Some(match reach(before.unwrap_or(""), after.unwrap_or("")) {
+            Some(Reach::Narrower(extra)) => format!("narrower: rows must now also match {extra}"),
+            Some(Reach::Wider(extra)) => format!("wider: rows can now also match {extra}"),
+            Some(Reach::Looser(gone)) => format!("wider: rows no longer have to match {gone}"),
+            Some(Reach::Tighter(gone)) => format!("narrower: rows matching only {gone} are no longer reached"),
+            None => "reaches different rows".into(),
+        }),
         ("post", '+') => "new write",
         ("post", '-') => "no longer written",
         ("post", '~') => "writes a different value",
@@ -232,6 +308,107 @@ fn tag(row: &str, mark: char, before: Option<&str>, after: Option<&str>) -> Opti
         _ => return None,
     };
     Some(t.into())
+}
+
+/// How a changed row filter moved: terms ANDed in or dropped, alternatives ORed in or dropped.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Reach {
+    /// `a` → `a AND b`: rows must also match `b`.
+    Narrower(String),
+    /// `a` → `a OR b`.
+    Wider(String),
+    /// `a AND b` → `a`.
+    Looser(String),
+    /// `a OR b` → `a`.
+    Tighter(String),
+}
+
+/// Compare two filters on the same scope term by term. Builders are matched by name, not by
+/// what they are passed (`⟨anchorPredicate(a)⟩` is `⟨built by anchorPredicate⟩`), so a
+/// builder that now ANDs in a second term reads as that term.
+pub(crate) fn reach(before: &str, after: &str) -> Option<Reach> {
+    use merak_behaviour::clause::{split_top, strip_outer};
+    let (sa, a) = before.split_once(": ")?;
+    let (sb, b) = after.split_once(": ")?;
+    if sa != sb {
+        return None;
+    }
+    // Only the part that differs: `any of (X)` → `any of (Y)` compares X with Y, and so does
+    // `case a.ix ⟨built by f: X⟩ else …` → `case a.ix ⟨built by g: Y⟩ else …`.
+    let (a, b) = differing(a, b)?;
+    let unwrap = |t: &str| -> String {
+        let t = strip_outer(t);
+        match t.strip_prefix("⟨built by ").and_then(|x| x.strip_suffix('⟩')).and_then(|x| x.split_once(": ")) {
+            Some((_, shape)) => shape.to_string(),
+            None => t.to_string(),
+        }
+    };
+    let (a, b) = (unwrap(a), unwrap(b));
+    let (a, b) = (a.as_str(), b.as_str());
+    let key = |t: &str| -> String {
+        let t = strip_outer(t);
+        match t.strip_prefix('⟨').and_then(|x| x.strip_suffix('⟩')) {
+            Some(inner) => {
+                let inner = inner.strip_prefix("built by ").unwrap_or(inner);
+                format!("⟨{}⟩", inner.split(['(', ',']).next().unwrap_or(inner).trim())
+            }
+            None => t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(),
+        }
+    };
+    // The terms of `y` left over once each term of `x` is matched, if every one is.
+    let extra = |x: &[&str], y: &[&str]| -> Option<Vec<String>> {
+        let mut left: Vec<&str> = y.to_vec();
+        for t in x {
+            let i = left.iter().position(|u| key(u) == key(t))?;
+            left.remove(i);
+        }
+        (!left.is_empty()).then(|| left.iter().map(|t| strip_outer(t).to_string()).collect())
+    };
+    let terms = |s: &str, sep: &str| -> Vec<String> {
+        let s = strip_outer(s);
+        let mut v: Vec<String> = split_top(s, sep).into_iter().map(|t| t.trim().to_string()).collect();
+        if v.len() == 1 {
+            v = split_top(s, &sep.to_lowercase()).into_iter().map(|t| t.trim().to_string()).collect();
+        }
+        v
+    };
+    for (sep, grows, shrinks) in [(" AND ", Reach::Narrower as fn(String) -> Reach, Reach::Looser as fn(String) -> Reach), (" OR ", Reach::Wider, Reach::Tighter)] {
+        let (ta, tb) = (terms(a, sep), terms(b, sep));
+        let (ta, tb): (Vec<&str>, Vec<&str>) = (ta.iter().map(|s| s.as_str()).collect(), tb.iter().map(|s| s.as_str()).collect());
+        if ta.len() == tb.len() {
+            continue;
+        }
+        if let Some(e) = extra(&ta, &tb) {
+            return Some(grows(e.join(sep)));
+        }
+        if let Some(e) = extra(&tb, &ta) {
+            return Some(shrinks(e.join(sep)));
+        }
+    }
+    None
+}
+
+/// The differing middles of two filters, cut outside atoms. `None` under a negation, where a
+/// narrower term would mean more rows.
+pub(crate) fn differing<'s>(a: &'s str, b: &'s str) -> Option<(&'s str, &'s str)> {
+    let (ca, cb): (Vec<(usize, char)>, Vec<(usize, char)>) = (a.char_indices().collect(), b.char_indices().collect());
+    // Whether a cut before char `i` of `cs` is outside every atom.
+    let outside = |cs: &[(usize, char)], i: usize| cs[..i].iter().fold(0i32, |d, (_, c)| d + i32::from(*c == '⟨') - i32::from(*c == '⟩')) == 0;
+    let mut p = ca.iter().zip(&cb).take_while(|(x, y)| x.1 == y.1).count();
+    while p > 0 && !(outside(&ca, p) && matches!(ca[p - 1].1, ' ' | '(')) {
+        p -= 1;
+    }
+    let max = ca.len().min(cb.len()) - p;
+    let mut q = ca.iter().rev().zip(cb.iter().rev()).take(max).take_while(|(x, y)| x.1 == y.1).count();
+    while q > 0 && !(outside(&ca, ca.len() - q) && matches!(ca[ca.len() - q].1, ' ' | ')')) {
+        q -= 1;
+    }
+    let head = a[..ca.get(p).map_or(a.len(), |c| c.0)].to_lowercase();
+    if head.contains("not ") || head.contains('!') {
+        return None;
+    }
+    let cut = |s: &'s str, cs: &[(usize, char)]| &s[cs.get(p).map_or(s.len(), |c| c.0)..cs.get(cs.len() - q).map_or(s.len(), |c| c.0)];
+    Some((cut(a, &ca), cut(b, &cb)))
 }
 
 /// `POST …/search {query}` → `{query, attrs?}`: "now also sends attrs".
@@ -298,7 +475,8 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
     // Changed code: every top-level entity with a changed body (its own or a closure's).
     let mut changed: BTreeSet<String> = BTreeSet::new();
     for (ida, idb) in &m.forward {
-        if a.entities[ida].body_hash != b.entities[idb].body_hash {
+        let (ea, eb) = (&a.entities[ida], &b.entities[idb]);
+        if ea.body_hash != eb.body_hash || ea.consts != eb.consts {
             changed.insert(top_level(b, idb));
         }
     }
@@ -477,6 +655,28 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                 attach(&mut contracts, &mut program, owner, cl, &op.id);
                 continue;
             }
+            // What an entity now reads (its writes are `post` items already).
+            "DATAFLOW_EXPANDED" | "DATAFLOW_RESTRICTED" => {
+                let owner = Some(top_level(b, &op.subject)).filter(|o| contracts.contains_key(o));
+                let text = if op.kind == "DATAFLOW_EXPANDED" { op.after.as_deref() } else { op.before.as_deref() };
+                let reads = text.and_then(|t| t.split("; ").find_map(|p| p.strip_prefix("reads "))).map(str::to_string);
+                if let Some(reads) = reads {
+                    let expanded = op.kind == "DATAFLOW_EXPANDED";
+                    let cl = Clause {
+                        row: "reads".into(),
+                        mark: if expanded { '+' } else { '-' },
+                        before: (!expanded).then(|| reads.clone()),
+                        after: expanded.then_some(reads),
+                        tag: Some(if expanded { "reads more data" } else { "reads less data" }.into()),
+                        // The op's evidence is the function itself, not where it reads.
+                        evidence_before: None,
+                        evidence_after: None,
+                    };
+                    attach(&mut contracts, &mut program, owner, cl, &op.id);
+                    continue;
+                }
+                owner
+            }
             "UNCLASSIFIED_CHANGE" => {
                 let owner = Some(top_level(b, &op.subject)).filter(|o| contracts.contains_key(o));
                 let cl = Clause {
@@ -577,10 +777,10 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
         }
     }
 
-    // What a function takes, returns and renders explains a change Merak could not type
-    // otherwise: the `?` row is then noise.
+    // What a function returns and renders explains a change Merak could not type otherwise:
+    // the `?` row is then noise. A new parameter does not: what is done with it is the change.
     for c in contracts.values_mut() {
-        if c.clauses.iter().any(|x| matches!(x.row.as_str(), "takes" | "returns" | "renders") && x.mark != ' ') {
+        if c.clauses.iter().any(|x| matches!(x.row.as_str(), "returns" | "computes" | "renders") && x.mark != ' ') {
             c.clauses.retain(|x| x.mark != '?');
         }
     }
@@ -645,7 +845,7 @@ fn risk(c: &ContractDiff) -> u8 {
     let any = |row: &str, marks: &[char]| c.clauses.iter().any(|x| x.row == row && marks.contains(&x.mark));
     if c.has('!') {
         0
-    } else if any("who", &['-', '~']) || any("pre", &['-']) || any("where", &['-']) || c.clauses.iter().any(|x| x.tag.as_deref() == Some("widened")) {
+    } else if any("who", &['-', '~']) || any("pre", &['-']) || any("where", &['-']) || c.clauses.iter().any(|x| x.tag.as_deref().is_some_and(|t| t == "widened" || t.starts_with("wider:"))) {
         1
     } else if c.status == "changed" && !c.untyped_only() {
         2
@@ -655,5 +855,31 @@ fn risk(c: &ContractDiff) -> u8 {
         4
     } else {
         5
+    }
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::{reach, Reach};
+
+    #[test]
+    fn terms_anded_or_ored_in_move_the_reach() {
+        let ctx = "⟨anchorPredicate(c), each c in sc.Context⟩";
+        assert_eq!(
+            reach("scoped: any of (⟨built by anchorPredicate⟩)", &format!("scoped: any of (⟨anchorPredicate(sc.Anchor)⟩ AND {ctx})")),
+            Some(Reach::Narrower(ctx.into()))
+        );
+        assert_eq!(
+            reach("p: case ⟨built by f⟩ else false end", &format!("p: case ⟨built by g: ⟨f(x)⟩ AND {ctx}⟩ else false end")),
+            Some(Reach::Narrower(ctx.into()))
+        );
+        assert_eq!(reach("p: a = _ AND b = _", "p: a = _"), Some(Reach::Looser("b = _".into())));
+        assert_eq!(reach("p: a = _", "p: a = _ OR b = _"), Some(Reach::Wider("b = _".into())));
+        assert_eq!(reach("p: (a = _ OR b = _)", "p: (a = _)"), Some(Reach::Tighter("b = _".into())));
+        // Under a negation an extra term means more rows, not fewer: not classified.
+        assert_eq!(reach("p: not (a = _)", "p: not (a = _ AND b = _)"), None);
+        // Another builder with the same terms, or another scope, says nothing.
+        assert_eq!(reach("p: ⟨built by f⟩", "p: ⟨built by g⟩"), None);
+        assert_eq!(reach("p: a = _", "q: a = _ AND b = _"), None);
     }
 }

@@ -40,9 +40,10 @@ enum Cmd {
         /// Emit JSON instead of Markdown.
         #[arg(long)]
         json: bool,
-        /// Presentation: `contracts` (behaviour contracts, before and after), `plain`
-        /// (sentences grouped by concern) or `ops` (every operation as derived).
-        #[arg(long, default_value = "contracts")]
+        /// Presentation: `behaviour` (what changed and what it means, by entry point),
+        /// `contracts` (every contract clause, before and after), `plain` (sentences grouped
+        /// by concern) or `ops` (every operation as derived).
+        #[arg(long, default_value = "behaviour")]
         view: String,
         /// Same as `--view ops`.
         #[arg(long)]

@@ -80,7 +80,7 @@ fn tools() -> Value {
     transition_props["base"] = json!({"type": "string", "description": "Base revision (default `HEAD`)."});
     transition_props["head"] = json!({"type": "string", "description": "Head revision (default: the working tree, uncommitted changes included)."});
     transition_props["json"] = json!({"type": "boolean", "description": "Return the operations and contracts as JSON instead of Markdown."});
-    transition_props["view"] = json!({"type": "string", "enum": ["contracts", "plain", "ops"], "description": "contracts (default): each changed function's behaviour contract (who / pre / reads / post / effects), before and after, with the code behind each change. plain: sentences grouped by concern. ops: every operation as derived."});
+    transition_props["view"] = json!({"type": "string", "enum": ["behaviour", "contracts", "plain", "ops"], "description": "behaviour (default): changes grouped by entry point, each with its direction (wider / narrower), what it means and one line of code as evidence. contracts: each changed function's full behaviour contract (who / pre / reads / post / effects), before and after, with the code behind each change. plain: sentences grouped by concern. ops: every operation as derived."});
     let mut context_props = common;
     context_props["entity"] = json!({"type": "string", "description": "Function or method: `mergePeople`, `PersonService.mergePeople`, or a full id `src/x.ts::PersonService.mergePeople`."});
     json!([
@@ -115,7 +115,7 @@ fn transition(args: &Value) -> Result<String> {
         return Ok(serde_json::to_string_pretty(&t)?);
     }
     let label = if head.is_empty() { format!("{base}..working tree") } else { format!("{base}..{head}") };
-    Ok(crate::render(&t, args["view"].as_str().unwrap_or("contracts"), &label, &a, &b))
+    Ok(crate::render(&t, args["view"].as_str().unwrap_or("behaviour"), &label, &a, &b))
 }
 
 fn context(args: &Value) -> Result<String> {

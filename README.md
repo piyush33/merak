@@ -64,7 +64,7 @@ The snapshot model is only the substrate. **The transition is the product.**
 ## Status
 
 Early (v0). The engine is written in Rust. Supported source languages: TypeScript/JavaScript
-(including JSX) and Go, alone or mixed in one repository. Integrations (a Claude Code plugin and a GitHub PR
+(including JSX), Go and SQL (`.sql` files), alone or mixed in one repository. Integrations (a Claude Code plugin and a GitHub PR
 comment) come after the transitions are trustworthy. See [Roadmap](#roadmap).
 
 ## Quick start
@@ -143,9 +143,29 @@ When nothing typed explains a change, Merak says so instead of calling it a refa
   Affects `POST /auth/change-password` · `src/services/auth.service.ts:138`
 ```
 
-`merak diff` shows contracts by default. `--view plain` gives sentences grouped by concern,
-`--view ops` (or `--detail`) every operation as derived, and `--json` both operations and
-contracts for machines.
+`merak diff` shows the behaviour view by default. Changes are grouped by the entry point
+that reaches them, and each group starts with its direction (`▲ wider`, `▼ narrower`) and a
+sentence. Each changed function then has one line per behaviour (`FILTER`, `CHECK`,
+`WRITES`, `EFFECT` …), riskiest first, with one line of code as evidence. Renames fold into
+one line and unchanged clauses into a count. Every phrase is a template over the contract
+diff, so the output is deterministic. From KyzoOMS:
+
+```text
+### `GET /search/suggest` · ▼ narrower
+
+    repository.CoOccurring · changed · repository.go:710
+      ▼ FILTER    rows must now also match anchorPredicate(c) for each c in sc.Context   (2 places)
+                  was  anchorPredicate(…)
+                  now  anchorPredicate(sc.Anchor) AND anchorPredicate(c) for each c in sc.Context
+                   771   if err := r.db.WithContext(ctx).Raw(sql, args...).Scan(&rows).Error; err != nil {
+      ~ INPUT     anchors: Entity[] → scopes: Scope[]
+      ◆ RENAMED   1 output case unchanged but for names: anchors → scopes
+      same        2 output cases · 1 skip rule · 18 row filters · 8 writes · 1 constant
+```
+
+`--view contracts` shows every contract clause before and after, `--view plain` gives
+sentences grouped by concern, `--view ops` (or `--detail`) every operation as derived, and
+`--json` both operations and contracts for machines.
 
 ## How it works
 
@@ -160,6 +180,7 @@ source ──► merak-front-ts ──► Structural IR ──► merak-behaviou
 | `merak-ir` | Language-neutral structural IR (functions, classes, statements, expressions, types) |
 | `merak-front-ts` | Lowers TS/JS into the IR, using [oxc](https://github.com/oxc-project/oxc) |
 | `merak-front-go` | Lowers Go into the IR, using [tree-sitter-go](https://github.com/tree-sitter/tree-sitter-go) |
+| `merak-front-sql` | Lowers `.sql` files (functions, procedures, views, migrations, tables, indexes) into the IR |
 | `merak-behaviour` | Symbol/type/call resolution, fact extraction, the effect catalog, transitive summaries, state machines, invariant mining, design rules |
 | `merak-transition` | Entity matching across versions (including moves and renames), transition ops, Markdown rendering |
 | `merak-cli` | `merak model`, `merak diff` (directories or git revisions) |
@@ -228,6 +249,18 @@ transitions, contracts, the plugin) works unchanged. How Go maps:
 - **Catalog:** net/http (Go 1.22 `"POST /orders/{id}"` patterns), chi, gin, echo, fiber and gorilla/mux routes; `net/http` clients (`http.NewRequest…` + `Do`), resty; database/sql, sqlx, pgx, gorm, mongo; go-redis, NATS, kafka-go; `os` files; log, slog, zap, logrus, zerolog as logging.
 
 Limits: route groups and prefixes (`r.Route("/api", …)`, `r.Group(…)`) are not joined to their routes, and middleware is invisible. Interfaces with several implementations stay unresolved, and embedded structs promote their first embedded type only.
+
+### SQL
+
+SQL is read wherever it is: raw SQL in Go (database/sql, sqlx, pgx, gorm `Raw`/`Exec`) and
+`.sql` files. One analyzer (`sqlflow.rs`) reads a statement or script. It follows CTEs,
+`UNION` arms, joins, subqueries and `LATERAL`, and finds:
+
+- every table read and written, and schema changes (`create index … on t`);
+- row conditions: `WHERE` conjuncts and `JOIN … ON`, labelled by the CTE they belong to, each traced to its line;
+- **column lineage**: where each written column's value comes from, followed through CTEs to base-table columns. For example, `inventory_live_stock_stage.stack_number := inventory_count.remarks` becomes `{bill_items.stack_numbers, grn_line_items.stack_numbers, inventory_count.remarks}`. Ordering inside aggregates and windows is not a source.
+
+In `.sql` files, `CREATE FUNCTION`/`PROCEDURE`/`VIEW` are entities, and plpgsql control flow (`IF`, loops, `RAISE EXCEPTION` as a throw, `RETURN QUERY`, `EXCEPTION` handlers) is modelled. Other statements (a migration) are the file's `<script>` entity. Tables, their columns, constraints and indexes are schemas, so an added column or a dropped unique index is `SCHEMA_FIELD_*`. Outer joins "join in more data" rather than filter.
 
 ## Benchmark
 

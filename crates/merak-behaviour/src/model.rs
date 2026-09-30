@@ -99,6 +99,16 @@ pub struct GuardFact {
     pub returns_value: bool,
 }
 
+/// Items a loop leaves out: `for _, a := range arms { if len(raw) == 0 { continue } … }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkipFact {
+    /// What the loop goes over: `a in arms`.
+    pub over: String,
+    /// When an item is skipped (`continue`) or the loop ends early (`break`).
+    pub when: String,
+    pub loc: Loc,
+}
+
 /// One way a function returns: under which conditions, what value, and for markup what it renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Output {
@@ -108,6 +118,10 @@ pub struct Output {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renders: Vec<Rendered>,
     pub loc: Loc,
+    /// `value` is the formula a returned local was computed by (`s := a*x + b; if c { s += d }`),
+    /// with constants by value: a change to it is a change to what the function computes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub formula: bool,
 }
 
 /// A piece of rendered content with the element that styles it and the condition that shows it.
@@ -191,6 +205,12 @@ pub struct Entity {
     /// Log calls, as call shapes: not behaviour, but not nothing either.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logs: Vec<CallShape>,
+    /// Loop filters: items skipped (`continue`) or loops stopped (`break`) under a condition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skips: Vec<SkipFact>,
+    /// Module constants the entity uses, with their values (`wCatalog = 0.25`): tuning.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub consts: BTreeMap<String, String>,
     /// Access requirements stated in the entity's calls and decorators.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<AccessFact>,

@@ -401,6 +401,7 @@ dependencies = [
  "clap",
  "merak-behaviour",
  "merak-front-go",
+ "merak-front-sql",
  "merak-front-ts",
  "merak-ir",
  "merak-transition",
@@ -416,6 +417,13 @@ dependencies = [
  "merak-ir",
  "tree-sitter",
  "tree-sitter-go",
+]
+
+[[package]]
+name = "merak-front-sql"
+version = "0.1.0"
+dependencies = [
+ "merak-ir",
 ]
 
 [[package]]

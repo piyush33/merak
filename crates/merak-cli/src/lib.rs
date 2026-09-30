@@ -13,6 +13,7 @@ pub fn lower(files: &Files) -> merak_ir::Program {
     let go = merak_front_go::lower_program(files);
     program.modules.extend(go.modules);
     program.aliases.extend(go.aliases);
+    program.modules.extend(merak_front_sql::lower_program(files).modules);
     program
 }
 
@@ -26,7 +27,7 @@ pub fn model(files: &Files) -> Result<Model> {
     m
 }
 
-/// How to present a transition: `contracts` (default), `plain` sentences or `ops` as derived.
+/// How to present a transition: `behaviour` (default), `contracts`, `plain` sentences or `ops` as derived.
 pub fn render(t: &merak_transition::Transition, view: &str, label: &str, before: &Files, after: &Files) -> String {
     use merak_transition::render;
     let source = |loc: &merak_ir::Loc, is_before: bool| {
@@ -36,7 +37,8 @@ pub fn render(t: &merak_transition::Transition, view: &str, label: &str, before:
     match view {
         "ops" => render::detailed(t, Some(label)),
         "plain" => render::markdown(t, Some(label)),
-        _ => render::contracts(t, Some(label), &source),
+        "contracts" => render::contracts(t, Some(label), &source),
+        _ => merak_transition::behaviour::render(t, Some(label), &source),
     }
 }
 

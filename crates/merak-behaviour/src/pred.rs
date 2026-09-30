@@ -165,6 +165,20 @@ fn merge(ps: Vec<Pred>, is_or: bool) -> Pred {
                 *v2 = inter;
                 true
             }
+            // `f ∈ {a} ∧ f ∉ {b}` is `f ∈ {a}`: a later case of a switch excludes the earlier ones.
+            (Pred::NotIn { field: f1, values: v1 }, Pred::In { field: f2, values: v2 }) if !is_or && f1 == f2 && !v2.is_subset(v1) => {
+                v2.retain(|v| !v1.contains(v));
+                true
+            }
+            (Pred::In { field: f1, values: v1 }, q @ Pred::NotIn { .. }) if !is_or && q.field() == Some(f1.as_str()) => {
+                let Pred::NotIn { values: v2, .. } = &*q else { unreachable!() };
+                let kept: BTreeSet<String> = v1.difference(v2).cloned().collect();
+                if kept.is_empty() {
+                    return false;
+                }
+                *q = Pred::In { field: f1.clone(), values: kept };
+                true
+            }
             _ => false,
         });
         if !merged && !out.contains(&p) {

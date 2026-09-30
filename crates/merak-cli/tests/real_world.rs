@@ -321,8 +321,9 @@ fn condition_added_around_a_call_is_not_a_refactor() {
     let src = |body: &str| files(&[("src/w.ts", &format!("export async function wait(isLocked: boolean) {{ while (true) {{ {body} }} }}"))]);
     let t = merak_cli::diff(&src("await sleep(1000);"), &src("if (!isLocked) { await sleep(1000); }")).unwrap();
     let kinds: Vec<&str> = t.ops.iter().map(|o| o.kind.as_str()).collect();
-    assert_eq!(kinds, ["UNCLASSIFIED_CHANGE"], "{:#?}", t.ops);
-    assert_eq!(t.ops[0].after.as_deref(), Some("sleep(1000) when isLocked is not set"));
+    // Typed now: the loop's work is skipped while the lock is held.
+    assert_eq!(kinds, ["SKIP_ADDED"], "{:#?}", t.ops);
+    assert_eq!(t.ops[0].after.as_deref(), Some("loop: skipped when isLocked is set"));
 }
 
 #[test]
@@ -360,7 +361,7 @@ fn guarded_promise_sleep_is_not_a_refactor() {
         &src("if (!isLocked) { await new Promise((resolve) => setTimeout(resolve, 1000)); }"),
     )
     .unwrap();
-    assert_eq!(t.ops.iter().map(|o| o.kind.as_str()).collect::<Vec<_>>(), ["UNCLASSIFIED_CHANGE"], "{:#?}", t.ops);
+    assert_eq!(t.ops.iter().map(|o| o.kind.as_str()).collect::<Vec<_>>(), ["SKIP_ADDED"], "{:#?}", t.ops);
 }
 
 // ---- M6: new code is described ----------------------------------------------

@@ -118,6 +118,11 @@ pub trait CallSite {
     fn arg_type(&self, _i: usize) -> Option<String> {
         None
     }
+    /// The model a query-builder chain works on: the type of argument 0, or an earlier
+    /// `Model(&T{})` / `Table("t")` link.
+    fn chain_model(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Catalog {
@@ -272,6 +277,8 @@ pub fn eval_spec(spec: &str, site: &dyn CallSite) -> Option<String> {
         site.arg_str(n.parse().ok()?)
     } else if let Some(n) = spec.strip_prefix("host:") {
         site.arg_str(n.parse().ok()?).map(|url| url_host(&url))
+    } else if spec == "model" {
+        site.chain_model()
     } else if let Some(n) = spec.strip_prefix("type:") {
         site.arg_type(n.parse().ok()?)
     } else if let Some(n) = spec.strip_prefix("verb:") {

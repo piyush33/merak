@@ -17,7 +17,7 @@ fn wanted(path: &str) -> bool {
         return true;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
-    let source = merak_front_ts::is_supported(path) || merak_front_go::is_supported(path);
+    let source = merak_front_ts::is_supported(path) || merak_front_go::is_supported(path) || merak_front_sql::is_supported(path);
     source && !name.contains(".spec.") && !name.contains(".test.") && !path.split('/').any(|seg| TEST_DIRS.contains(&seg))
 }
 

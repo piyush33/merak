@@ -1,0 +1,9 @@
+[package]
+name = "merak-front-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Merak: SQL front end lowering .sql files (functions, views, migrations, tables) into the structural IR"
+
+[dependencies]
+merak-ir.workspace = true

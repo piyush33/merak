@@ -21,6 +21,8 @@ pub fn extract(ix: &Index, cat: &Catalog, module: &ir::Module) -> Vec<(String, S
             .map(|(k, t)| {
                 let ty = crate::extract::type_text(t);
                 let v = match c.field_tags.get(k) {
+                    // A SQL column's definition already starts with its type.
+                    Some(tag) if tag.starts_with(&ty.to_lowercase()) => tag.clone(),
                     Some(tag) => format!("{ty} `{tag}`"),
                     None => ty,
                 };

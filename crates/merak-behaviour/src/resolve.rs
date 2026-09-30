@@ -609,7 +609,17 @@ pub fn render(e: &Expr) -> String {
             format!("{} {o} {}", render(left), render(right))
         }
         Expr::Not(x) => format!("!{}", render(x)),
-        Expr::Template { .. } => "`…`".into(),
+        Expr::Template { quasis, exprs } => {
+            let mut out = String::from("`");
+            for (i, q) in quasis.iter().enumerate() {
+                out.push_str(q);
+                if let Some(x) = exprs.get(i) {
+                    out.push_str(&format!("${{{}}}", render(x)));
+                }
+            }
+            out.push('`');
+            out
+        }
         Expr::Object(_) => "{…}".into(),
         Expr::Array(xs) => format!("[{}]", xs.iter().map(render).collect::<Vec<_>>().join(", ")),
         Expr::Closure(id) => format!("<fn {}>", id.rsplit("::").next().unwrap_or(id)),

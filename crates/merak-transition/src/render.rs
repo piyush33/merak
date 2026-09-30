@@ -6,7 +6,7 @@
 //! derived it; JSON output is for machines.
 
 use crate::{Layer, Op, Transition};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 fn section(layer: Layer) -> &'static str {
@@ -291,7 +291,7 @@ fn headline(t: &Transition, plan: &NewCode) -> String {
     }
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -424,7 +424,7 @@ fn sentence(op: &Op) -> String {
 }
 
 /// Merak writes a value it cannot know as `_`; people read `…`.
-fn blanks(s: &str) -> String {
+pub(crate) fn blanks(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '=');
     chars
@@ -681,7 +681,7 @@ fn describe(summary: &str) -> String {
 }
 
 /// What an unclassified change did to calls, by function name: ": it now also calls `trim`, …".
-fn calls_summary(before: &str, after: &str) -> String {
+pub(crate) fn calls_summary(before: &str, after: &str) -> String {
     let names = |s: &str| -> Vec<String> {
         let mut seen = BTreeSet::new();
         s.split("; ").filter(|x| !x.is_empty()).map(call_name).filter(|n| seen.insert(n.clone())).collect()
@@ -781,9 +781,13 @@ fn call_name(shape: &str) -> String {
 fn also(t: &Transition, _plan: &NewCode) -> Option<String> {
     // Closures and code already described above are not listed again.
     let described: BTreeSet<&str> = t.ops.iter().filter(|o| o.kind == "BEHAVIOUR_ADDED").map(|o| o.subject.as_str()).collect();
+    let contracted: BTreeSet<&str> = t.contracts.iter().map(|c| c.entity.as_str()).collect();
     // `f` or `Class.method`; a third segment is a callback inside one (`Repo.get.where`).
-    let top_level =
-        |o: &&Op| o.subject.rsplit("::").next().is_some_and(|l| name(&o.subject) == l && l.split('.').count() <= 2) && !described.contains(o.subject.as_str());
+    let top_level = |o: &&Op| {
+        o.subject.rsplit("::").next().is_some_and(|l| name(&o.subject) == l && l.split('.').count() <= 2)
+            && !described.contains(o.subject.as_str())
+            && !contracted.contains(o.subject.as_str())
+    };
     let names = |kind: &str| -> Vec<String> {
         let mut seen = BTreeSet::new();
         t.ops.iter().filter(|o| o.kind == kind).filter(top_level).map(|o| format!("`{}`", name(&o.subject))).filter(|n| seen.insert(n.clone())).collect()
@@ -827,7 +831,7 @@ fn also(t: &Transition, _plan: &NewCode) -> Option<String> {
 /// Source text of one line, before (`true`) or after the change, for code under changed clauses.
 pub type SourceLine<'a> = &'a dyn Fn(&merak_ir::Loc, bool) -> Option<String>;
 
-const WIDTH: usize = 112;
+pub(crate) const WIDTH: usize = 112;
 
 /// The contract diff: per changed or new function, what it promises before and after.
 pub fn contracts(t: &Transition, header: Option<&str>, source: SourceLine) -> String {
@@ -837,6 +841,8 @@ pub fn contracts(t: &Transition, header: Option<&str>, source: SourceLine) -> St
     for c in &t.contracts {
         let kind = match c.status.as_str() {
             "new" => "new",
+            // Tables defined in `.sql` files are schemas too, of the database.
+            "schema" if c.entity.split("::").next().is_some_and(|m| m.to_ascii_lowercase().ends_with(".sql")) => "table",
             "schema" => "validation schema",
             _ if c.untyped_only() => "changed, untyped",
             _ => "changed",
@@ -875,7 +881,7 @@ pub fn contracts(t: &Transition, header: Option<&str>, source: SourceLine) -> St
 }
 
 /// A restyled piece of content: `{phrase}: span.font-semibold  →  span.text-gray-400` (before → after).
-fn restyled(x: &crate::contract::Clause) -> Option<String> {
+pub(crate) fn restyled(x: &crate::contract::Clause) -> Option<String> {
     let split = |v: &Option<String>| v.as_deref().and_then(|v| v.rsplit_once(": ")).map(|(c, s)| (c.to_string(), s.to_string()));
     match (split(&x.before), split(&x.after)) {
         (Some((cb, sb)), Some((ca, sa))) if cb == ca => Some(format!("{ca}: {sb}  →  {sa}")),
@@ -956,8 +962,67 @@ fn contract_headline(t: &Transition) -> String {
     if untyped > 0 {
         line.push_str(&format!(" {} Merak can't type: review by hand.", plural(untyped, "change", "changes")));
     }
+    // Which rows a query reaches is the change a reader most needs first: say it here.
+    for c in &t.contracts {
+        let mut said = BTreeSet::new();
+        for x in c.clauses.iter().filter(|x| x.row == "where") {
+            let Some((dir, what)) = x.tag.as_deref().and_then(|t| t.split_once(": ")) else { continue };
+            if !matches!(dir, "narrower" | "wider") || !said.insert(what.to_string()) {
+                continue;
+            }
+            let reads = if dir == "narrower" { "reads fewer rows" } else { "can read more rows" };
+            line.push_str(&format!("\n\n**`{}` {reads}:** {what}.", c.name));
+        }
+    }
     line.push_str("\n\n`+` added · `-` removed · `~` changed · `!` rule broken · `?` untyped · unmarked: unchanged · `a → b`: before → after");
     line
+}
+
+/// Unchanged writes as context: own writes grouped by type (`Partner{ID, Kind} written`),
+/// writes made by callees only counted. Assignments of a value (`:=`) stay as they are.
+fn compress_writes(items: Vec<String>) -> Vec<String> {
+    let mut own: Vec<(String, Vec<String>)> = vec![];
+    let mut by_callees = 0;
+    let mut out = vec![];
+    // Columns assigned from somewhere (`t.c := src`): grouped by table when there are many.
+    let mut assigned: BTreeMap<String, usize> = BTreeMap::new();
+    for it in &items {
+        if let Some((field, _)) = it.split_once(" := ") {
+            *assigned.entry(field.rsplit_once('.').map(|(t, _)| t.to_string()).unwrap_or_default()).or_default() += 1;
+        }
+    }
+    for it in items {
+        if let Some((field, _)) = it.split_once(" := ") {
+            if let Some((t, c)) = field.rsplit_once('.') {
+                if assigned.get(t).is_some_and(|n| *n > 3) {
+                    match own.iter_mut().find(|(x, _)| x == t) {
+                        Some((_, fs)) => fs.push(c.to_string()),
+                        None => own.push((t.to_string(), vec![c.to_string()])),
+                    }
+                    continue;
+                }
+            }
+        }
+        if it.ends_with(" is written (by a callee)") {
+            by_callees += 1;
+        } else if let Some((ty, field)) = it.strip_suffix(" is written").and_then(|f| f.rsplit_once('.')) {
+            match own.iter_mut().find(|(t, _)| t == ty) {
+                Some((_, fs)) => fs.push(field.to_string()),
+                None => own.push((ty.to_string(), vec![field.to_string()])),
+            }
+        } else {
+            out.push(it);
+        }
+    }
+    for (ty, fields) in own {
+        // Short enough to share a line: the first few fields, then how many more.
+        let shown = if fields.len() > 5 { format!("{}, +{}", fields[..4].join(", "), fields.len() - 4) } else { fields.join(", ") };
+        out.push(if fields.len() == 1 { format!("{ty}.{} written", fields[0]) } else { format!("{ty}{{{shown}}} written") });
+    }
+    if by_callees > 0 {
+        out.push(plural(by_callees, "field written by callees", "fields written by callees"));
+    }
+    out
 }
 
 /// The clause block of one contract, aligned for a monospace code block.
@@ -974,8 +1039,16 @@ fn block(c: &crate::contract::ContractDiff, source: Option<SourceLine>, file: &s
         // every item is new, so its rows read the same way, marked `+`.
         let compact = |x: &&&crate::contract::Clause| x.mark == ' ' || (c.status == "new" && x.mark == '+');
         let same: Vec<String> = items.iter().filter(compact).filter_map(|x| x.after.as_deref()).map(|a| item(row, a)).collect();
+        let same = match row {
+            "post" => compress_writes(same),
+            // Many unchanged row conditions (a SQL function's CTEs) are counted, not listed.
+            "where" if same.len() > 8 => vec![plural(same.len(), "condition unchanged", "conditions unchanged")],
+            _ => same,
+        };
         // Unchanged markup is context nobody reads: count it instead.
         let (short, long): (Vec<String>, Vec<String>) = same.into_iter().partition(|t| row != "renders" && t.chars().count() <= 90);
+        // Long unchanged writes are still just context: shown, not counted as "cases".
+        let (short, long) = if row == "post" { (short.into_iter().chain(long).collect::<Vec<_>>(), vec![]) } else { (short, long) };
         let mark = if c.status == "new" { '+' } else { ' ' };
         if !short.is_empty() {
             out.extend(wrap_items(&format!("{mark} {row:<9} "), &short));
@@ -1096,7 +1169,7 @@ fn code(x: &crate::contract::Clause, source: SourceLine, file: &str) -> Vec<Stri
     out
 }
 
-fn clip(s: &str) -> String {
+pub(crate) fn clip(s: &str) -> String {
     const MAX: usize = WIDTH - 19;
     if s.chars().count() <= MAX {
         s.to_string()
@@ -1125,7 +1198,7 @@ fn wrap_items(head: &str, items: &[String]) -> Vec<String> {
 }
 
 /// Wrap `text` after `head`, continuing under the text column.
-fn wrap(head: &str, text: &str) -> Vec<String> {
+pub(crate) fn wrap(head: &str, text: &str) -> Vec<String> {
     let indent = " ".repeat(head.chars().count());
     let room = WIDTH.saturating_sub(indent.len()).max(30);
     let mut lines = vec![];
@@ -1145,7 +1218,7 @@ fn wrap(head: &str, text: &str) -> Vec<String> {
 
 /// One clause item, with effects in short verbs (`write order`, `POST payments.example.com`)
 /// and values Merak cannot know as `…`.
-fn item(row: &str, text: &str) -> String {
+pub(crate) fn item(row: &str, text: &str) -> String {
     if row != "effects" {
         return blanks(text);
     }
@@ -1159,6 +1232,8 @@ fn item(row: &str, text: &str) -> String {
         "db_write" => format!("write {rest}"),
         "db_read" => format!("read {rest}"),
         "db_query" => format!("query {rest}"),
+        // `create index i on t`, `alter table t`: the schema change as written.
+        "db_schema" => rest.to_string(),
         "http" => rest.to_string(),
         "event_emit" => format!("emit {rest}"),
         "queue" => format!("queue {rest}"),
@@ -1172,4 +1247,9 @@ fn item(row: &str, text: &str) -> String {
         Some(l) => format!("{verb} ({})", l.replace("async via ", "later, via ")),
         None => verb,
     }
+}
+
+/// The structural remainder in one line, for other views.
+pub(crate) fn also_line(t: &Transition) -> Option<String> {
+    also(t, &NewCode::plan(t))
 }

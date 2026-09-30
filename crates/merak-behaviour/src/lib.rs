@@ -3,6 +3,7 @@
 //! invariants and declared design rules.
 
 pub mod catalog;
+pub mod clause;
 pub mod design;
 pub mod extract;
 pub mod infer;
@@ -11,6 +12,7 @@ pub mod pred;
 pub mod resolve;
 pub mod schema;
 pub mod sql;
+pub mod sqlflow;
 pub mod summary;
 
 pub use model::*;

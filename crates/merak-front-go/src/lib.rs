@@ -276,6 +276,8 @@ struct Lowerer<'s> {
     results: Results,
     /// Error variables and the call that last set them: `err` ← `h.svc.Cancel`.
     err_sources: HashMap<String, String>,
+    /// Each callee's arguments at its first call in the current function.
+    callee_args: HashMap<String, String>,
     /// String variables' current values in straight-line code (`query := "SELECT …"`, then
     /// `query = "UPDATE …"`): a call argument naming one is that string.
     strings: HashMap<String, ir::Expr>,
@@ -299,6 +301,7 @@ impl<'s> Lowerer<'s> {
             receiver: None,
             results: Results::default(),
             err_sources: HashMap::new(),
+            callee_args: HashMap::new(),
             strings: HashMap::new(),
             assigned: vec![],
         }
@@ -486,7 +489,10 @@ impl<'s> Lowerer<'s> {
                     Some(v) if matches!(v.kind(), "interpreted_string_literal" | "raw_string_literal" | "int_literal" | "float_literal") => self.expr(v, None),
                     Some(v) if v.kind() == "identifier" && self.t(v) != "iota" => self.expr(v, None),
                     // `iota` and expressions of it: the constant stands for itself.
-                    _ => ir::Expr::Str(name.clone()),
+                    Some(v) if self.t(v).split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == "iota") => ir::Expr::Str(name.clone()),
+                    // `` `SELECT …` + filterClause + `…` ``, `15 * time.Minute`: the expression itself.
+                    Some(v) => self.expr(v, None),
+                    None => ir::Expr::Str(name.clone()),
                 };
                 let tr = last_ty.map(|t| self.type_ref(t));
                 if let Some(ir::TypeRef::Named(tn, _)) = &tr {
@@ -555,6 +561,7 @@ impl<'s> Lowerer<'s> {
         };
         let saved = (std::mem::take(&mut self.locals), std::mem::replace(&mut self.receiver, receiver.clone()), std::mem::replace(&mut self.results, results));
         let saved_strings = std::mem::take(&mut self.strings);
+        let saved_callees = std::mem::take(&mut self.callee_args);
         // A closure sees its enclosing function's variables.
         if parent.is_some() {
             self.locals = saved.0.clone();
@@ -570,6 +577,7 @@ impl<'s> Lowerer<'s> {
         self.scope.pop();
         (self.locals, self.receiver, self.results) = saved;
         self.strings = saved_strings;
+        self.callee_args = saved_callees;
         let body_hash = ir::body_hash(&body);
         self.module.functions.push(ir::Function {
             id: id.clone(),
@@ -806,18 +814,24 @@ impl<'s> Lowerer<'s> {
     /// `a, b := f()` / `var x T = v`: one binding per name; a tuple result binds the first.
     /// Remember the call that sets each name, for naming error checks on them.
     fn note_sources(&mut self, names: &[Node], values: &[Node]) {
-        let source = |lw: &Self, v: &Node| -> Option<String> {
+        // `anchorPredicate`; the second call of it with other arguments is `anchorPredicate(c)`,
+        // so checks on the two results read differently.
+        let source = |lw: &mut Self, v: &Node| -> Option<String> {
             let f = field(*v, "function").filter(|_| v.kind() == "call_expression")?;
             let text: String = lw.t(f).split_whitespace().collect();
-            Some(match lw.receiver.as_deref().and_then(|r| text.strip_prefix(&format!("{r}."))) {
+            let callee = match lw.receiver.as_deref().and_then(|r| text.strip_prefix(&format!("{r}."))) {
                 Some(rest) => rest.to_string(),
                 None => text,
-            })
+            };
+            let args: String = field(*v, "arguments").map(|a| lw.t(a).split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+            let first = lw.callee_args.entry(callee.clone()).or_insert_with(|| args.clone()).clone();
+            Some(if first == args { callee } else { format!("{callee}{args}") })
         };
         for (i, n) in names.iter().enumerate() {
             let v = if values.len() == names.len() { values.get(i) } else { values.first() };
             let name = self.t(*n).to_string();
-            match v.and_then(|v| source(self, v)) {
+            let src = v.and_then(|v| source(self, v));
+            match src {
                 Some(src) => self.err_sources.insert(name, src),
                 None => self.err_sources.remove(&name),
             };

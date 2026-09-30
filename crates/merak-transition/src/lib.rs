@@ -4,6 +4,7 @@
 //! The snapshot models are only the substrate; the output of this crate — a
 //! list of typed, evidence-backed operations — is the object Merak is about.
 
+pub mod behaviour;
 pub mod contract;
 pub mod render;
 
@@ -366,7 +367,8 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
             Some(_) => (vec![], vec![]),
         };
         // Decorators are not in the body hash: `@Authenticated({ public: true })` alone is a change.
-        if ea.body_hash == eb.body_hash && same_filters(&fa, &fb) && own_access(ea) == own_access(eb) {
+        // Nor are the values of the constants it uses: `wResults = 1.0 → 0.25` alone is a change.
+        if ea.body_hash == eb.body_hash && same_filters(&fa, &fb) && own_access(ea) == own_access(eb) && ea.consts == eb.consts {
             continue;
         }
         changed += 1;
@@ -513,6 +515,8 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         query_filters(&mut out, idb, &fa, &fb);
         access_change(&mut out, idb, &sa.access, &sb.access);
         output_change(&mut out, idb, ea, eb);
+        consts_change(&mut out, idb, ea, eb);
+        skips_change(&mut out, idb, ea, eb);
 
         for op in &mut out.ops[start..] {
             op.affects = affects.clone();
@@ -701,7 +705,7 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         }
         let kinds = typed.get(idb.as_str());
         let has = |prefixes: &[&str]| kinds.is_some_and(|k| k.iter().any(|x| prefixes.iter().any(|p| x.starts_with(p))));
-        let conditions_explained = has(&["GUARD_", "AUTH_", "QUERY_FILTER_", "VALIDATION_", "STATE_TRANSITION_"]);
+        let conditions_explained = has(&["GUARD_", "AUTH_", "QUERY_FILTER_", "VALIDATION_", "STATE_TRANSITION_", "SKIP_"]);
         let effects_explained = has(&["EFFECT_", "DATAFLOW_"]);
         // Calls into helpers that exist on one side only (extracted or inlined) count as their bodies.
         let unconditioned = |v: Vec<CallShape>| -> Vec<CallShape> {
@@ -916,7 +920,8 @@ fn output_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity,
         let mut v: Vec<String> = e
             .outputs
             .iter()
-            .filter(|o| observable(&o.value))
+            // What a function computes (`s := 0.25 * x; +6 when …`) is observable too.
+            .filter(|o| o.formula || observable(&o.value))
             .map(|o| format!("{}: {}", if o.when.is_empty() { "otherwise".into() } else { format!("when {}", o.when.join(" ∧ ")) }, o.value))
             .collect();
         v.sort();
@@ -931,6 +936,39 @@ fn output_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity,
     let join = |xs: &[&String]| (!xs.is_empty()).then(|| xs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; "));
     let loc = |e: &merak_behaviour::Entity| e.outputs.first().map(|o| o.loc.clone()).into_iter().collect();
     out.push("OUTPUT_CHANGED", Layer::Behaviour, subject, join(&gone), join(&new), loc(ea), loc(eb));
+}
+
+/// Loop filters that appeared or disappeared: `a in arms: skipped when len(raw) ∈ {0}`.
+fn skips_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity, eb: &merak_behaviour::Entity) {
+    let text = |s: &merak_behaviour::SkipFact| format!("{}: skipped when {}", s.over, s.when);
+    let (ta, tb): (BTreeSet<String>, BTreeSet<String>) = (ea.skips.iter().map(text).collect(), eb.skips.iter().map(text).collect());
+    for s in eb.skips.iter().filter(|s| !ta.contains(&text(s))) {
+        out.push("SKIP_ADDED", Layer::Behaviour, subject, None, Some(text(s)), vec![], vec![s.loc.clone()]);
+    }
+    for s in ea.skips.iter().filter(|s| !tb.contains(&text(s))) {
+        out.push("SKIP_REMOVED", Layer::Behaviour, subject, Some(text(s)), None, vec![s.loc.clone()], vec![]);
+    }
+}
+
+/// Module constants an entity uses (weights, limits, thresholds) whose value changed, or
+/// that it started or stopped using: `wCatalog = 0.25`, `partnerFetchLimit = 200`.
+fn consts_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity, eb: &merak_behaviour::Entity) {
+    if ea.consts == eb.consts {
+        return;
+    }
+    let show = |m: &BTreeMap<String, String>, other: &BTreeMap<String, String>| -> Option<String> {
+        let v: Vec<String> = m.iter().filter(|(k, v)| other.get(*k) != Some(*v)).map(|(k, v)| format!("{k} = {v}")).collect();
+        (!v.is_empty()).then(|| v.join(", "))
+    };
+    out.push(
+        "CONSTANTS_CHANGED",
+        Layer::Behaviour,
+        subject,
+        show(&ea.consts, &eb.consts),
+        show(&eb.consts, &ea.consts),
+        vec![ea.loc.clone()],
+        vec![eb.loc.clone()],
+    );
 }
 
 /// Access requirements reached before and after. Dropping a requirement or adding
@@ -981,7 +1019,14 @@ fn query_filters(out: &mut Builder, subject: &str, fa: &[&QueryFilter], fb: &[&Q
         (gone, new) = (vec![], vec![]);
     }
     for (g, n) in pairs {
-        out.push("QUERY_FILTER_CHANGED", Layer::Behaviour, subject, Some(g.expr.clone()), Some(n.expr.clone()), vec![g.loc.clone()], vec![n.loc.clone()]);
+        let note = contract::reach(&g.expr, &n.expr).map(|r| match r {
+            contract::Reach::Narrower(t) => format!("the query now also requires {t}: it reaches fewer rows"),
+            contract::Reach::Tighter(t) => format!("the query no longer accepts rows matching only {t}: it reaches fewer rows"),
+            contract::Reach::Wider(t) => format!("the query now also accepts {t}: it can reach more rows"),
+            contract::Reach::Looser(t) => format!("the query no longer requires {t}: it can reach more rows"),
+        });
+        out.push("QUERY_FILTER_CHANGED", Layer::Behaviour, subject, Some(g.expr.clone()), Some(n.expr.clone()), vec![g.loc.clone()], vec![n.loc.clone()]).note =
+            note;
     }
     for g in gone {
         out.push("QUERY_FILTER_REMOVED", Layer::Behaviour, subject, Some(g.expr.clone()), None, vec![g.loc.clone()], vec![]).note =

@@ -20,7 +20,7 @@ behaviour: access rules, query filters, effects, validation schemas, state trans
   is `UNCLASSIFIED_CHANGE` (UI code and anything else Merak does not model) stay silent; ask
   with `/merak:review` or `merak_transition` to see those. Claude Code labels any Stop hook that
   continues a turn as "Stop hook error" in its UI; for Merak that is the review, not a failure.
-- **MCP tools.** `merak_transition` (a change as behaviour contracts, before and after, with the code behind each change; `view: plain` or `ops` for the other presentations: uncommitted work by default, or
+- **MCP tools.** `merak_transition` (a change as behaviour lines grouped by entry point, each with its direction and the code behind it; `view: contracts`, `plain` or `ops` for the other presentations: uncommitted work by default, or
   `base`/`head`, with `root` for a subdirectory) and `merak_context` (what one function does:
   effects, access requirements, filters, guards, routes that reach it, callers).
 - **`/merak:review`**: a behaviour-level review of the current changes, a branch or a range.

@@ -320,9 +320,13 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
         filter_depth: u32::from(envs.filter_callbacks.contains(&f.id)),
         request_depth: 0,
         spawn_depth: 0,
+        defs: HashMap::new(),
+        def_exprs: HashMap::new(),
+        made_by: HashMap::new(),
         ctes: scope_ctes(ix, f),
         path: vec![],
         consumed_closures: BTreeSet::new(),
+        clause: clause_shape(ix, envs, &f.id, 0),
         e: Entity {
             id: f.id.clone(),
             name: f.name.clone(),
@@ -361,6 +365,8 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
             call_shapes: vec![],
             filters: vec![],
             logs: vec![],
+            consts: BTreeMap::new(),
+            skips: vec![],
             access: vec![],
         },
     };
@@ -409,6 +415,12 @@ struct Walker<'a, 'p> {
     request_depth: u32,
     /// Inside `go …`: calls start concurrently.
     spawn_depth: u32,
+    /// How each local was computed so far, constants by value: `0.25 * log1p(breadth); +6 when …`.
+    defs: HashMap<String, String>,
+    /// The same, as expressions (other locals substituted), where a local has one value.
+    def_exprs: HashMap<String, Expr>,
+    /// Program functions whose results flow into each local, on any path: `predicate` ← `scopePredicate`.
+    made_by: HashMap<String, BTreeSet<String>>,
     /// CTE names in scope: reading one is not a table read.
     ctes: BTreeSet<String>,
     /// Conditions under which the current statement runs: enclosing `if` tests and the
@@ -417,6 +429,8 @@ struct Walker<'a, 'p> {
     /// Top-level guards are marked (`true`): guard facts already compare them.
     path: Vec<(Pred, bool)>,
     consumed_closures: BTreeSet<String>,
+    /// What this function builds, when it assembles a string clause: `⟨a⟩ AND ⟨b, each c in cs⟩`.
+    clause: Option<String>,
     e: Entity,
 }
 
@@ -453,8 +467,19 @@ impl Walker<'_, '_> {
     fn stmt(&mut self, s: &Stmt, top: bool) {
         match s {
             Stmt::Expr(e, loc) => self.expr(e, loc),
-            Stmt::Let { ty, init, loc, .. } => {
+            Stmt::Let { name, ty, init, loc } => {
                 if let Some(init) = init {
+                    let m = self.makers(init);
+                    self.made_by.entry(name.clone()).or_default().extend(m);
+                    let value = self.inline_consts(init);
+                    let text = render(&value);
+                    // Long definitions are not substituted further: formulas stay readable.
+                    if text.chars().count() <= 300 {
+                        self.def_exprs.insert(name.clone(), value);
+                    } else {
+                        self.def_exprs.remove(name);
+                    }
+                    self.defs.insert(name.clone(), text);
                     self.expr(init, loc);
                     // `const order: Order = { status: …, … }` constructs a record.
                     if let (Some(ty), Expr::Object(props)) = (ty, init) {
@@ -500,7 +525,29 @@ impl Walker<'_, '_> {
                     self.expr(e, loc);
                     let mut renders = vec![];
                     rendered(e, "", &mut Vec::new(), &mut renders);
-                    self.e.outputs.push(Output { when: self.conditions(false), value: render(e), renders, loc: loc.clone() });
+                    // `return s`: what `s` was computed by, when it was computed here.
+                    let (value, formula) = match e {
+                        // A clause built up from other builders: what it composes.
+                        Expr::Ident(_) if self.clause.as_ref().is_some_and(|c| c.contains('⟨')) => (self.clause.clone().unwrap_or_default(), true),
+                        Expr::Array(xs) if matches!(xs.first(), Some(Expr::Ident(_))) && self.clause.as_ref().is_some_and(|c| c.contains('⟨')) => {
+                            let rest: Vec<String> = xs.iter().skip(1).map(render).collect();
+                            (format!("[{}]", std::iter::once(self.clause.clone().unwrap_or_default()).chain(rest).collect::<Vec<_>>().join(", ")), true)
+                        }
+                        Expr::Ident(x) if self.defs.get(x).is_some_and(|d| is_formula(d)) => (self.defs[x].clone(), true),
+                        // `return clause, args, true` (Go): each local by what it was built from.
+                        Expr::Array(xs) if xs.iter().any(|x| matches!(x, Expr::Ident(n) if self.defs.get(n).is_some_and(|d| is_formula(d)))) => {
+                            let parts: Vec<String> = xs
+                                .iter()
+                                .map(|x| match x {
+                                    Expr::Ident(n) if self.defs.get(n).is_some_and(|d| is_formula(d)) => self.defs[n].clone(),
+                                    x => render(x),
+                                })
+                                .collect();
+                            (format!("[{}]", parts.join(", ")), true)
+                        }
+                        e => (render(e), false),
+                    };
+                    self.e.outputs.push(Output { when: self.conditions(false), value, renders, loc: loc.clone(), formula });
                 }
             }
             Stmt::Throw(e, loc) => {
@@ -511,10 +558,16 @@ impl Walker<'_, '_> {
                     e => self.expr(e, loc),
                 }
             }
-            Stmt::Loop { iter, body, loc, .. } => {
+            Stmt::Loop { binding, iter, body, loc } => {
                 if let Some(it) = iter {
                     self.expr(it, loc);
                 }
+                // `if c { continue }` at the top of the body: which items the loop leaves out.
+                let over = match (binding, iter) {
+                    (Some(b), Some(it)) => format!("{b} in {}", render(it)),
+                    _ => "loop".to_string(),
+                };
+                self.loop_skips(body, &over);
                 self.depth += 1;
                 self.stmts(body, false);
                 self.depth -= 1;
@@ -541,6 +594,38 @@ impl Walker<'_, '_> {
                 self.expr(object, loc);
             }
             Expr::Assign { target, value, loc: aloc } => {
+                // `s += x` / `s -= x` / `s = x` on a local: the formula grows, with its condition.
+                if let Expr::Ident(x) = target.as_ref() {
+                    let m = self.makers(value);
+                    self.made_by.entry(x.clone()).or_default().extend(m);
+                    let when = self.conditions(false);
+                    let when = if when.is_empty() { String::new() } else { format!(" when {}", when.join(" ∧ ")) };
+                    let step = match value.as_ref() {
+                        Expr::Binary { op: op @ (ir::BinOp::Add | ir::BinOp::Sub), left, right } if matches!(left.as_ref(), Expr::Ident(l) if l == x) => {
+                            let sign = if *op == ir::BinOp::Add { "+" } else { "−" };
+                            Some(format!("{sign}{}{when}", render(&self.inline_consts(right))))
+                        }
+                        v if when.is_empty() => {
+                            let value = self.inline_consts(v);
+                            let text = render(&value);
+                            if text.chars().count() <= 300 {
+                                self.def_exprs.insert(x.clone(), value);
+                            } else {
+                                self.def_exprs.remove(x);
+                            }
+                            self.defs.insert(x.clone(), text);
+                            None
+                        }
+                        v => {
+                            // Set on some paths only: no single value to substitute.
+                            self.def_exprs.remove(x);
+                            Some(format!("= {}{when}", render(&self.inline_consts(v))))
+                        }
+                    };
+                    if let (Some(step), Some(d)) = (step, self.defs.get_mut(x)) {
+                        d.push_str(&format!("; {step}"));
+                    }
+                }
                 if let Expr::Member { object, property } = target.as_ref() {
                     if let Some(field) = self.ix.field_path(self.env, object, property) {
                         let v = self.ix.const_str(self.env, value);
@@ -551,21 +636,31 @@ impl Walker<'_, '_> {
                 self.expr(value, aloc);
             }
             Expr::New { callee, args, loc: nloc } => {
-                // `new X(…)` is a call too: `await new Promise((r) => setTimeout(r, 1000))`.
-                let call = ir::Call { callee: callee.as_ref().clone(), args: args.clone(), loc: nloc.clone() };
-                let shape = format!("new {}", self.call_shape(&call));
-                self.e.call_shapes.push(CallShape { shape, target: None, when: self.conditions(false), guards: self.conditions(true), loc: nloc.clone(), effect: false });
-                // `Order{Status: StatusPending}` (Go) constructs a record: its data fields are written.
+                // `Order{Status: StatusPending}` (Go) constructs a record: its data fields are
+                // written, and compared as writes. The construction itself stays a call shape,
+                // without those fields, so the conditions it runs under still count.
+                let mut written = BTreeSet::new();
                 if let [Expr::Object(props)] = args.as_slice() {
                     if matches!(self.ix.type_of(self.env, e), Ty::Class(_)) {
                         for (k, v) in props {
                             if let Some(field) = self.ix.field_path(self.env, e, k) {
                                 let value = self.ix.const_str(self.env, v);
                                 self.e.writes.push(WriteFact { field, value, creation: true, loc: nloc.clone() });
+                                written.insert(k.clone());
                             }
                         }
                     }
                 }
+                // `new X(…)` is a call too: `await new Promise((r) => setTimeout(r, 1000))`.
+                let shape_args = match args.as_slice() {
+                    [Expr::Object(props)] if !written.is_empty() => {
+                        vec![Expr::Object(props.iter().filter(|(k, _)| !written.contains(k)).cloned().collect())]
+                    }
+                    _ => args.clone(),
+                };
+                let call = ir::Call { callee: callee.as_ref().clone(), args: shape_args, loc: nloc.clone() };
+                let shape = format!("new {}", self.call_shape(&call));
+                self.e.call_shapes.push(CallShape { shape, target: None, when: self.conditions(false), guards: self.conditions(true), loc: nloc.clone(), effect: false });
                 args.iter().for_each(|a| self.expr(a, nloc));
             }
             Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
@@ -573,6 +668,12 @@ impl Walker<'_, '_> {
                 self.expr(right, loc);
             }
             Expr::Not(x) | Expr::Await(x) => self.expr(x, loc),
+            // A module constant used here: its value is part of what the entity does.
+            Expr::Ident(n) if !self.env.vars.contains_key(n) => {
+                if let Some(v) = self.ix.const_str(self.env, e).filter(|v| v.parse::<f64>().is_ok() || v == "true" || v == "false") {
+                    self.e.consts.insert(n.clone(), v);
+                }
+            }
             Expr::Spawn(x) => {
                 self.spawn_depth += 1;
                 self.expr(x, loc);
@@ -738,7 +839,12 @@ impl Walker<'_, '_> {
 
     /// The current path conditions (`guards`: the entity's own guards), rendered for a call shape.
     fn conditions(&self, guards: bool) -> Vec<String> {
-        let mut conds: Vec<String> = self.path.iter().filter(|(_, g)| *g == guards).map(|(p, _)| p.render()).collect();
+        let preds: Vec<Pred> = self.path.iter().filter(|(_, g)| *g == guards).map(|(p, _)| p.clone()).collect();
+        let mut conds: Vec<String> = match Pred::And(preds).simplify() {
+            Pred::And(ps) => ps.iter().map(Pred::render).collect(),
+            Pred::True => vec![],
+            p => vec![p.render()],
+        };
         conds.sort();
         conds.dedup();
         conds
@@ -815,30 +921,13 @@ impl Walker<'_, '_> {
             Route(String, String, i32),
             Nothing,
         }
+        if let Some(rule) = self.cat.effect_for(api).filter(|r| r.kind == "sql") {
+            self.sql_call(rule.target.clone(), api, c);
+            return true;
+        }
         let found = {
             let site = Site { segments: catalog::split_segments(api), walker: self, call: c };
-            if let Some(rule) = self.cat.effect_for(api).filter(|r| r.kind == "sql") {
-                // Raw SQL: what it does is in the statement (`sql:N`, argument N).
-                let n: usize = rule.target.strip_prefix("sql:").and_then(|n| n.parse().ok()).unwrap_or(0);
-                let parsed = site.arg_str(n).and_then(|q| {
-                    crate::sql::parse(&q, &|k| {
-                        let a = c.args.get(n + k)?;
-                        self.ix.const_str(self.env, a)
-                    })
-                });
-                match parsed {
-                    Some(q) => {
-                        let kind = if q.write { "db_write" } else { "db_read" };
-                        let filters = q.filters.clone();
-                        drop(site);
-                        for f in filters {
-                            self.e.filters.push(QueryFilter { expr: format!("{}: {f}", q.table), loc: c.loc.clone() });
-                        }
-                        Found::Effect(EffectKey { kind: kind.into(), target: q.table, method: None }, false)
-                    }
-                    None => Found::Effect(EffectKey { kind: "db_query".into(), target: "<dynamic>".into(), method: None }, true),
-                }
-            } else if let Some(rule) = self.cat.effect_for(api) {
+            if let Some(rule) = self.cat.effect_for(api) {
                 let target = catalog::eval_spec(&rule.target, &site);
                 // `db.with('x', …).selectFrom('x')` reads a CTE, not a table: the CTE's
                 // own query is recorded where it is defined.
@@ -889,12 +978,238 @@ impl Walker<'_, '_> {
         true
     }
 
+    /// Raw SQL (`target = "sql:N"`, the statement in argument N): the tables it reads and
+    /// writes, its schema changes, its row conditions, and where written columns come from.
+    fn sql_call(&mut self, target: String, api: &str, c: &ir::Call) {
+        let n: usize = target.strip_prefix("sql:").and_then(|n| n.parse().ok()).unwrap_or(0);
+        let text = c.args.get(n).and_then(|a| self.ix.const_str(self.env, a));
+        let value = |k: usize| c.args.get(n + k).and_then(|a| self.ix.const_str(self.env, a));
+        let is_var = |n: &str| self.env.vars.contains_key(n);
+        // Built at runtime from a constant template (`fmt.Sprintf(coOccurrenceSQL, arms, …)`):
+        // the template is read, each hole named by the functions that fill it.
+        let (text, holes) = match text {
+            Some(t) => (Some(t), vec![]),
+            None => match c.args.get(n).and_then(|a| self.sql_template(a)) {
+                Some((t, h)) => (Some(t), h),
+                None => (None, vec![]),
+            },
+        };
+        let fill = |s: String| -> String { holes.iter().enumerate().fold(s, |s, (i, h)| s.replace(&format!("__dyn{i}__"), h)) };
+        let Some(mut flow) = text.as_deref().and_then(|q| crate::sqlflow::analyze_with(q, &value, &is_var)) else {
+            self.e.unknowns.push(Unknown { question: format!("SQL of `{api}` is not a constant"), loc: c.loc.clone() });
+            let key = EffectKey { kind: "db_query".into(), target: "<dynamic>".into(), method: None };
+            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone() });
+            return;
+        };
+        // Text that says nothing SQL can read (not a statement at all) is not an effect to drop.
+        let quiet = [
+            "set", "reset", "analyze", "vacuum", "lock", "notify", "listen", "begin", "commit", "rollback", "grant", "revoke", "comment", "discard", "do",
+            "refresh", "call",
+        ];
+        let first = text.as_deref().unwrap_or("").split_whitespace().next().unwrap_or("").to_lowercase();
+        if flow.reads.is_empty() && flow.writes.is_empty() && flow.ddl.is_empty() && !quiet.contains(&first.as_str()) {
+            self.e.unknowns.push(Unknown { question: format!("SQL of `{api}` could not be read"), loc: c.loc.clone() });
+            let key = EffectKey { kind: "db_query".into(), target: "<dynamic>".into(), method: None };
+            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone() });
+            return;
+        }
+        flow.filters = flow.filters.into_iter().map(&fill).collect();
+        flow.columns = std::mem::take(&mut flow.columns).into_iter().map(|(k, v)| (k, fill(v))).collect();
+        let mut push = |kind: &str, target: &str, method: Option<String>| {
+            let key = EffectKey { kind: kind.into(), target: target.into(), method };
+            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone() });
+        };
+        for t in &flow.writes {
+            push("db_write", t, None);
+        }
+        for t in flow.reads.difference(&flow.writes) {
+            push("db_read", t, None);
+        }
+        for (verb, object) in &flow.ddl {
+            push("db_schema", object, Some(verb.clone()));
+        }
+        let lines: Vec<String> = text.as_deref().unwrap_or("").lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()).collect();
+        for f in flow.filters {
+            let loc = Loc { line: c.loc.line + sql_line(&lines, &f) as u32, ..c.loc.clone() };
+            self.e.filters.push(QueryFilter { expr: f, loc });
+        }
+        for (field, v) in flow.columns {
+            // `'CANCELLED'` is the value CANCELLED.
+            let v = match v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+                Some(inner) if !inner.contains('\'') => inner.to_string(),
+                _ => v,
+            };
+            self.e.writes.push(WriteFact { field, value: Some(v), creation: false, loc: c.loc.clone() });
+        }
+    }
+
+    /// An SQL string built from a constant template: the template with each hole as
+    /// `__dynN__`, and what fills each (`⟨built by scopePredicate⟩`).
+    fn sql_template(&self, e: &Expr) -> Option<(String, Vec<String>)> {
+        let e = self.inline_consts(e);
+        let mut holes = vec![];
+        let hole = |x: &Expr, holes: &mut Vec<String>| -> String {
+            if let Some(v) = self.ix.const_str(self.env, x) {
+                return v;
+            }
+            let makers = self.makers(x);
+            let what = match makers.iter().collect::<Vec<_>>().as_slice() {
+                [] => "⟨dynamic⟩".to_string(),
+                // One builder: what it composes (`⟨a⟩ AND ⟨b, each c in cs⟩`) when that can be
+                // read, so a builder that now ANDs in another term shows the term.
+                [m] => {
+                    let shape = self.maker_id(m).and_then(|id| clause_shape(self.ix, self.envs, &id, 0));
+                    let direct = matches!(x, Expr::Call(c) if matches!(self.ix.resolve_call(self.env, &c.callee), Callee::Internal(_)));
+                    match (shape, self.joined_by(x).as_deref()) {
+                        (Some(s), Some("OR")) => format!("any of ({s})"),
+                        (Some(s), Some("AND")) => format!("all of ({s})"),
+                        (None, Some("OR")) => format!("any of (⟨built by {m}⟩)"),
+                        (None, Some("AND")) => format!("all of (⟨built by {m}⟩)"),
+                        (Some(s), _) if direct => s,
+                        // Built into something else first (`WHEN i THEN (…)` arms): say by what.
+                        (Some(s), _) => format!("⟨built by {m}: {s}⟩"),
+                        (None, _) => format!("⟨built by {m}⟩"),
+                    }
+                }
+                ms => format!("⟨built by {}⟩", ms.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ")),
+            };
+            holes.push(what);
+            format!("__dyn{}__", holes.len() - 1)
+        };
+        let text = match &e {
+            Expr::Call(call) if matches!(self.ix.resolve_call(self.env, &call.callee), Callee::External(ref a) if a == "fmt.Sprintf()") => {
+                let format = self.ix.const_str(self.env, call.args.first()?)?;
+                let mut out = String::new();
+                let mut args = call.args.iter().skip(1);
+                let mut chars = format.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch != '%' {
+                        out.push(ch);
+                        continue;
+                    }
+                    if chars.peek() == Some(&'%') {
+                        chars.next();
+                        out.push('%');
+                        continue;
+                    }
+                    while chars.peek().is_some_and(|c| !c.is_ascii_alphabetic()) {
+                        chars.next();
+                    }
+                    chars.next();
+                    match args.next() {
+                        Some(a) => out.push_str(&hole(a, &mut holes)),
+                        None => out.push('?'),
+                    }
+                }
+                out
+            }
+            Expr::Template { quasis, exprs } => {
+                let mut out = String::new();
+                for (i, q) in quasis.iter().enumerate() {
+                    out.push_str(q);
+                    if let Some(x) = exprs.get(i) {
+                        out.push_str(&hole(x, &mut holes));
+                    }
+                }
+                out
+            }
+            _ => return None,
+        };
+        Some((text, holes))
+    }
+
+    /// Loop filters of a loop body. `if c { continue }` skips when `c`; a trailing
+    /// `if c { … }` skips when `¬c`, and the filters inside it are the loop's too, so
+    /// `if (id) { …; if (v) { … } }` and `if (!id) continue; …; if (!v) continue; …` agree.
+    fn loop_skips(&mut self, body: &[Stmt], over: &str) {
+        for (k, s) in body.iter().enumerate() {
+            let Stmt::If { test, then, otherwise, loc } = s else { continue };
+            if !otherwise.is_empty() {
+                continue;
+            }
+            // Only an `if` that does nothing but move on filters; one that does work first
+            // (`if … { arms = append(…); continue }`) is another way of handling the item.
+            if matches!(then.as_slice(), [Stmt::Jump(_)]) {
+                self.e.skips.push(SkipFact { over: over.to_string(), when: self.pred(test).render(), loc: loc.clone() });
+            } else if k + 1 == body.len() && !matches!(then.last(), Some(Stmt::Return(..) | Stmt::Throw(..))) {
+                self.e.skips.push(SkipFact { over: over.to_string(), when: self.pred(test).negate().render(), loc: loc.clone() });
+                self.loop_skips(then, over);
+            }
+        }
+    }
+
+    /// Program functions whose results `e` is made from: called in it, or flowing in through
+    /// the locals it uses.
+    /// The program function a maker name (from `makers`) refers to, preferring this module's.
+    fn maker_id(&self, name: &str) -> Option<String> {
+        let named = |f: &&ir::Function| f.id.rsplit("::").next().is_some_and(|l| l.rsplit('.').next() == Some(name));
+        let mut fs: Vec<&ir::Function> = self.ix.program.functions().filter(named).collect();
+        fs.sort_by_key(|f| !f.id.starts_with(&format!("{}::", self.env.module)));
+        fs.first().map(|f| f.id.clone())
+    }
+
+    /// `strings.Join(terms, " OR ")` / `terms.join(" AND ")`: the connective the parts are joined by.
+    fn joined_by(&self, e: &Expr) -> Option<String> {
+        let Expr::Call(c) = e else { return None };
+        let sep = match self.ix.resolve_call(self.env, &c.callee) {
+            Callee::External(a) if a == "strings.Join()" => c.args.get(1),
+            Callee::External(a) if a == "Array#.join()" => c.args.first(),
+            _ => None,
+        }?;
+        let sep = self.ix.const_str(self.env, sep)?.trim().to_uppercase();
+        matches!(sep.as_str(), "OR" | "AND").then_some(sep)
+    }
+
+    fn makers(&self, e: &Expr) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        visit_expr(e, &mut |call| {
+            if let Callee::Internal(id) = self.ix.resolve_call(self.env, &call.callee) {
+                out.insert(id.rsplit("::").next().unwrap_or(&id).rsplit('.').next().unwrap_or(&id).to_string());
+            }
+        });
+        let mut idents = vec![];
+        collect_idents(e, &mut idents);
+        for n in idents {
+            if let Some(m) = self.made_by.get(&n) {
+                out.extend(m.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// `e` with numeric module constants replaced by their values, so a formula reads
+    /// `0.25 * math.Log1p(breadth)` and a changed weight is a changed formula.
+    fn inline_consts(&self, e: &Expr) -> Expr {
+        let b = |x: &Expr| Box::new(self.inline_consts(x));
+        match e {
+            Expr::Ident(n) if !self.env.vars.contains_key(n) => match self.ix.const_str(self.env, e).and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) => Expr::Num(v),
+                None => e.clone(),
+            },
+            // A local by what it was built from (already substituted when it was built).
+            Expr::Ident(n) if self.def_exprs.contains_key(n) && !matches!(self.def_exprs[n], Expr::Ident(_)) => self.def_exprs[n].clone(),
+            Expr::Template { quasis, exprs } => Expr::Template { quasis: quasis.clone(), exprs: exprs.iter().map(|x| self.inline_consts(x)).collect() },
+            Expr::Binary { op, left, right } => Expr::Binary { op: *op, left: b(left), right: b(right) },
+            Expr::Logical { op, left, right } => Expr::Logical { op: *op, left: b(left), right: b(right) },
+            Expr::Not(x) => Expr::Not(b(x)),
+            Expr::Conditional { test, then, otherwise } => Expr::Conditional { test: b(test), then: b(then), otherwise: b(otherwise) },
+            Expr::Call(c) => {
+                Expr::Call(Box::new(ir::Call { callee: c.callee.clone(), args: c.args.iter().map(|a| self.inline_consts(a)).collect(), loc: c.loc.clone() }))
+            }
+            Expr::Array(xs) => Expr::Array(xs.iter().map(|x| self.inline_consts(x)).collect()),
+            other => other.clone(),
+        }
+    }
+
     /// `kysely.Kysely#.selectFrom().where().execute()`: the last link only runs a chain whose
     /// root is a catalogued effect.
     fn runs_effect_chain(&self, api: &str) -> bool {
         let links: Vec<&str> = api.trim_end_matches("()").split("().").collect();
         let Some(last) = links.last() else { return false };
-        if !(last.starts_with("execute") || *last == "stream") || links.len() < 2 {
+        // `…execute()` runs the chain; so does a catalogued effect at its end whose chain
+        // already holds one (gorm's `Raw("SELECT …").Scan(&x)`).
+        let runs = last.starts_with("execute") || *last == "stream" || self.cat.effect_for(api).is_some();
+        if !runs || links.len() < 2 {
             return false;
         }
         (1..links.len()).any(|n| self.cat.effect_for(&format!("{}()", links[..n].join("()."))).is_some())
@@ -1156,6 +1471,26 @@ impl CallSite for Site<'_, '_, '_> {
         self.walker.ix.const_str(self.walker.env, self.call.args.get(i)?)
     }
 
+    fn chain_model(&self) -> Option<String> {
+        if let Some(t) = self.arg_type(0) {
+            return Some(t);
+        }
+        let mut cur = &self.call.callee;
+        while let Expr::Member { object, .. } = cur {
+            let Expr::Call(c) = object.as_ref() else { return None };
+            if let Expr::Member { property, .. } = &c.callee {
+                let site = Site { segments: vec![], walker: self.walker, call: c };
+                match property.as_str() {
+                    "Model" => return site.arg_type(0),
+                    "Table" => return site.arg_str(0),
+                    _ => {}
+                }
+            }
+            cur = &c.callee;
+        }
+        None
+    }
+
     fn arg_type(&self, i: usize) -> Option<String> {
         let ty = self.walker.ix.type_of(self.walker.env, self.call.args.get(i)?);
         let ty = match ty {
@@ -1206,6 +1541,50 @@ fn scope_ctes(ix: &Index, f: &ir::Function) -> BTreeSet<String> {
     out
 }
 
+/// The line (from 0) of a statement's lines where the condition `scope: pred` is written:
+/// after its CTE's definition when it has one, else the first line mentioning it.
+fn sql_line(lines: &[String], filter: &str) -> usize {
+    let (scope, pred) = filter.split_once(": ").unwrap_or(("", filter));
+    let from = lines.iter().position(|l| l.starts_with(&format!("{scope} as")) || l.contains(&format!(" {scope} as ("))).unwrap_or(0);
+    let head: String = pred.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let find = |needle: &str| lines[from..].iter().position(|l| l.contains(needle)).map(|p| p + from);
+    // The whole condition when it is on one line, else where it starts.
+    find(pred).or_else(|| find(&head)).or_else(|| find(head.split('(').next().unwrap_or(&head))).unwrap_or(0)
+}
+
+fn collect_idents(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Ident(n) => out.push(n.clone()),
+        Expr::Member { object, .. } => collect_idents(object, out),
+        Expr::Index { object, index } => {
+            collect_idents(object, out);
+            collect_idents(index, out);
+        }
+        Expr::Call(c) => {
+            collect_idents(&c.callee, out);
+            c.args.iter().for_each(|a| collect_idents(a, out));
+        }
+        Expr::New { args, .. } | Expr::Array(args) | Expr::Template { exprs: args, .. } => args.iter().for_each(|a| collect_idents(a, out)),
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            collect_idents(left, out);
+            collect_idents(right, out);
+        }
+        Expr::Not(x) | Expr::Await(x) | Expr::Spawn(x) => collect_idents(x, out),
+        Expr::Conditional { test, then, otherwise } => {
+            collect_idents(test, out);
+            collect_idents(then, out);
+            collect_idents(otherwise, out);
+        }
+        Expr::Object(props) => props.iter().for_each(|(_, v)| collect_idents(v, out)),
+        _ => {}
+    }
+}
+
+/// A computed value worth showing in place of the local it was stored in: arithmetic.
+fn is_formula(d: &str) -> bool {
+    [" + ", " - ", " * ", " / ", "; +", "; −", "${"].iter().any(|op| d.contains(op))
+}
+
 /// `/prefix/path`, with duplicate and trailing slashes removed.
 fn join_route(prefix: &str, path: &str) -> String {
     let segs: Vec<&str> = prefix.split('/').chain(path.split('/')).filter(|s| !s.is_empty()).collect();
@@ -1221,4 +1600,129 @@ fn flip(op: &str) -> &str {
         ">=" => "<=",
         other => other,
     }
+}
+
+/// What a string-building function returns when it succeeds, with the program functions
+/// it calls as atoms: `scopePredicate` → `⟨anchorPredicate(sc.Anchor)⟩ AND
+/// ⟨anchorPredicate(c), each c in sc.Context⟩`. Failure returns (`""`, `null`) are not
+/// shapes. `None` unless every other return agrees: a function that picks one of several
+/// constants (`switch e.Kind { … }`) is a leaf, named rather than spelled out.
+fn clause_shape(ix: &Index, envs: &Envs, id: &str, depth: u32) -> Option<String> {
+    struct Shaper<'a, 'p> {
+        ix: &'a Index<'p>,
+        envs: &'a Envs,
+        depth: u32,
+        env: &'a Env,
+        vals: HashMap<String, String>,
+        shapes: BTreeSet<String>,
+        /// A string literal was joined in: this builds text, not a number.
+        text: std::cell::Cell<bool>,
+    }
+    impl Shaper<'_, '_> {
+        fn walk(&mut self, stmts: &[Stmt], each: Option<&(String, String)>) {
+            for s in stmts {
+                match s {
+                    Stmt::Let { name, init: Some(e), .. } => {
+                        let v = self.shape(e, each);
+                        self.vals.insert(name.clone(), v);
+                    }
+                    Stmt::Expr(Expr::Assign { target, value, .. }, _) => {
+                        if let Expr::Ident(x) = target.as_ref() {
+                            let v = self.shape(value, each);
+                            self.vals.insert(x.clone(), v);
+                        }
+                    }
+                    Stmt::If { then, otherwise, .. } => {
+                        self.walk(then, each);
+                        self.walk(otherwise, each);
+                    }
+                    Stmt::Loop { binding, iter, body, .. } => {
+                        let over = match (binding, iter) {
+                            (Some(b), Some(it)) => Some((b.clone(), render(it))),
+                            _ => each.cloned(),
+                        };
+                        self.walk(body, over.as_ref());
+                    }
+                    Stmt::Block(b) => self.walk(b, each),
+                    Stmt::Try { body, handler, finalizer, .. } => {
+                        self.walk(body, each);
+                        self.walk(handler, each);
+                        self.walk(finalizer, each);
+                    }
+                    Stmt::Return(Some(e), _) => {
+                        let first = match e {
+                            Expr::Array(xs) => xs.first(),
+                            e => Some(e),
+                        };
+                        match first {
+                            None | Some(Expr::Null | Expr::Undefined) => {}
+                            Some(Expr::Str(s)) if s.is_empty() => {}
+                            Some(x) => {
+                                let v = self.shape(x, each);
+                                self.shapes.insert(v);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn shape(&self, e: &Expr, each: Option<&(String, String)>) -> String {
+            match e {
+                Expr::Str(s) => {
+                    self.text.set(true);
+                    s.clone()
+                }
+                Expr::Binary { op: ir::BinOp::Add, left, right } => self.shape(left, each) + &self.shape(right, each),
+                Expr::Template { quasis, exprs } => {
+                    self.text.set(true);
+                    let mut out = String::new();
+                    for (i, q) in quasis.iter().enumerate() {
+                        out.push_str(q);
+                        if let Some(x) = exprs.get(i) {
+                            out.push_str(&self.shape(x, each));
+                        }
+                    }
+                    out
+                }
+                Expr::Ident(n) if self.vals.contains_key(n) => self.vals[n].clone(),
+                Expr::Call(c) => {
+                    let text = match self.ix.resolve_call(self.env, &c.callee) {
+                        Callee::Internal(id) => {
+                            let name = id.rsplit("::").next().unwrap_or(&id).rsplit('.').next().unwrap_or(&id).to_string();
+                            format!("{name}({})", c.args.iter().map(render).collect::<Vec<_>>().join(", "))
+                        }
+                        _ => render(e),
+                    };
+                    let mut ids = vec![];
+                    collect_idents(e, &mut ids);
+                    // A builder that composes one shape itself is spelled out: `scoped(e)` that
+                    // returns `predicate(e)`'s clause reads as that clause.
+                    if let Callee::Internal(id) = self.ix.resolve_call(self.env, &c.callee) {
+                        let looped = each.is_some_and(|(b, _)| ids.contains(b));
+                        if let Some(inner) = (!looped && self.depth < 3).then(|| clause_shape(self.ix, self.envs, &id, self.depth + 1)).flatten() {
+                            self.text.set(true);
+                            return format!("({inner})");
+                        }
+                    }
+                    match each {
+                        Some((b, over)) if ids.contains(b) => format!("⟨{text}, each {b} in {over}⟩"),
+                        _ => format!("⟨{text}⟩"),
+                    }
+                }
+                other => format!("⟨{}⟩", render(other)),
+            }
+        }
+    }
+    let f = ix.function(id)?;
+    let mut s = Shaper { ix, envs, depth, env: envs.by_fn.get(id)?, vals: HashMap::new(), shapes: BTreeSet::new(), text: std::cell::Cell::new(false) };
+    s.walk(&f.body, None);
+    if !s.text.get() {
+        return None;
+    }
+    let [one] = std::mem::take(&mut s.shapes).into_iter().collect::<Vec<_>>().try_into().ok()?;
+    let one = crate::clause::unparen(&one.split_whitespace().collect::<Vec<_>>().join(" "));
+    // A long builder reads better by name than spelled out.
+    (one.chars().count() <= 200).then_some(one)
 }

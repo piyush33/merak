@@ -165,15 +165,22 @@ api = "{jackc/pgx,jackc/pgx/pgxpool,jackc/pgx/pgconn}.**.{Exec,Query,QueryRow}()
 kind = "sql"
 target = "sql:1"
 
+# gorm: raw SQL is read like database/sql; otherwise the table is the model's
+# (`Create(&order)`, `Model(&Order{})`, `Table("orders")`).
+[[effect]]
+api = "gorm.DB#.**.{Raw,Exec}()"
+kind = "sql"
+target = "sql:0"
+
 [[effect]]
 api = "gorm.DB#.**.{Create,CreateInBatches,Save,Update,Updates,UpdateColumn,UpdateColumns,Delete,FirstOrCreate}()"
 kind = "db_write"
-target = "type:0|gorm"
+target = "model|gorm"
 
 [[effect]]
 api = "gorm.DB#.**.{First,Last,Take,Find,Scan,Count,Pluck,FirstOrInit}()"
 kind = "db_read"
-target = "type:0|gorm"
+target = "model|gorm"
 
 [[effect]]
 api = "mongo-driver/mongo.**.{InsertOne,InsertMany,UpdateOne,UpdateMany,UpdateByID,ReplaceOne,DeleteOne,DeleteMany,FindOneAndUpdate,FindOneAndDelete,FindOneAndReplace,BulkWrite}()"
@@ -297,6 +304,16 @@ api = "{log.*(),log/slog.**,fmt.{Print,Println,Printf}(),zap.**,sirupsen/logrus.
 # ---- Go: query predicates ---------------------------------------------------------
 [[filter]]
 api = "gorm.DB#.**.{Where,Or,Not}()"
+
+# ---- SQL files ------------------------------------------------------------------
+# Statements of `.sql` files (functions, views, migrations) are `$sql("…")` calls.
+[[effect]]
+api = "$sql()"
+kind = "sql"
+target = "sql:0"
+
+[[log]]
+api = "$raise()"
 
 # ---- validation schemas ----------------------------------------------------
 # Module constants built from these roots are validation schemas. `docs` methods

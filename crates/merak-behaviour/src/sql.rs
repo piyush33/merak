@@ -108,7 +108,7 @@ fn depths(toks: &[String]) -> Vec<i32> {
         .collect()
 }
 
-fn tokenize(sql: &str) -> Vec<String> {
+pub(crate) fn tokenize(sql: &str) -> Vec<String> {
     let b: Vec<char> = sql.chars().collect();
     let mut out = vec![];
     let mut i = 0;

@@ -251,3 +251,258 @@ func (s *Storage) Icon(id int64) (*Icon, error) {
     let outputs: Vec<String> = m.entities["store::Storage.Icon"].outputs.iter().map(|o| format!("{} → {}", o.when.join(" ∧ "), o.value)).collect();
     assert_eq!(outputs, ["errors.Is(err, sql.ErrNoRows) → null", "!(errors.Is(err, sql.ErrNoRows)) → icon"]);
 }
+
+#[test]
+fn gorm_raw_sql_and_model_tables() {
+    let src = r#"
+package repo
+
+import "gorm.io/gorm"
+
+type Order struct{ ID string }
+type Repo struct{ db *gorm.DB }
+
+func (r *Repo) Open() []Order {
+	var out []Order
+	r.db.Raw("SELECT * FROM orders WHERE status = 'open' AND deleted_at IS NULL").Scan(&out)
+	return out
+}
+
+func (r *Repo) Close(id string) {
+	r.db.Model(&Order{}).Where("id = ?", id).Update("status", "closed")
+	r.db.Table("audit").Where("order_id = ?", id).Delete(nil)
+}
+"#;
+    let m = merak_cli::model(&files(&[("repo/repo.go", src)])).unwrap();
+    let effects = |id: &str| -> Vec<String> { m.entities[id].effects.iter().map(|e| e.key.render()).collect() };
+    assert_eq!(effects("repo::Repo.Open"), ["db_read orders"]);
+    assert_eq!(effects("repo::Repo.Close"), ["db_write Order", "db_write audit"]);
+    let filters: Vec<&str> = m.entities["repo::Repo.Open"].filters.iter().map(|f| f.expr.as_str()).collect();
+    assert_eq!(filters, ["orders: status = 'open'", "orders: deleted_at is null"]);
+}
+
+const REFRESH: &str = r#"
+CREATE TABLE IF NOT EXISTS stock (item_id text, stack_number text);
+
+CREATE OR REPLACE FUNCTION refresh_stock() RETURNS integer
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+    v_rows integer;
+BEGIN
+    TRUNCATE stock;
+    INSERT INTO stock (item_id, stack_number)
+    WITH latest AS (
+        SELECT sku_id AS item_id, remarks AS stack_number
+          FROM inventory_count
+         WHERE deleted_at IS NULL
+    )
+    SELECT item_id, stack_number FROM latest;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    RETURN v_rows;
+END;
+$fn$;
+"#;
+
+#[test]
+fn sql_files_lineage_filters_and_tables() {
+    let after = REFRESH.replace(
+        "    SELECT item_id, stack_number FROM latest;",
+        "    , stacks AS (\n        SELECT bi.item_id, bi.stack_numbers AS stack_number FROM bill_items bi JOIN bills b ON b.bill_id = bi.bill_id\n         WHERE b.status <> 'void'\n    )\n    SELECT l.item_id, s.stack_number FROM latest l LEFT JOIN stacks s ON s.item_id = l.item_id;",
+    ).replace("stack_number text);", "stack_number text, note text);");
+    let t = merak_cli::diff(&files(&[("db/stock.sql", REFRESH)]), &files(&[("db/stock.sql", &after)])).unwrap();
+    let ops: Vec<String> = t.ops.iter().map(|o| format!("{} {}", o.kind, o.after.clone().unwrap_or_default())).collect();
+    assert!(ops.contains(&"SCHEMA_FIELD_ADDED text".to_string()), "{ops:#?}");
+    assert!(ops.contains(&"QUERY_FILTER_ADDED latest: left join stacks s on s.item_id = l.item_id".to_string()), "{ops:#?}");
+    assert!(ops.contains(&"QUERY_FILTER_ADDED stacks: b.status <> 'void'".to_string()), "{ops:#?}");
+    assert!(ops.iter().any(|o| o.starts_with("EFFECT_ADDED") && o.contains("bill_items")), "{ops:#?}");
+    let m = merak_cli::model(&files(&[("db/stock.sql", &after)])).unwrap();
+    let f = &m.entities["db/stock.sql::refresh_stock"];
+    let w = f.writes.iter().find(|w| w.field == "stock.stack_number").unwrap();
+    assert_eq!(w.value.as_deref(), Some("bill_items.stack_numbers"));
+    let filter = f.filters.iter().find(|q| q.expr == "stacks: b.status <> 'void'").unwrap();
+    assert_eq!(filter.loc.line, 19);
+}
+
+const RANK: &str = r#"
+package rank
+
+import "math"
+
+const (
+	wResults = 1.0
+	wPrefix  = 6.0
+)
+
+type cand struct {
+	count  int
+	prefix bool
+}
+
+func sortCands(cs []cand) float64 {
+	score := func(c cand) float64 {
+		s := wResults * math.Log1p(float64(c.count))
+		if c.prefix {
+			s += wPrefix
+		}
+		return s
+	}
+	return score(cs[0])
+}
+"#;
+
+#[test]
+fn a_changed_weight_is_a_changed_computation() {
+    let after = RANK.replace("wResults = 1.0", "wResults = 0.25");
+    let t = merak_cli::diff(&files(&[("rank/rank.go", RANK)]), &files(&[("rank/rank.go", &after)])).unwrap();
+    let ops: Vec<String> =
+        t.ops.iter().map(|o| format!("{} {} → {}", o.kind, o.before.clone().unwrap_or_default(), o.after.clone().unwrap_or_default())).collect();
+    assert!(ops.contains(&"CONSTANTS_CHANGED wResults = 1 → wResults = 0.25".to_string()), "{ops:#?}");
+    assert!(
+        ops.contains(&"OUTPUT_CHANGED otherwise: 1 * math.Log1p(c.count); +6 when cand.prefix is set → otherwise: 0.25 * math.Log1p(c.count); +6 when cand.prefix is set".to_string()),
+        "{ops:#?}"
+    );
+    assert!(!ops.iter().any(|o| o.starts_with("PURE_REFACTOR")));
+}
+
+const SCOPES: &str = r#"
+package suggest
+
+import (
+	"fmt"
+	"strings"
+
+	"gorm.io/gorm"
+)
+
+const partnersSQL = `SELECT b.id FROM products p JOIN brands b ON b.id = p.brand_id WHERE p.deleted_at IS NULL AND (%s)`
+
+type Repo struct{ db *gorm.DB }
+
+func predicate(e string) (string, bool) {
+	if e == "" {
+		return "", false
+	}
+	return "p.brand_id = ?", true
+}
+
+func scoped(e, ctx string) (string, bool) {
+	clause, ok := predicate(e)
+	if !ok {
+		return "", false
+	}
+	return clause, true
+}
+
+func (r *Repo) Partners(anchors []string) {
+	var terms []string
+	for _, a := range anchors {
+		clause, ok := predicate(a)
+		if !ok {
+			continue
+		}
+		terms = append(terms, "("+clause+")")
+	}
+	sql := fmt.Sprintf(partnersSQL, strings.Join(terms, " OR "))
+	var ids []string
+	r.db.Raw(sql).Scan(&ids)
+}
+"#;
+
+#[test]
+fn a_query_built_from_a_template_names_what_fills_it() {
+    let after = SCOPES
+        .replace("clause, ok := predicate(a)", "clause, ok := scoped(a, \"\")")
+        .replace("		if !ok {\n			continue\n		}\n		terms", "		if !ok {\n			continue\n		}\n		if len(a) > 40 {\n			continue\n		}\n		terms");
+    let t = merak_cli::diff(&files(&[("suggest/s.go", SCOPES)]), &files(&[("suggest/s.go", &after)])).unwrap();
+    let ops: Vec<String> =
+        t.ops.iter().map(|o| format!("{} {} → {}", o.kind, o.before.clone().unwrap_or_default(), o.after.clone().unwrap_or_default())).collect();
+    // `scoped` only wraps `predicate`: both build the same clause, so the filter did not change.
+    assert!(!ops.iter().any(|o| o.starts_with("QUERY_FILTER")), "{ops:#?}");
+    assert!(ops.contains(&"SKIP_ADDED  → a in anchors: skipped when 40 < len(a)".to_string()), "{ops:#?}");
+    let m = merak_cli::model(&files(&[("suggest/s.go", SCOPES)])).unwrap();
+    let effects: Vec<String> = m.entities["suggest::Repo.Partners"].effects.iter().map(|e| e.key.render()).collect();
+    assert_eq!(effects, ["db_read brands", "db_read products"]);
+}
+
+const COMPOSED: &str = r#"
+package suggest
+
+import (
+	"fmt"
+	"strings"
+
+	"gorm.io/gorm"
+)
+
+const partnersSQL = `SELECT b.id FROM products p JOIN brands b ON b.id = p.brand_id WHERE p.deleted_at IS NULL AND (%s)`
+
+type Entity struct {
+	Kind  string
+	ID    string
+}
+
+type Scope struct {
+	Anchor  Entity
+	Context []Entity
+}
+
+type Repo struct{ db *gorm.DB }
+
+func anchorPredicate(e Entity) (string, []any, bool) {
+	switch e.Kind {
+	case "brand":
+		return "p.brand_id = ?", []any{e.ID}, true
+	case "range":
+		return "p.product_range = ?", []any{e.ID}, true
+	default:
+		return "", nil, false
+	}
+}
+
+func scopePredicate(sc Scope) (string, []any, bool) {
+	clause, args, ok := anchorPredicate(sc.Anchor)
+	if !ok {
+		return "", nil, false
+	}
+	for _, c := range sc.Context {
+		cc, cargs, ok := anchorPredicate(c)
+		if !ok {
+			return "", nil, false
+		}
+		clause = "(" + clause + ") AND (" + cc + ")"
+		args = append(args, cargs...)
+	}
+	return clause, args, true
+}
+
+func (r *Repo) Partners(scopes []Scope) {
+	var terms []string
+	for _, sc := range scopes {
+		clause, _, ok := anchorPredicate(sc.Anchor)
+		if !ok {
+			continue
+		}
+		terms = append(terms, "("+clause+")")
+	}
+	sql := fmt.Sprintf(partnersSQL, strings.Join(terms, " OR "))
+	var ids []string
+	r.db.Raw(sql).Scan(&ids)
+}
+"#;
+
+#[test]
+fn a_builder_that_ands_in_another_term_narrows_the_filter() {
+	let after = COMPOSED.replace("clause, _, ok := anchorPredicate(sc.Anchor)", "clause, _, ok := scopePredicate(sc)");
+	let t = merak_cli::diff(&files(&[("suggest/s.go", COMPOSED)]), &files(&[("suggest/s.go", &after)])).unwrap();
+	let op = t.ops.iter().find(|o| o.kind == "QUERY_FILTER_CHANGED").unwrap_or_else(|| panic!("{:#?}", t.ops));
+	assert_eq!(op.before.as_deref(), Some("products: any of (⟨built by anchorPredicate⟩)"));
+	assert_eq!(op.after.as_deref(), Some("products: any of (⟨anchorPredicate(sc.Anchor)⟩ AND ⟨anchorPredicate(c), each c in sc.Context⟩)"));
+	assert_eq!(op.note.as_deref(), Some("the query now also requires ⟨anchorPredicate(c), each c in sc.Context⟩: it reaches fewer rows"));
+	let (before, after) = (files(&[("suggest/s.go", COMPOSED)]), files(&[("suggest/s.go", &after)]));
+	let view = merak_cli::render(&t, "contracts", "test", &before, &after);
+	assert!(view.contains("**`Repo.Partners` reads fewer rows:** rows must now also match ⟨anchorPredicate(c), each c in sc.Context⟩."), "{view}");
+	let m = merak_cli::model(&before).unwrap();
+	let returns: Vec<&str> = m.entities["suggest::scopePredicate"].outputs.iter().map(|o| o.value.as_str()).collect();
+	assert!(returns.contains(&"[⟨anchorPredicate(sc.Anchor)⟩ AND ⟨anchorPredicate(c), each c in sc.Context⟩, args, true]"), "{returns:?}");
+}
