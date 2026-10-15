@@ -362,8 +362,15 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         // Query filters belong to the top-level entity, closures included: a new
         // `$if(c, (qb) => qb.where(…))` narrows the method's query, and closure ids
         // shift when a sibling closure is inserted.
+        // A query moved into a helper that exists on one side only is still this one's.
         let (fa, fb) = match ea.parent {
-            None => (scoped_filters(a, &kids_a, ida), scoped_filters(b, &kids_b, idb)),
+            None => {
+                let (own_a, own_b) = (scoped_filters(a, &kids_a, ida), scoped_filters(b, &kids_b, idb));
+                (
+                    inline_filters(a, &kids_a, ida, &|t| m.forward.contains_key(t), Some(&own_b)),
+                    inline_filters(b, &kids_b, idb, &|t| m.backward.contains_key(t), Some(&own_a)),
+                )
+            }
             Some(_) => (vec![], vec![]),
         };
         // Decorators are not in the body hash: `@Authenticated({ public: true })` alone is a change.
@@ -516,7 +523,8 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         access_change(&mut out, idb, &sa.access, &sb.access);
         output_change(&mut out, idb, ea, eb);
         consts_change(&mut out, idb, ea, eb);
-        skips_change(&mut out, idb, ea, eb);
+        skips_change(&mut out, idb, (a, ida), (b, idb), &|t| m.forward.contains_key(t), &|t| m.backward.contains_key(t));
+        filters_to_memory(&mut out.ops[start..], b, idb, &|t| m.backward.contains_key(t));
 
         for op in &mut out.ops[start..] {
             op.affects = affects.clone();
@@ -715,10 +723,11 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
                 v
             }
         };
-        let sa = unconditioned(inline_shapes(a, ida, &|t| m.forward.contains_key(t)));
-        let sb = unconditioned(inline_shapes(b, idb, &|t| m.backward.contains_key(t)));
-        let (sa, sb): (Vec<&CallShape>, Vec<&CallShape>) = (sa.iter().collect(), sb.iter().collect());
-        let (mut gone, mut new) = multiset_diff(&sa, &sb);
+        let (sa, via_a) = inline_shapes(a, ida, &|t| m.forward.contains_key(t));
+        let (sb, via_b) = inline_shapes(b, idb, &|t| m.backward.contains_key(t));
+        let (sa, sb) = (unconditioned(sa), unconditioned(sb));
+        let (ra, rb): (Vec<&CallShape>, Vec<&CallShape>) = (sa.iter().collect(), sb.iter().collect());
+        let (mut gone, mut new) = multiset_diff(&ra, &rb);
         // Calls whose meaning a typed op already reports: helpers with effects or writes, the
         // validators behind VALIDATION_*, the policy functions behind AUTH_* and GUARD_*.
         let validations_explained = has(&["VALIDATION_"]);
@@ -737,6 +746,32 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         if gone.is_empty() && new.is_empty() {
             continue;
         }
+        // What differs inside a helper that exists on one side only is that helper's own
+        // story (its contract): here it is one call to it, where it is called.
+        let collapse = |xs: Vec<&CallShape>, all: &[CallShape], via: &[Option<CallShape>]| -> Vec<CallShape> {
+            let mut out: Vec<CallShape> = vec![];
+            for x in xs {
+                let i = all.iter().position(|y| std::ptr::eq(x, y));
+                let shown = match i.and_then(|i| via[i].as_ref()) {
+                    Some(call) => call.clone(),
+                    None => x.clone(),
+                };
+                if !out.iter().any(|o| o.key() == shown.key() && o.loc == shown.loc) {
+                    out.push(shown);
+                }
+            }
+            out
+        };
+        // A call gone from here that new code it now calls makes moved there with it.
+        let name = |c: &CallShape| crate::render::call_name(&c.key()).rsplit('.').next().unwrap_or("").to_string();
+        let moved: BTreeSet<String> = new.iter().filter(|x| sb.iter().position(|y| std::ptr::eq(**x, y)).is_some_and(|i| via_b[i].is_some())).map(|x| name(x)).collect();
+        let mut gone = gone;
+        gone.retain(|g| !moved.contains(&name(g)));
+        if gone.is_empty() && new.is_empty() {
+            continue;
+        }
+        let (gone, new) = (collapse(gone, &sa, &via_a), collapse(new, &sb, &via_b));
+        let (gone, new): (Vec<&CallShape>, Vec<&CallShape>) = (gone.iter().collect(), new.iter().collect());
         let show = |xs: &[&CallShape]| (!xs.is_empty()).then(|| xs.iter().map(|c| c.key()).collect::<Vec<_>>().join("; "));
         let evidence = |xs: &[&CallShape]| {
             let mut locs: Vec<Loc> = xs.iter().map(|c| c.loc.clone()).collect();
@@ -939,23 +974,179 @@ fn output_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity,
 }
 
 /// Loop filters that appeared or disappeared: `a in arms: skipped when len(raw) ∈ {0}`.
-fn skips_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity, eb: &merak_behaviour::Entity) {
+/// A loop filter that disappeared while the function now gets its items from new code whose
+/// query tests the same value (`status ∉ {pending}` → `lower(payment_status) = 'pending'`)
+/// moved into that query: SKIP_MOVED_TO_QUERY says where, not that more items get through.
+fn skips_change(
+    out: &mut Builder,
+    subject: &str,
+    (a, ida): (&Model, &str),
+    (b, idb): (&Model, &str),
+    matched_a: &dyn Fn(&str) -> bool,
+    matched: &dyn Fn(&str) -> bool,
+) {
+    let (Some(_), Some(eb)) = (a.entities.get(ida), b.entities.get(idb)) else { return };
     let text = |s: &merak_behaviour::SkipFact| format!("{}: skipped when {}", s.over, s.when);
-    let (ta, tb): (BTreeSet<String>, BTreeSet<String>) = (ea.skips.iter().map(text).collect(), eb.skips.iter().map(text).collect());
-    for s in eb.skips.iter().filter(|s| !ta.contains(&text(s))) {
+    // A loop moved into a helper that exists on one side only still filters for this function.
+    let (own_a, own_b) = (a.entities[ida].skips.iter().collect::<Vec<_>>(), b.entities[idb].skips.iter().collect::<Vec<_>>());
+    let (sa, sb) = (inline_skips(a, ida, matched_a, Some(&own_b)), inline_skips(b, idb, matched, Some(&own_a)));
+    let (ta, tb): (BTreeSet<String>, BTreeSet<String>) = (sa.iter().map(|s| text(s)).collect(), sb.iter().map(|s| text(s)).collect());
+    for s in sb.iter().filter(|s| !ta.contains(&text(s))) {
         out.push("SKIP_ADDED", Layer::Behaviour, subject, None, Some(text(s)), vec![], vec![s.loc.clone()]);
     }
-    for s in ea.skips.iter().filter(|s| !tb.contains(&text(s))) {
-        out.push("SKIP_REMOVED", Layer::Behaviour, subject, Some(text(s)), None, vec![s.loc.clone()], vec![]);
+    // Queries of the new code it calls, with the function that runs each.
+    let kids = closures_by_parent(b);
+    let mut queries: Vec<(String, &QueryFilter)> = vec![];
+    for c in eb.calls.iter().filter(|c| !matched(&c.target) && b.entities.contains_key(&c.target)) {
+        for f in inline_filters(b, &kids, &c.target, &|_| false, None) {
+            queries.push((short(&c.target).to_string(), f));
+        }
     }
+    for s in sa.iter().filter(|s| !tb.contains(&text(s))) {
+        let values = skip_values(&s.when);
+        let moved = queries.iter().find(|(_, f)| {
+            let q = f.expr.to_lowercase();
+            !values.is_empty() && values.iter().all(|v| q.contains(&format!("'{}'", v.to_lowercase())) || q.contains(&format!("= {}", v.to_lowercase())))
+        });
+        match moved {
+            Some((by, f)) => {
+                out.push("SKIP_MOVED_TO_QUERY", Layer::Behaviour, subject, Some(text(s)), Some(format!("{by}: {}", f.expr)), vec![s.loc.clone()], vec![f.loc.clone()]).note =
+                    Some(format!("the loop no longer filters these items; the query of {by} now tests the same value"));
+            }
+            None => {
+                out.push("SKIP_REMOVED", Layer::Behaviour, subject, Some(text(s)), None, vec![s.loc.clone()], vec![]);
+            }
+        }
+    }
+}
+
+/// Query filters this function dropped while it hands one of its parameters to new code that
+/// filters over it in memory (`ByItem(…, itemIDs, …)` → `skips each id in itemIDs when …`):
+/// the filtering moved out of the query, it was not dropped. Those ops say so.
+fn filters_to_memory(ops: &mut [Op], b: &Model, idb: &str, matched: &dyn Fn(&str) -> bool) {
+    if !ops.iter().any(|o| matches!(o.kind.as_str(), "QUERY_FILTER_REMOVED" | "QUERY_FILTER_CHANGED")) {
+        return;
+    }
+    let Some(e) = b.entities.get(idb) else { return };
+    // What it passes on to new code, by name.
+    let passed: BTreeSet<&str> = e.calls.iter().filter(|c| !matched(&c.target)).flat_map(|c| c.args.iter().map(String::as_str)).collect();
+    let skips = inline_skips(b, idb, matched, None);
+    let Some(s) = skips.iter().find(|s| s.over.split_once(" in ").is_some_and(|(_, over)| passed.contains(over))) else { return };
+    let owner = b.entities.values().find(|x| x.skips.iter().any(|y| std::ptr::eq(y, *s))).map(|x| short(&x.id).to_string()).unwrap_or_default();
+    for o in ops.iter_mut().filter(|o| matches!(o.kind.as_str(), "QUERY_FILTER_REMOVED" | "QUERY_FILTER_CHANGED")) {
+        o.kind = "QUERY_FILTER_MOVED_TO_MEMORY".into();
+        o.note = Some(format!("`{owner}`, over each {}", s.over));
+    }
+}
+
+/// Loop filters of `id` and of the functions it calls that exist on this side only. `other`: the
+/// loop filters the other version has itself; a helper's count only over the same items (the
+/// loop moved into it), not loops the function never had. `None`: all of them.
+pub(crate) fn inline_skips<'x>(
+    model: &'x Model,
+    id: &str,
+    matched: &dyn Fn(&str) -> bool,
+    other: Option<&[&merak_behaviour::SkipFact]>,
+) -> Vec<&'x merak_behaviour::SkipFact> {
+    let overs: Option<BTreeSet<&str>> = other.map(|o| o.iter().map(|s| s.over.as_str()).collect());
+    let mut out = vec![];
+    let mut seen = BTreeSet::from([id.to_string()]);
+    let mut stack = vec![id.to_string()];
+    while let Some(cur) = stack.pop() {
+        let Some(e) = model.entities.get(&cur) else { continue };
+        let own = cur == id;
+        out.extend(e.skips.iter().filter(|s| own || overs.as_ref().is_none_or(|o| o.contains(s.over.as_str()))));
+        for c in &e.calls {
+            if !matched(&c.target) && model.entities.get(&c.target).is_some_and(|t| t.parent.is_none()) && seen.insert(c.target.clone()) {
+                stack.push(c.target.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The literal values a loop filter tests: `status ∉ {pending}` → `[pending]`,
+/// `x != "a"` → `[a]`.
+fn skip_values(when: &str) -> Vec<String> {
+    let mut out = vec![];
+    for (open, close) in [("∉ {", "}"), ("∈ {", "}")] {
+        if let Some(i) = when.find(open) {
+            if let Some(j) = when[i..].find(close) {
+                out.extend(when[i + open.len()..i + j].split(", ").map(|v| v.trim_matches(['"', '\'']).to_string()).filter(|v| !v.is_empty() && v != "null"));
+            }
+        }
+    }
+    for op in ["!= ", "== ", "= "] {
+        for part in when.split(op).skip(1) {
+            let v = part.split([' ', ')']).next().unwrap_or("");
+            let v = v.trim_matches(['"', '\'']).to_string();
+            if part.starts_with(['"', '\'']) && !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// Query filters of `id` and its closures, and of the functions it calls that exist on this
+/// side only (an extracted query helper), so moving a query into a helper changes nothing.
+/// `other`: the filters the other version has itself. A helper's filters count only on a
+/// table those are on: a helper that runs a query the function never had is a new query (a
+/// new read), not a narrower one. `None`: all of them.
+pub(crate) fn inline_filters<'x>(
+    model: &'x Model,
+    kids: &BTreeMap<&str, Vec<&str>>,
+    id: &str,
+    matched: &dyn Fn(&str) -> bool,
+    other: Option<&[&QueryFilter]>,
+) -> Vec<&'x QueryFilter> {
+    let table = |f: &QueryFilter| f.expr.split_once(": ").map(|(t, _)| t.to_string()).unwrap_or_default();
+    let tables: Option<BTreeSet<String>> = other.map(|o| o.iter().map(|f| table(f)).collect());
+    let mut out: Vec<&QueryFilter> = scoped_filters(model, kids, id);
+    let own = out.len();
+    let mut seen = BTreeSet::from([id.to_string()]);
+    let mut stack = vec![id.to_string()];
+    let mut first = true;
+    while let Some(cur) = stack.pop() {
+        if !std::mem::take(&mut first) {
+            out.extend(scoped_filters(model, kids, &cur));
+        }
+        let mut scope = vec![cur.as_str()];
+        let mut i = 0;
+        while i < scope.len() {
+            scope.extend(kids.get(scope[i]).into_iter().flatten().copied());
+            i += 1;
+        }
+        for e in scope.iter().filter_map(|x| model.entities.get(*x)) {
+            for c in &e.calls {
+                if !matched(&c.target) && model.entities.contains_key(&c.target) && seen.insert(c.target.clone()) {
+                    stack.push(c.target.clone());
+                }
+            }
+        }
+    }
+    let mut i = 0;
+    out.retain(|f| {
+        i += 1;
+        i <= own || tables.as_ref().is_none_or(|t| t.contains(&table(f)))
+    });
+    out
 }
 
 /// Module constants an entity uses (weights, limits, thresholds) whose value changed, or
 /// that it started or stopped using: `wCatalog = 0.25`, `partnerFetchLimit = 200`.
 fn consts_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity, eb: &merak_behaviour::Entity) {
-    if ea.consts == eb.consts {
+    // Numbers and flags count as used or not; text and maps (`"paid"`, `{relevance: "Sort"}`)
+    // only when their value changed: starting to compare against a status is not a constant change.
+    let numeric = |v: &str| v.parse::<f64>().is_ok() || v == "true" || v == "false";
+    let view = |own: &BTreeMap<String, String>, other: &BTreeMap<String, String>| -> BTreeMap<String, String> {
+        own.iter().filter(|(k, v)| numeric(v) || other.get(*k).is_some_and(|o| !numeric(o))).map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let (ca, cb) = (view(&ea.consts, &eb.consts), view(&eb.consts, &ea.consts));
+    if ca == cb {
         return;
     }
+    let (ea_consts, eb_consts) = (&ca, &cb);
     let show = |m: &BTreeMap<String, String>, other: &BTreeMap<String, String>| -> Option<String> {
         let v: Vec<String> = m.iter().filter(|(k, v)| other.get(*k) != Some(*v)).map(|(k, v)| format!("{k} = {v}")).collect();
         (!v.is_empty()).then(|| v.join(", "))
@@ -964,8 +1155,8 @@ fn consts_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity,
         "CONSTANTS_CHANGED",
         Layer::Behaviour,
         subject,
-        show(&ea.consts, &eb.consts),
-        show(&eb.consts, &ea.consts),
+        show(ea_consts, eb_consts),
+        show(eb_consts, ea_consts),
         vec![ea.loc.clone()],
         vec![eb.loc.clone()],
     );
@@ -1014,6 +1205,23 @@ fn query_filters(out: &mut Builder, subject: &str, fa: &[&QueryFilter], fb: &[&Q
         }
         None => true,
     });
+    // `x in (?)` with its subquery's own conditions → `exists (… x … conditions …)`: the same
+    // filter written another way, one change to check rather than a wider and a narrower one.
+    let mut rewrites: Vec<(Vec<&QueryFilter>, &QueryFilter)> = vec![];
+    new.retain(|n| {
+        let into: Vec<&QueryFilter> = gone.iter().copied().filter(|g| rewritten_into(&g.expr, &n.expr)).collect();
+        if into.is_empty() {
+            return true;
+        }
+        gone.retain(|g| !into.iter().any(|x| std::ptr::eq(*x, *g)));
+        rewrites.push((into, *n));
+        false
+    });
+    for (gs, n) in rewrites {
+        let before = gs.iter().map(|g| g.expr.clone()).collect::<Vec<_>>().join(" · ");
+        out.push("QUERY_FILTER_CHANGED", Layer::Behaviour, subject, Some(before), Some(n.expr.clone()), gs.iter().map(|g| g.loc.clone()).collect(), vec![n.loc.clone()])
+            .note = Some("rewritten as a subquery (check that it reaches the same rows)".into());
+    }
     if let ([g], [n]) = (gone.as_slice(), new.as_slice()) {
         pairs.push((*g, *n));
         (gone, new) = (vec![], vec![]);
@@ -1038,25 +1246,62 @@ fn query_filters(out: &mut Builder, subject: &str, fa: &[&QueryFilter], fb: &[&Q
     }
 }
 
+/// A removed filter that lives on inside an added subquery: its predicate is there (table
+/// aliases aside), or it was `x in (?)` and the subquery tests `x`.
+pub(crate) fn rewritten_into(gone: &str, new: &str) -> bool {
+    // (`orders.id in (?)` + `deleted_at is null` → `exists (… od.order_id = orders.id and od.deleted_at is null …)`)
+    let n = new.to_lowercase();
+    if !(n.contains("exists (") || n.contains("select ")) {
+        return false;
+    }
+    // `od.deleted_at` → `deleted_at`.
+    let bare = |s: &str| -> String {
+        s.split(' ').map(|w| w.rsplit_once('.').filter(|(t, _)| !t.contains(['(', '\'', '"'])).map_or(w, |(_, c)| c)).collect::<Vec<_>>().join(" ")
+    };
+    let g = gone.to_lowercase();
+    let g = g.split_once(": ").map_or(g.as_str(), |(_, p)| p).to_string();
+    if let Some(col) = g.strip_suffix(" in (?)") {
+        return n.contains(col.trim());
+    }
+    bare(&n).contains(&bare(&g))
+}
+
 /// Call shapes of `id`, with calls to entities absent from the other version
 /// (`matched` is false) replaced by those entities' own shapes, under the
-/// conditions of the call site as well as their own.
-fn inline_shapes(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> Vec<CallShape> {
+/// conditions of the call site as well as their own. Beside each shape: the call from
+/// `id` into the helper it was inlined from, if it was.
+fn inline_shapes(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (Vec<CallShape>, Vec<Option<CallShape>>) {
     /// `inlined`: `id` is a helper seen from its caller, so its own guards are conditions too.
-    fn walk(model: &Model, id: &str, outer: &[String], inlined: bool, matched: &dyn Fn(&str) -> bool, seen: &mut BTreeSet<String>, out: &mut Vec<CallShape>) {
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        model: &Model,
+        id: &str,
+        outer: &[String],
+        inlined: bool,
+        via: Option<&CallShape>,
+        matched: &dyn Fn(&str) -> bool,
+        seen: &mut BTreeSet<String>,
+        out: &mut (Vec<CallShape>, Vec<Option<CallShape>>),
+    ) {
         let Some(e) = model.entities.get(id) else { return };
         for c in &e.call_shapes {
             let mut when: Vec<String> = c.when.iter().chain(outer).chain(c.guards.iter().filter(|_| inlined)).cloned().collect();
             when.sort();
             when.dedup();
             match &c.target {
-                Some(t) if !matched(t) && model.entities.contains_key(t) && seen.insert(t.clone()) => walk(model, t, &when, true, matched, seen, out),
-                _ => out.push(CallShape { when, ..c.clone() }),
+                Some(t) if !matched(t) && model.entities.contains_key(t) && seen.insert(t.clone()) => {
+                    let at = via.cloned().unwrap_or_else(|| CallShape { when: when.clone(), ..c.clone() });
+                    walk(model, t, &when, true, Some(&at), matched, seen, out)
+                }
+                _ => {
+                    out.0.push(CallShape { when, ..c.clone() });
+                    out.1.push(via.cloned());
+                }
             }
         }
     }
-    let mut out = vec![];
-    walk(model, id, &[], false, matched, &mut BTreeSet::from([id.to_string()]), &mut out);
+    let mut out = (vec![], vec![]);
+    walk(model, id, &[], false, None, matched, &mut BTreeSet::from([id.to_string()]), &mut out);
     out
 }
 
@@ -1073,4 +1318,21 @@ fn multiset_diff<'x>(a: &[&'x CallShape], b: &[&'x CallShape]) -> (Vec<&'x CallS
         }
     }
     (left.into_values().flatten().collect(), only_b)
+}
+
+#[cfg(test)]
+mod moved_tests {
+    use super::{rewritten_into, skip_values};
+
+    #[test]
+    fn a_subquery_keeps_what_it_was_written_from() {
+        let exists = "exists (select 1 from order_details od where od.order_id = orders.id and od.deleted_at is null)";
+        assert!(rewritten_into("deleted_at is null", exists));
+        assert!(rewritten_into("orders.id in (?)", exists));
+        assert!(!rewritten_into("status = 'open'", exists));
+        // Not a subquery: no rewrite.
+        assert!(!rewritten_into("deleted_at is null", "od.deleted_at is null"));
+        assert_eq!(skip_values("status ∉ {pending}"), ["pending"]);
+        assert_eq!(skip_values(r#"p.Status != "pending""#), ["pending"]);
+    }
 }

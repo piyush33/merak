@@ -37,6 +37,16 @@ pub struct CallFact {
     /// Started concurrently and not waited for (`go f()`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spawned: bool,
+    /// Its arguments as written (rendered): what is passed where, compared across versions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Each argument's string skeleton when it builds one (`/go-api/maps/resolve?url=…`): what
+    /// a callee that sends its parameter somewhere sends it to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_skeletons: Vec<Option<String>>,
+    /// Each argument that is a parameter of the caller, by index: passed on, not built here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_params: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -68,6 +78,10 @@ pub struct EffectFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
     pub loc: Loc,
+    /// The target is this parameter of the function (`fetch(url)` in a `fetchWithAuth(url)`):
+    /// each caller's argument says where it really goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_param: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,6 +136,15 @@ pub struct Output {
     /// with constants by value: a change to it is a change to what the function computes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub formula: bool,
+}
+
+/// An event an element handles, and what its handler does (`setActive(i)`, or the calls it makes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerFact {
+    pub element: String,
+    pub event: String,
+    pub does: String,
+    pub loc: Loc,
 }
 
 /// A piece of rendered content with the element that styles it and the condition that shows it.
@@ -179,6 +202,18 @@ pub struct Entity {
     pub effects: Vec<EffectFact>,
     pub reads: BTreeMap<String, Loc>,
     pub writes: Vec<WriteFact>,
+    /// What it writes into a parameter the caller passed (`into[k] = v` on a map, a field of
+    /// an untyped argument): `into[singular(w)]`. The caller sees the change, so it is
+    /// behaviour; kept apart from `writes`, whose fields name types, not parameters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutates: Vec<WriteFact>,
+    /// What it puts into a record it builds key by key (`updates["zoho_item_id"] = v` on a
+    /// fresh map): the column assignments an update applies, with the value as written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sets: Vec<WriteFact>,
+    /// Events its markup handles: `<button>` on `onMouseEnter` runs `setActive(i)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<HandlerFact>,
     pub guards: Vec<GuardFact>,
     /// For boolean predicate functions: what the return value means.
     pub returns: Option<Pred>,
@@ -310,6 +345,10 @@ pub struct Summary {
     /// Access requirements: own ones, plus the constant ones of everything reached.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub access: BTreeMap<String, AccessFact>,
+    /// Effects whose target is a parameter of this function, by parameter index: a caller
+    /// passing a known string there reaches that target instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_param: BTreeMap<usize, BTreeSet<EffectKey>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

@@ -15,6 +15,8 @@ pub struct Flow {
     pub reads: BTreeSet<String>,
     /// Tables written: INSERT, UPDATE, DELETE, MERGE, TRUNCATE.
     pub writes: BTreeSet<String>,
+    /// Of those, the ones rows are deleted from: DELETE, TRUNCATE.
+    pub deletes: BTreeSet<String>,
     /// Schema changes: (`create table`, `inventory_live_stock`) …
     pub ddl: Vec<(String, String)>,
     /// Row conditions, `scope: condition`, where scope is the CTE (or table) they apply in.
@@ -297,6 +299,7 @@ impl Analyzer<'_> {
                 for x in &self.t[i + 1..hi] {
                     if !matches!(x.as_str(), "table" | "only" | "," | "restart" | "identity" | "cascade" | "continue" | "restrict") {
                         self.flow.writes.insert(clean(x));
+                        self.flow.deletes.insert(clean(x));
                     }
                 }
                 vec![]
@@ -718,6 +721,7 @@ impl Analyzer<'_> {
         }
         let table = clean(self.at(i));
         self.flow.writes.insert(table.clone());
+        self.flow.deletes.insert(table.clone());
         let mut srcs = vec![(table.clone(), Src::Table(table.clone()))];
         let cl = self.clauses(i, hi);
         if let Some((a, b)) = self.clause(&cl, "using", hi) {

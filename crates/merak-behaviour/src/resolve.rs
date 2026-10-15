@@ -467,6 +467,41 @@ impl<'p> Index<'p> {
         self.const_str_depth(env, e, 0)
     }
 
+    /// Whether `name` in `module` is a module-level `const` (not an import, enum or local).
+    pub fn is_module_const(&self, module: &str, name: &str) -> bool {
+        matches!(self.resolve_symbol(module, name), Some(Symbol::Const { .. }))
+    }
+
+    /// A module constant that is a small map or list of literals (or of names), as written:
+    /// `{relevance: "Sort", price_asc: "Price ↑"}`, `{relevance: ArrowUpDown, …}`.
+    pub fn const_text(&self, env: &Env, e: &Expr) -> Option<String> {
+        let Expr::Ident(n) = e else { return None };
+        if env.vars.contains_key(n) {
+            return None;
+        }
+        let Symbol::Const { module, name } = self.resolve_symbol(&env.module, n)? else { return None };
+        let c = self.module(&module)?.consts.iter().find(|c| c.name == name)?;
+        let cenv = Env { module: module.clone(), ..Default::default() };
+        let value = |v: &Expr| -> Option<String> {
+            match v {
+                Expr::Ident(x) => Some(x.clone()),
+                v => self.const_str(&cenv, v).map(|s| format!("{s:?}")),
+            }
+        };
+        let text = match c.init.as_ref()? {
+            Expr::Object(props) if !props.is_empty() && props.len() <= 12 => {
+                let parts: Option<Vec<String>> = props.iter().map(|(k, v)| value(v).map(|v| format!("{k}: {v}"))).collect();
+                format!("{{{}}}", parts?.join(", "))
+            }
+            Expr::Array(xs) if !xs.is_empty() && xs.len() <= 12 => {
+                let parts: Option<Vec<String>> = xs.iter().map(value).collect();
+                format!("[{}]", parts?.join(", "))
+            }
+            _ => return None,
+        };
+        (text.chars().count() <= 400).then_some(text)
+    }
+
     fn const_str_depth(&self, env: &Env, e: &Expr, depth: u32) -> Option<String> {
         if depth > 8 {
             return None;

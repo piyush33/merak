@@ -8,7 +8,7 @@
 //! transitions), `rule` (invariants, layering, ownership), `input` (validation schemas)
 //! and `calls` (changes Merak cannot type).
 
-use crate::{closures_by_parent, is_auth_pred, scoped_filters, short, Layer, Matching, Op};
+use crate::{closures_by_parent, inline_filters, is_auth_pred, rewritten_into, short, Layer, Matching, Op};
 use merak_behaviour::{EntityKind, Model};
 use merak_ir::Loc;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,13 @@ pub struct ContractDiff {
     pub routes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_routes: Vec<String>,
+    /// Other contracts of this change that call it, by entity id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callers: Vec<String>,
+    /// A new function holding what its caller did before (an extracted helper): that caller.
+    /// Its clauses the caller already had are context, not news.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
     pub clauses: Vec<Clause>,
     /// Ids of the operations this contract accounts for.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -47,6 +54,9 @@ pub struct Clause {
     /// What the change means for this clause: `widened`, `reaches more rows`, `new` …
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// Under what conditions it happens, along the calls that reach it: `isMapsLink(v) ∧ ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_before: Option<Loc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,10 +83,13 @@ pub const ROWS: &[&str] = &[
     "skips",
     "where",
     "post",
+    "passes",
+    "fills",
     "reads",
     "effects",
     "consts",
     "renders",
+    "handles",
     "lifecycle",
     "rule",
     "input",
@@ -92,26 +105,38 @@ struct Item {
     key: String,
     text: String,
     loc: Option<Loc>,
+    /// The conditions it happens under, along the calls that reach it (effects only).
+    when: Option<String>,
 }
 
-fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item> {
+/// `matched`: whether a function exists in the other version too. Code moved into one that
+/// does not (an extracted helper) is read as still here.
+fn items(
+    model: &Model,
+    kids: &BTreeMap<&str, Vec<&str>>,
+    id: &str,
+    matched: &dyn Fn(&str) -> bool,
+    other: Option<&[&merak_behaviour::QueryFilter]>,
+    skip_peer: Option<&[&merak_behaviour::SkipFact]>,
+) -> Vec<Item> {
     let (Some(e), Some(s)) = (model.entities.get(id), model.summaries.get(id)) else { return vec![] };
     let mut out = vec![];
     for p in &e.params {
         let key = p.split(':').next().unwrap_or(p).trim().to_string();
-        out.push(Item { row: "takes", key, text: p.clone(), loc: Some(e.loc.clone()) });
+        out.push(Item { row: "takes", key, text: p.clone(), loc: Some(e.loc.clone()), when: None });
     }
     for a in s.access.values() {
         let key = a.requirement.split('=').next().unwrap_or(&a.requirement).to_string();
         let text = if a.dynamic() { format!("{key} chosen by the caller") } else { a.requirement.replace('=', " = ") };
-        out.push(Item { row: "who", key, text, loc: Some(a.loc.clone()) });
+        out.push(Item { row: "who", key, text, loc: Some(a.loc.clone()), when: None });
     }
     // A predicate function (a policy) is its rule: `canCancel` returns `User.role ∈ {ADMIN}`.
-    if let Some(r) = &e.returns {
+    // A predicate's rule; a plain boolean result its outputs already state.
+    if let Some(r) = e.returns.as_ref().filter(|r| is_auth_pred(r) || e.outputs.is_empty()) {
         let text = r.render();
         let row = if is_auth_pred(r) { "who" } else { "returns" };
         let loc = e.returns_at.clone().unwrap_or_else(|| e.loc.clone());
-        out.push(Item { row, key: r.field().map(str::to_string).unwrap_or_else(|| "returns".into()), text, loc: Some(loc) });
+        out.push(Item { row, key: r.field().map(str::to_string).unwrap_or_else(|| "returns".into()), text, loc: Some(loc), when: None });
     }
     // `if (end <= start) return <span/>` is an output case (see `returns`), not a precondition.
     let cases: BTreeSet<&Loc> = e.guards.iter().filter(|g| g.returns_value).map(|g| &g.loc).collect();
@@ -119,11 +144,14 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
         let text = p.render();
         // A role or permission test is an access rule, whatever form it takes.
         let row = if is_auth_pred(p) { "who" } else { "pre" };
-        out.push(Item { row, key: p.field().map(str::to_string).unwrap_or_else(|| text.clone()), text, loc: Some(l.clone()) });
+        out.push(Item { row, key: p.field().map(str::to_string).unwrap_or_else(|| text.clone()), text, loc: Some(l.clone()), when: None });
     }
+    // A check made by calling a function that rejects bad input: what that function requires.
     for (v, l) in &s.validations {
         let name = short(v).to_string();
-        out.push(Item { row: "pre", key: format!("check {name}"), text: format!("passes {name}"), loc: Some(l.clone()) });
+        let requires: Vec<String> = model.summaries.get(v).map(|vs| vs.requires.iter().map(|(_, p, _)| p.render()).take(2).collect()).unwrap_or_default();
+        let text = if requires.is_empty() { format!("passes {name}") } else { format!("passes {name} ({})", requires.join(" ∧ ")) };
+        out.push(Item { row: "pre", key: format!("check {name}"), text, loc: Some(l.clone()), when: None });
     }
     // What its local functions compute (`score = 0.25 * math.Log1p(breadth) + …`), and the
     // constants it and they use.
@@ -135,13 +163,40 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
         let Some(ke) = model.entities.get(k) else { continue };
         for o in ke.outputs.iter().filter(|o| o.formula) {
             let when = if o.when.is_empty() { String::new() } else { format!(" when {}", o.when.join(" ∧ ")) };
-            out.push(Item { row: "computes", key: format!("{}{when}", ke.name), text: format!("{}{when} = {}", ke.name, o.value), loc: Some(o.loc.clone()) });
+            out.push(Item { row: "computes", key: format!("{}{when}", ke.name), text: format!("{}{when} = {}", ke.name, o.value), loc: Some(o.loc.clone()), when: None });
         }
     }
-    if let Some(me) = model.entities.get(id) {
-        for s in &me.skips {
-            let text = format!("{}: skipped when {}", s.over, s.when);
-            out.push(Item { row: "skips", key: text.clone(), text, loc: Some(s.loc.clone()) });
+    // Loop filters, its closures' included (`go func() { for _, ddl := range […] … }()`), and
+    // those of a helper that exists on this side only (a loop moved out into it).
+    let mut skip_seen = BTreeSet::new();
+    let moved = crate::inline_skips(model, id, matched, skip_peer);
+    for s in scope.iter().filter_map(|k| model.entities.get(*k)).flat_map(|me| me.skips.iter()).chain(moved) {
+        let text = format!("{}: skipped when {}", s.over, s.when);
+        if skip_seen.insert((text.clone(), s.loc.clone())) {
+            out.push(Item { row: "skips", key: text.clone(), text, loc: Some(s.loc.clone()), when: None });
+        }
+    }
+    // Events its markup handles, and what a `.map(…)` row renders: its own, its callbacks' too.
+    for k in scope.iter() {
+        let Some(ke) = model.entities.get(*k) else { continue };
+        let tail = ke.name.rsplit('.').next().unwrap_or("");
+        let each = *k != id && (tail == "map" || tail.starts_with("map#"));
+        for h in &ke.handlers {
+            let element = if each { format!("each {}", h.element) } else { h.element.clone() };
+            let text = format!("{element} on {}: {}", h.event, h.does);
+            out.push(Item { row: "handles", key: format!("{element} {}", h.event), text, loc: Some(h.loc.clone()), when: None });
+        }
+        if each {
+            for o in ke.outputs.iter().filter(|o| o.value.starts_with('<')) {
+                let case = if o.when.is_empty() { "each row".to_string() } else { format!("each row when {}", o.when.join(" ∧ ")) };
+                out.push(Item { row: "returns", key: format!("each|{case}"), text: format!("{case}: {}", o.value), loc: Some(o.loc.clone()), when: None });
+            }
+            for o in &ke.outputs {
+                for r in &o.renders {
+                    let shown = if r.when.is_empty() { r.content.clone() } else { format!("{} if {}", r.content, r.when) };
+                    out.push(Item { row: "renders", key: format!("each|{shown}"), text: format!("{shown}: {}", r.style), loc: Some(o.loc.clone()), when: None });
+                }
+            }
         }
     }
     let mut consts: BTreeMap<&String, &String> = BTreeMap::new();
@@ -151,10 +206,10 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
         }
     }
     for (k, v) in consts {
-        out.push(Item { row: "consts", key: k.clone(), text: format!("{k} = {v}"), loc: None });
+        out.push(Item { row: "consts", key: k.clone(), text: format!("{k} = {v}"), loc: None, when: None });
     }
     let mut seen = BTreeSet::new();
-    for f in scoped_filters(model, kids, id) {
+    for f in inline_filters(model, kids, id, matched, other) {
         if seen.insert(f.expr.clone()) {
             // By column: `status` in `status = ?`, `icons: status` for SQL; a subquery by its text.
             let (table, pred) = f.expr.split_once(": ").unwrap_or(("", &f.expr));
@@ -169,7 +224,7 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
                 first
             };
             let key = if table.is_empty() { col.to_string() } else { format!("{table}: {col}") };
-            out.push(Item { row: "where", key, text: f.expr.clone(), loc: Some(f.loc.clone()) });
+            out.push(Item { row: "where", key, text: f.expr.clone(), loc: Some(f.loc.clone()), when: None });
         }
     }
     let mut own = BTreeSet::new();
@@ -179,24 +234,62 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
             None => format!("{} is written", w.field),
         };
         if own.insert(text.clone()) {
-            out.push(Item { row: "post", key: w.field.clone(), text, loc: Some(w.loc.clone()) });
+            out.push(Item { row: "post", key: w.field.clone(), text, loc: Some(w.loc.clone()), when: None });
+        }
+    }
+    // What it puts into a record it builds (`updates.zoho_item_id := gorm.Expr("COALESCE(…)", v)`).
+    for w in &e.sets {
+        let text = format!("{} := {}", w.field, w.value.as_deref().unwrap_or("…"));
+        if own.insert(text.clone()) {
+            out.push(Item { row: "post", key: w.field.clone(), text, loc: Some(w.loc.clone()), when: None });
+        }
+    }
+    // What it writes into what its caller passed: `into[singular(w)]`.
+    for w in &e.mutates {
+        let text = match &w.value {
+            Some(v) => format!("{} := {v}", w.field),
+            None => format!("{} is written", w.field),
+        };
+        if own.insert(text.clone()) {
+            out.push(Item { row: "post", key: w.field.clone(), text, loc: Some(w.loc.clone()), when: None });
         }
     }
     let own_fields: BTreeSet<&str> = e.writes.iter().map(|w| w.field.as_str()).collect();
     for f in s.writes.iter().filter(|f| !own_fields.contains(f.as_str())) {
-        out.push(Item { row: "post", key: f.clone(), text: format!("{f} is written (by a callee)"), loc: None });
+        out.push(Item { row: "post", key: f.clone(), text: format!("{f} is written (by a callee)"), loc: None, when: None });
     }
-    for o in &e.outputs {
+    // `return r.loadVariantDocs(ctx, "")` into an extracted helper with one result: that result.
+    let extracted = |v: &str| -> Option<String> {
+        let c = e.calls.iter().find(|c| !matched(&c.target) && v.contains(&format!("{}(", short(&c.target).rsplit('.').next().unwrap_or(""))))?;
+        match model.entities.get(&c.target)?.outputs.as_slice() {
+            [o] if o.when.is_empty() => Some(o.value.clone()),
+            _ => None,
+        }
+    };
+    // `return ByItem(…)` → `return c.byItem(…)` through helpers that exist on this side only:
+    // the cases of the one at the end of the chain are this function's.
+    let mut outputs: &Vec<merak_behaviour::Output> = &e.outputs;
+    let mut seen_chain = BTreeSet::from([id.to_string()]);
+    while let [o] = outputs.as_slice() {
+        let next = e_calls_into(model, o, matched).filter(|t| seen_chain.insert(t.clone()));
+        match next.and_then(|t| model.entities.get(&t)) {
+            Some(h) if !h.outputs.is_empty() && o.when.is_empty() => outputs = &h.outputs,
+            _ => break,
+        }
+    }
+    let chained = !std::ptr::eq(outputs, &e.outputs);
+    for o in outputs {
         let case = if o.when.is_empty() { "otherwise".to_string() } else { format!("when {}", o.when.join(" ∧ ")) };
-        out.push(Item { row: "returns", key: case.clone(), text: format!("{case}: {}", o.value), loc: Some(o.loc.clone()) });
+        let value = if chained { o.value.clone() } else { extracted(&o.value).unwrap_or_else(|| o.value.clone()) };
+        out.push(Item { row: "returns", key: case.clone(), text: format!("{case}: {value}"), loc: Some(o.loc.clone()), when: None });
         for r in &o.renders {
             let shown = if r.when.is_empty() { r.content.clone() } else { format!("{} if {}", r.content, r.when) };
-            out.push(Item { row: "renders", key: format!("{case}|{shown}"), text: format!("{shown}: {}", r.style), loc: Some(o.loc.clone()) });
+            out.push(Item { row: "renders", key: format!("{case}|{shown}"), text: format!("{shown}: {}", r.style), loc: Some(o.loc.clone()), when: None });
         }
     }
     let pure = s.effects.is_empty() && s.writes.is_empty();
     if pure && !e.outputs.is_empty() {
-        out.push(Item { row: "effects", key: "none".into(), text: "none found".into(), loc: None });
+        out.push(Item { row: "effects", key: "none".into(), text: "none found".into(), loc: None, when: None });
     }
     for (k, i) in model.effects_outside_checks(id) {
         let later: Vec<&str> = i.modes.iter().filter(|m| m.starts_with("async")).map(String::as_str).collect();
@@ -209,23 +302,100 @@ fn items(model: &Model, kids: &BTreeMap<&str, Vec<&str>>, id: &str) -> Vec<Item>
         if !later.is_empty() && !i.modes.contains("sync") {
             text = format!("{text} ({})", later.join(", "));
         }
-        out.push(Item { row: "effects", key: format!("{} {}", k.kind, k.target), text, loc: i.evidence.iter().next().cloned() });
+        let when = effect_when(model, id, k);
+        out.push(Item { row: "effects", key: format!("{} {}", k.kind, k.target), text, loc: i.evidence.iter().next().cloned(), when });
     }
     out
+}
+
+/// The conditions under which `id` reaches effect `k`: the path conditions of each call on
+/// the way (`onQuery` → `goToLink` when `isMapsLink(v) ∨ coordsFromText(v)`, `ready`), and of
+/// the call that does it. `None` when it always happens.
+fn effect_when(model: &Model, id: &str, k: &merak_behaviour::EffectKey) -> Option<String> {
+    let has = |t: &str| model.summaries.get(t).is_some_and(|s| s.effects.contains_key(k));
+    // Where the target is passed in: a callee sending its parameter to the same kind of place.
+    let passes = |t: &str| model.summaries.get(t).is_some_and(|s| s.by_param.values().flatten().any(|x| x.kind == k.kind && x.method == k.method));
+    let mut conds: Vec<String> = vec![];
+    let mut cur = id.to_string();
+    let mut seen = BTreeSet::new();
+    while seen.insert(cur.clone()) {
+        let e = model.entities.get(&cur)?;
+        // Done where it happens: an effect of its own, or the call that names the target.
+        if let Some(f) = e.effects.iter().find(|f| &f.key == k) {
+            if let Some(s) = e.call_shapes.iter().find(|s| s.effect && s.loc == f.loc) {
+                conds.extend(s.when.iter().cloned());
+            }
+            break;
+        }
+        // A real call first; of functions it only refers to (`<fn goToLink>`), the one nothing
+        // calls (the `onChange` handler), not one reached through it, so its conditions count.
+        let called = |t: &str| model.entities.values().any(|x| x.call_shapes.iter().any(|s| s.target.as_deref() == Some(t) && !s.shape.starts_with("<fn ")));
+        let rank = |s: &&merak_behaviour::CallShape| match (s.shape.starts_with("<fn "), s.target.as_deref().is_some_and(called)) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+        };
+        let mut hops: Vec<&merak_behaviour::CallShape> = e.call_shapes.iter().filter(|s| s.target.as_deref().is_some_and(has)).collect();
+        hops.sort_by_key(rank);
+        let next = hops.first().copied().or_else(|| e.call_shapes.iter().find(|s| s.target.as_deref().is_some_and(passes)));
+        let Some(s) = next else { break };
+        conds.extend(s.when.iter().cloned());
+        let t = s.target.clone().unwrap_or_default();
+        if !has(&t) {
+            break;
+        }
+        cur = t;
+    }
+    let mut out: Vec<String> = vec![];
+    for c in conds {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    (!out.is_empty()).then(|| out.join(" ∧ "))
+}
+
+/// The function an output returns the result of, when it exists on this side only:
+/// `committedstock.ByItem(ctx, …)` → the `ByItem` it calls.
+fn e_calls_into(model: &Model, o: &merak_behaviour::Output, matched: &dyn Fn(&str) -> bool) -> Option<String> {
+    model
+        .entities
+        .values()
+        .flat_map(|e| e.calls.iter())
+        .filter(|c| !matched(&c.target) && c.loc.file == o.loc.file && c.loc.line == o.loc.line)
+        .map(|c| c.target.clone())
+        .find(|t| o.value.contains(&format!("{}(", short(t).rsplit('.').next().unwrap_or(""))))
 }
 
 /// Item-by-item comparison of two contracts, in clause order.
 fn compare(before: &[Item], after: &[Item]) -> Vec<Clause> {
     let mut out = vec![];
-    for row in ["takes", "who", "returns", "computes", "pre", "skips", "where", "post", "effects", "consts", "renders"] {
+    for row in ["takes", "who", "returns", "computes", "pre", "skips", "where", "post", "effects", "consts", "renders", "handles"] {
         let mut left: Vec<&Item> = before.iter().filter(|i| i.row == row).collect();
+        // A write moved into a callee is still made.
+        let same = |x: &str, y: &str| x == y || (row == "post" && x.replace(" (by a callee)", "") == y.replace(" (by a callee)", ""));
         for b in after.iter().filter(|i| i.row == row) {
             // Same text first (unchanged), then same key (changed).
-            let pos = left.iter().position(|a| a.text == b.text).or_else(|| left.iter().position(|a| a.key == b.key));
+            let pos = left.iter().position(|a| same(&a.text, &b.text)).or_else(|| left.iter().position(|a| a.key == b.key));
             match pos.map(|p| left.remove(p)) {
-                Some(a) if a.text == b.text => out.push(clause(row, ' ', Some(a), Some(b))),
+                Some(a) if same(&a.text, &b.text) => out.push(clause(row, ' ', Some(a), Some(b))),
                 Some(a) => out.push(clause(row, '~', Some(a), Some(b))),
                 None => out.push(clause(row, '+', None, Some(b))),
+            }
+        }
+        // Filters that live on inside an added subquery: one rewritten filter.
+        if row == "where" {
+            for c in out.iter_mut().filter(|c| c.row == "where" && c.mark == '+') {
+                let new = c.after.clone().unwrap_or_default();
+                let into: Vec<&Item> = left.iter().copied().filter(|g| rewritten_into(&g.text, &new)).collect();
+                if into.is_empty() {
+                    continue;
+                }
+                left.retain(|g| !into.iter().any(|x| std::ptr::eq(*x, *g)));
+                c.mark = '~';
+                c.before = Some(into.iter().map(|g| g.text.clone()).collect::<Vec<_>>().join(" · "));
+                c.evidence_before = into[0].loc.clone();
+                c.tag = Some("rewritten as a subquery (check that it reaches the same rows)".into());
             }
         }
         for a in left {
@@ -247,6 +417,7 @@ fn clause(row: &str, mark: char, a: Option<&Item>, b: Option<&Item>) -> Clause {
         before: if mark == ' ' { None } else { before },
         after,
         tag,
+        when: b.or(a).and_then(|i| i.when.clone()),
         evidence_before: a.and_then(|i| i.loc.clone()),
         evidence_after: b.and_then(|i| i.loc.clone()),
     }
@@ -290,6 +461,8 @@ fn tag(row: &str, mark: char, before: Option<&str>, after: Option<&str>) -> Opti
         }
         ("where", '+') => "reaches fewer rows",
         ("where", '-') => "reaches more rows",
+        // `v.status = 'active'` → `v.status = 'active' ⟨dynamic⟩`: more conditions can be added at run time.
+        ("where", '~') if after.is_some_and(|a| a.strip_suffix(" ⟨dynamic⟩").is_some_and(|x| Some(x) == before)) => "also takes conditions built at run time",
         ("where", '~') => return Some(match reach(before.unwrap_or(""), after.unwrap_or("")) {
             Some(Reach::Narrower(extra)) => format!("narrower: rows must now also match {extra}"),
             Some(Reach::Wider(extra)) => format!("wider: rows can now also match {extra}"),
@@ -299,6 +472,11 @@ fn tag(row: &str, mark: char, before: Option<&str>, after: Option<&str>) -> Opti
         }),
         ("post", '+') => "new write",
         ("post", '-') => "no longer written",
+        // `col := COALESCE(NULLIF(col, ''), ?)` keeps what is there; a plain value replaces it.
+        ("post", '~') if keeps_existing(before.unwrap_or("")) && !keeps_existing(after.unwrap_or("")) => {
+            "now overwrites an existing value (it was set only when empty)"
+        }
+        ("post", '~') if !keeps_existing(before.unwrap_or("")) && keeps_existing(after.unwrap_or("")) => "now set only when empty (it overwrote)",
         ("post", '~') => "writes a different value",
         ("effects", '+') => "new effect",
         ("effects", '-') => "effect dropped",
@@ -308,6 +486,17 @@ fn tag(row: &str, mark: char, before: Option<&str>, after: Option<&str>) -> Opti
         _ => return None,
     };
     Some(t.into())
+}
+
+/// A write that keeps the current value when there is one: `col := COALESCE(col, ?)`,
+/// `COALESCE(NULLIF(BTRIM(t.col), ''), ?)`: the column itself comes first in a COALESCE.
+fn keeps_existing(write: &str) -> bool {
+    let Some((field, value)) = write.split_once(" := ") else { return false };
+    let col = field.rsplit(['.', '[']).next().unwrap_or(field).trim_end_matches([']', '"']).to_lowercase();
+    let v = value.to_lowercase();
+    let Some(i) = v.find("coalesce(") else { return false };
+    let first = crate::render::top_level_args(&v[i + "coalesce(".len()..]).into_iter().next().unwrap_or_default();
+    !col.is_empty() && first.contains(&col)
 }
 
 /// How a changed row filter moved: terms ANDed in or dropped, alternatives ORed in or dropped.
@@ -491,7 +680,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
         if e.parent.is_none()
             && e.kind != EntityKind::Constructor
             && !backward.contains_key(id)
-            && (!e.outputs.is_empty() || b.summaries.get(id).is_some_and(|s| !s.effects.is_empty()))
+            && (!e.outputs.is_empty() || !e.mutates.is_empty() || b.summaries.get(id).is_some_and(|s| !s.effects.is_empty()))
         {
             changed.insert(id.clone());
         }
@@ -518,13 +707,32 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
         let routes = b.entry_points_reaching(&idb);
         let new_routes: Vec<String> = b.routes.iter().filter(|r| r.handler == idb && !routes_before.contains(&r.key())).map(|r| r.key()).collect();
         let (status, clauses) = match backward.get(&idb) {
-            Some(ida) => ("changed", compare(&items(a, &kids_a, ida), &items(b, &kids_b, &idb))),
-            None => ("new", compare(&[], &items(b, &kids_b, &idb))),
+            Some(ida) => {
+                let (own_a, own_b) = (crate::scoped_filters(a, &kids_a, ida), crate::scoped_filters(b, &kids_b, &idb));
+                let mut clauses = compare(
+                    &items(a, &kids_a, ida, &|t| m.forward.contains_key(t), Some(&own_b), Some(&b.entities[&idb].skips.iter().collect::<Vec<_>>())),
+                    &items(b, &kids_b, &idb, &|t| m.backward.contains_key(t), Some(&own_a), Some(&a.entities[ida].skips.iter().collect::<Vec<_>>())),
+                );
+                clauses.extend(passes(a, b, m, ida, &idb));
+                ("changed", clauses)
+            }
+            None => ("new", compare(&[], &items(b, &kids_b, &idb, &|_| true, Some(&[]), Some(&[])))),
         };
         let name = handler_names.get(&idb).cloned().unwrap_or_else(|| short(&idb).to_string());
         contracts.insert(
             idb.clone(),
-            ContractDiff { entity: idb.clone(), name, status: status.into(), loc: e.loc.clone(), routes, new_routes, clauses, ops: vec![] },
+            ContractDiff {
+                entity: idb.clone(),
+                name,
+                status: status.into(),
+                loc: e.loc.clone(),
+                routes,
+                new_routes,
+                callers: vec![],
+                moved_from: None,
+                clauses,
+                ops: vec![],
+            },
         );
     }
     // New route handlers that are closures (`router.post('/x', async (req) => …)`) are named by their route.
@@ -559,6 +767,8 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     loc,
                     routes: vec![],
                     new_routes: vec![],
+                    callers: vec![],
+                    moved_from: None,
                     clauses: vec![],
                     ops: vec![],
                 });
@@ -580,6 +790,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     before: label(&op.before),
                     after: label(&op.after),
                     tag: Some(tag.into()),
+                    when: None,
                     evidence_before: op.evidence_before.first().cloned(),
                     evidence_after: op.evidence_after.first().cloned(),
                 });
@@ -608,6 +819,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     before: states(&op.before),
                     after: states(&op.after),
                     tag: Some(tag.into()),
+                    when: None,
                     evidence_before: op.evidence_before.first().cloned(),
                     evidence_after: op.evidence_after.first().cloned(),
                 };
@@ -623,6 +835,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     before: None,
                     after: Some(format!("breaks {} ({:.0}% of writers follow it)", op.subject, op.confidence * 100.0)),
                     tag: Some("inferred pattern".into()),
+                    when: None,
                     evidence_before: None,
                     evidence_after: op.evidence_after.first().cloned(),
                 };
@@ -649,6 +862,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     before: None,
                     after: Some(text),
                     tag: Some("declared in merak.toml".into()),
+                    when: None,
                     evidence_before: None,
                     evidence_after: op.evidence_after.first().cloned(),
                 };
@@ -668,6 +882,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                         before: (!expanded).then(|| reads.clone()),
                         after: expanded.then_some(reads),
                         tag: Some(if expanded { "reads more data" } else { "reads less data" }.into()),
+                        when: None,
                         // The op's evidence is the function itself, not where it reads.
                         evidence_before: None,
                         evidence_after: None,
@@ -677,6 +892,37 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                 }
                 owner
             }
+            // A loop filter that moved into the query of new code: the removed `skips` item
+            // becomes that move.
+            "SKIP_MOVED_TO_QUERY" => {
+                let owner = Some(top_level(b, &op.subject)).filter(|o| contracts.contains_key(o));
+                if let Some(c) = owner.as_ref().and_then(|o| contracts.get_mut(o)) {
+                    if let Some(x) = c.clauses.iter_mut().find(|x| x.row == "skips" && x.mark == '-' && x.before == op.before) {
+                        x.mark = '~';
+                        x.after = op.after.clone();
+                        x.tag = Some("moved into the query".into());
+                        x.evidence_after = op.evidence_after.first().cloned();
+                    }
+                    c.ops.push(op.id.clone());
+                }
+                continue;
+            }
+            // A filter the query no longer applies because new code filters in memory.
+            "QUERY_FILTER_MOVED_TO_MEMORY" => {
+                let owner = Some(top_level(b, &op.subject)).filter(|o| contracts.contains_key(o));
+                if let Some(c) = owner.as_ref().and_then(|o| contracts.get_mut(o)) {
+                    let table_pred = |t: &str| t.split_once(": ").map_or(t.to_string(), |(_, p)| p.to_string());
+                    let gone = op.before.as_deref().map(table_pred);
+                    for x in c.clauses.iter_mut().filter(|x| x.row == "where" && matches!(x.mark, '-' | '~')) {
+                        if x.before.as_deref().map(table_pred) == gone || x.before.as_deref().is_some_and(|bf| op.before.as_deref().is_some_and(|ob| bf.contains(ob) || ob.contains(bf))) {
+                            x.mark = '~';
+                            x.tag = Some(format!("moved into memory: {}", op.note.clone().unwrap_or_default()));
+                        }
+                    }
+                    c.ops.push(op.id.clone());
+                }
+                continue;
+            }
             "UNCLASSIFIED_CHANGE" => {
                 let owner = Some(top_level(b, &op.subject)).filter(|o| contracts.contains_key(o));
                 let cl = Clause {
@@ -685,6 +931,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     before: op.before.clone(),
                     after: op.after.clone(),
                     tag: None,
+                    when: None,
                     evidence_before: op.evidence_before.first().cloned(),
                     evidence_after: op.evidence_after.first().cloned(),
                 };
@@ -735,6 +982,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                 before: op.before.clone(),
                 after: Some(format!("{} {}", op.kind.to_lowercase().replace('_', " "), op.subject)),
                 tag: None,
+                when: None,
                 evidence_before: op.evidence_before.first().cloned(),
                 evidence_after: op.evidence_after.first().cloned(),
             };
@@ -796,6 +1044,51 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
             || !c.ops.is_empty()
             || b.entities.values().any(|e| e.calls.iter().any(|x| &x.target == id) && kept.contains(&top_level(b, &e.id)) && &top_level(b, &e.id) != id)
     });
+    // Which rows a delete removes: the filter written on the same line (`Where("cart_id = ?", …).Delete(…)`).
+    for c in contracts.values_mut() {
+        for x in c.clauses.iter_mut().filter(|x| x.row == "effects" && x.mark == '+' && x.after.as_deref().is_some_and(|a| a.starts_with("db_delete "))) {
+            let Some(at) = x.evidence_after.clone() else { continue };
+            let table = x.after.as_deref().unwrap_or("").trim_start_matches("db_delete ").split(' ').next().unwrap_or("").to_string();
+            let f = b.entities.values().flat_map(|e| &e.filters).find(|f| f.loc == at);
+            if let Some(f) = f {
+                let pred = f.expr.split_once(": ").filter(|(t, _)| t.eq_ignore_ascii_case(&table) || !t.contains(' ')).map_or(f.expr.as_str(), |(_, p)| p);
+                x.tag = Some(format!("where {pred}"));
+            }
+        }
+    }
+    // Who in this change calls whom: a new helper is read with its caller.
+    let ids: BTreeSet<String> = contracts.keys().cloned().collect();
+    for (id, c) in contracts.iter_mut() {
+        let mut callers: BTreeSet<String> = BTreeSet::new();
+        for e in b.entities.values().filter(|e| e.calls.iter().any(|x| &x.target == id)) {
+            let top = top_level(b, &e.id);
+            if &top != id && ids.contains(&top) {
+                callers.insert(top);
+            }
+        }
+        c.callers = callers.into_iter().collect();
+    }
+    // An extracted helper: a new function whose reads, filters and writes its (changed)
+    // caller had before. Those are context; what is new in it stays news.
+    let norm = |t: &str| t.replace(" (by a callee)", "").replace(" ⟨dynamic⟩", "");
+    for c in contracts.values_mut().filter(|c| c.status == "new") {
+        for caller in &c.callers {
+            let Some(ida) = backward.get(caller) else { continue };
+            let before: BTreeSet<String> = items(a, &kids_a, ida, &|_| true, None, Some(&[])).iter().map(|i| format!("{}|{}", i.row, norm(&i.text))).collect();
+            let moved = |x: &Clause| matches!(x.row.as_str(), "effects" | "where" | "post" | "skips") && x.after.as_deref().is_some_and(|t| before.contains(&format!("{}|{}", x.row, norm(t))));
+            // A query or a loop that moved, not just fields both happen to write.
+            let logic = c.clauses.iter().filter(|x| matches!(x.row.as_str(), "where" | "skips") && moved(x)).count();
+            let all = c.clauses.iter().filter(|x| moved(x)).count();
+            if logic >= 2 || (logic >= 1 && all >= 3) {
+                for x in c.clauses.iter_mut().filter(|x| moved(x)) {
+                    x.mark = ' ';
+                    x.tag = None;
+                }
+                c.moved_from = Some(short(caller).to_string());
+                break;
+            }
+        }
+    }
     let mut out: Vec<ContractDiff> = contracts.into_values().collect();
     out.extend(schemas.into_values());
     if !program.is_empty() {
@@ -806,6 +1099,8 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
             loc: Loc { file: String::new(), line: 0 },
             routes: vec![],
             new_routes: vec![],
+            callers: vec![],
+            moved_from: None,
             ops: program.iter().map(|(_, id)| id.clone()).collect(),
             clauses: program.into_iter().map(|(c, _)| c).collect(),
         });
@@ -814,6 +1109,104 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
         c.clauses.sort_by_key(|x| ROWS.iter().position(|r| *r == x.row).unwrap_or(ROWS.len()));
     }
     out.sort_by_key(|c| (risk(c), c.name.clone()));
+    out
+}
+
+/// What a changed function passes where: an argument of a call it makes that is now
+/// something else (`push(…, xs)` → `push(…, only(xs))`), and, for the locals the new
+/// argument uses, the calls that fill them (`seen` ← `add(seen, c.Title)`, where `add` writes
+/// into that parameter).
+fn passes(a: &Model, b: &Model, m: &Matching, ida: &str, idb: &str) -> Vec<Clause> {
+    let (Some(ea), Some(eb)) = (a.entities.get(ida), b.entities.get(idb)) else { return vec![] };
+    let name = |t: &str| short(t).rsplit('.').next().unwrap_or(t).to_string();
+    let call = |n: &str, args: &[String]| format!("{n}({})", args.join(", "));
+    let mut out = vec![];
+    let mut locals: Vec<String> = vec![];
+    // Calls to the same function, in order, where both versions make as many.
+    let targets: BTreeSet<&str> = eb.calls.iter().map(|c| c.target.as_str()).collect();
+    for t in targets {
+        let after: Vec<&merak_behaviour::CallFact> = eb.calls.iter().filter(|c| c.target == t).collect();
+        let before: Vec<&merak_behaviour::CallFact> = ea.calls.iter().filter(|c| m.to_after(&c.target) == t).collect();
+        if after.len() != before.len() {
+            continue;
+        }
+        for (cb, ca) in before.iter().zip(&after) {
+            if cb.args.len() != ca.args.len() || cb.args == ca.args {
+                continue;
+            }
+            for (i, (old, new)) in cb.args.iter().zip(&ca.args).enumerate() {
+                if old == new {
+                    continue;
+                }
+                // `only(xs)` around what was passed: it now goes through `only`.
+                let wrapper = new.split_once('(').filter(|(g, rest)| !g.is_empty() && !g.contains([' ', '[']) && rest.contains(old.as_str())).map(|(g, _)| g);
+                let tag = match wrapper {
+                    Some(g) => format!("now through {g}"),
+                    None => "passes something else".into(),
+                };
+                let mut shown_b: Vec<String> = cb.args.clone();
+                let mut shown_a: Vec<String> = ca.args.clone();
+                for (j, (x, y)) in shown_b.iter_mut().zip(shown_a.iter_mut()).enumerate() {
+                    if j != i && x == y && x.chars().count() > 40 {
+                        *x = "…".into();
+                        *y = "…".into();
+                    }
+                }
+                out.push(Clause {
+                    row: "passes".into(),
+                    mark: '~',
+                    before: Some(call(&name(t), &shown_b)),
+                    after: Some(call(&name(t), &shown_a)),
+                    tag: Some(tag),
+                    when: None,
+                    evidence_before: Some(cb.loc.clone()),
+                    evidence_after: Some(ca.loc.clone()),
+                });
+                for tok in new.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
+                    if !tok.is_empty() && !tok.contains('.') && tok.starts_with(|c: char| c.is_alphabetic()) && !locals.contains(&tok.to_string()) {
+                        locals.push(tok.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // The calls that fill a local by writing into the parameter it is passed as.
+    let fillers = |e: &merak_behaviour::Entity, model: &Model, local: &str| -> Vec<(String, merak_ir::Loc)> {
+        e.calls
+            .iter()
+            .filter_map(|c| {
+                let j = c.args.iter().position(|x| x == local)?;
+                let callee = model.entities.get(&c.target)?;
+                let p = callee.params.get(j.min(callee.params.len().checked_sub(1)?))?;
+                let p = p.split(':').next().unwrap_or(p).trim();
+                callee.mutates.iter().any(|w| w.field.starts_with(&format!("{p}[")) || w.field.starts_with(&format!("{p}."))).then(|| {
+                    let rest: Vec<String> = c.args.iter().filter(|x| *x != local).cloned().collect();
+                    (call(&name(&c.target), &rest), c.loc.clone())
+                })
+            })
+            .collect()
+    };
+    for local in locals {
+        let now = fillers(eb, b, &local);
+        if now.is_empty() {
+            continue;
+        }
+        let was = fillers(ea, a, &local);
+        let texts = |xs: &[(String, merak_ir::Loc)]| xs.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>().join(" · ");
+        if texts(&was) == texts(&now) {
+            continue;
+        }
+        out.push(Clause {
+            row: "fills".into(),
+            mark: if was.is_empty() { '+' } else { '~' },
+            before: (!was.is_empty()).then(|| format!("{local} ← {}", texts(&was))),
+            after: Some(format!("{local} ← {}", texts(&now))),
+            tag: Some("filled here".into()),
+            when: None,
+            evidence_before: was.first().map(|(_, l)| l.clone()),
+            evidence_after: now.first().map(|(_, l)| l.clone()),
+        });
+    }
     out
 }
 

@@ -175,10 +175,24 @@ fn rendered(e: &Expr, style: &str, when: &mut Vec<String>, out: &mut Vec<Rendere
                 style.to_string()
             } else {
                 let classes: String = j.class().map(|c| c.split_whitespace().map(|x| format!(".{x}")).collect()).unwrap_or_default();
-                format!("{}{classes}", j.tag)
+                // What a person (or a screen reader) is told about it: `[aria-label=SORT_NEXT[sort]]`.
+                let told: String = j
+                    .attrs
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("aria-") || matches!(k.as_str(), "title" | "alt" | "role" | "placeholder" | "href" | "type" | "disabled"))
+                    .map(|(k, v)| {
+                        let v = render(v);
+                        let v = if v.chars().count() > 40 { format!("{}…", v.chars().take(39).collect::<String>()) } else { v };
+                        format!("[{k}={v}]")
+                    })
+                    .collect();
+                format!("{}{classes}{told}", j.tag)
             };
             if j.children.is_empty() && !j.tag.is_empty() {
                 out.push(Rendered { content: format!("<{}>", j.tag), style: style.clone(), when: cond(when) });
+            } else if !j.tag.is_empty() && style.contains('[') {
+                // An element with children that tells something itself (`aria-label`, `title`).
+                out.push(Rendered { content: format!("<{}> itself", j.tag), style: style.clone(), when: cond(when) });
             }
             for c in &j.children {
                 rendered(c, &style, when, out);
@@ -324,6 +338,7 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
         def_exprs: HashMap::new(),
         made_by: HashMap::new(),
         ctes: scope_ctes(ix, f),
+        records: BTreeSet::new(),
         path: vec![],
         consumed_closures: BTreeSet::new(),
         clause: clause_shape(ix, envs, &f.id, 0),
@@ -346,6 +361,9 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
             effects: vec![],
             reads: BTreeMap::new(),
             writes: vec![],
+            mutates: vec![],
+            sets: vec![],
+            handlers: vec![],
             guards: vec![],
             returns: None,
             returns_at: None,
@@ -423,6 +441,8 @@ struct Walker<'a, 'p> {
     made_by: HashMap<String, BTreeSet<String>>,
     /// CTE names in scope: reading one is not a table read.
     ctes: BTreeSet<String>,
+    /// Locals that start as an empty map or object: records built key by key.
+    records: BTreeSet<String>,
     /// Conditions under which the current statement runs: enclosing `if` tests and the
     /// negations of earlier early exits. Part of every call shape, so a condition added
     /// around a call is a change, while `if (c) { f() }` and `if (!c) return; f()` agree.
@@ -468,6 +488,17 @@ impl Walker<'_, '_> {
         match s {
             Stmt::Expr(e, loc) => self.expr(e, loc),
             Stmt::Let { name, ty, init, loc } => {
+                // `updates := map[string]any{}`, `make(map[string]any)`, `const f = {}`.
+                let fresh_record = match init {
+                    Some(Expr::Object(props)) => props.is_empty(),
+                    Some(Expr::Call(c)) => matches!(&c.callee, Expr::Ident(n) if n == "make") && matches!(c.args.first(), Some(Expr::Opaque(t)) if t.starts_with("map[")),
+                    _ => false,
+                };
+                if fresh_record {
+                    self.records.insert(name.clone());
+                } else {
+                    self.records.remove(name);
+                }
                 if let Some(init) = init {
                     let m = self.makers(init);
                     self.made_by.entry(name.clone()).or_default().extend(m);
@@ -508,6 +539,23 @@ impl Walker<'_, '_> {
                         let requires = self.with_domain(requires);
                         let returns_value = matches!(then.last(), Some(Stmt::Return(Some(_), _)));
                         self.e.guards.push(GuardFact { requires, on_fail, loc: loc.clone(), returns_value });
+                    } else {
+                        // `if err != nil { log(…); if !ok { return } }`: it stops when both hold.
+                        for inner in then.iter() {
+                            let Stmt::If { test: t2, then: th2, otherwise: o2, loc: l2 } = inner else { continue };
+                            let on_fail = match th2.last() {
+                                Some(Stmt::Throw(..)) => OnFail::Throw,
+                                Some(Stmt::Return(..)) => OnFail::Return,
+                                _ => continue,
+                            };
+                            if !o2.is_empty() {
+                                continue;
+                            }
+                            let both = crate::pred::Pred::And(vec![self.pred(test), self.pred(t2)]).simplify();
+                            let requires = self.with_domain(both.negate());
+                            let returns_value = matches!(th2.last(), Some(Stmt::Return(Some(_), _)));
+                            self.e.guards.push(GuardFact { requires, on_fail, loc: l2.clone(), returns_value });
+                        }
                     }
                 }
                 self.depth += 1;
@@ -525,6 +573,17 @@ impl Walker<'_, '_> {
                     self.expr(e, loc);
                     let mut renders = vec![];
                     rendered(e, "", &mut Vec::new(), &mut renders);
+                    // `<SortIcon/>` where `const SortIcon = SORT_ICONS[sort]`: the element it is.
+                    for r in renders.iter_mut() {
+                        let Some(tag) = r.content.strip_prefix('<').and_then(|t| t.strip_suffix('>')).map(str::to_string) else { continue };
+                        if let Some(def) = self.def_exprs.get(&tag).filter(|d| matches!(d, Expr::Index { .. } | Expr::Member { .. } | Expr::Conditional { .. })) {
+                            let real = render(def);
+                            r.content = format!("<{real}>");
+                            if let Some(rest) = r.style.strip_prefix(tag.as_str()) {
+                                r.style = format!("{real}{rest}");
+                            }
+                        }
+                    }
                     // `return s`: what `s` was computed by, when it was computed here.
                     let (value, formula) = match e {
                         // A clause built up from other builders: what it composes.
@@ -567,7 +626,11 @@ impl Walker<'_, '_> {
                     (Some(b), Some(it)) => format!("{b} in {}", render(it)),
                     _ => "loop".to_string(),
                 };
-                self.loop_skips(body, &over);
+                // A loop that searches for an item to set a flag (`if d { found = true; break }`)
+                // filters nothing itself: the loop that tests the flag says what it means.
+                if !self.searches(body) {
+                    self.loop_skips(body, &over);
+                }
                 self.depth += 1;
                 self.stmts(body, false);
                 self.depth -= 1;
@@ -630,8 +693,26 @@ impl Walker<'_, '_> {
                     if let Some(field) = self.ix.field_path(self.env, object, property) {
                         let v = self.ix.const_str(self.env, value);
                         self.e.writes.push(WriteFact { field, value: v, creation: false, loc: aloc.clone() });
+                    } else if let Some(p) = self.param(object) {
+                        let v = self.ix.const_str(self.env, value);
+                        self.e.mutates.push(WriteFact { field: format!("{p}.{property}"), value: v, creation: false, loc: aloc.clone() });
+                    } else if let Expr::Ident(r) = object.as_ref() {
+                        // A record built key by key: the value as written, so `COALESCE(col, ?)`
+                        // and a plain value read apart.
+                        if self.records.contains(r) {
+                            let text = render(value);
+                            let text = if text.chars().count() > 200 { format!("{}…", text.chars().take(199).collect::<String>()) } else { text };
+                            self.e.sets.push(WriteFact { field: format!("{r}.{property}"), value: Some(text), creation: false, loc: aloc.clone() });
+                        }
                     }
                     self.expr(object, aloc);
+                }
+                // `into[k] = v` where `into` is a parameter: the caller's map or slice changes.
+                if let Expr::Index { object, index } = target.as_ref() {
+                    if let Some(p) = self.param(object) {
+                        let v = self.ix.const_str(self.env, value);
+                        self.e.mutates.push(WriteFact { field: format!("{p}[{}]", render(index)), value: v, creation: false, loc: aloc.clone() });
+                    }
                 }
                 self.expr(value, aloc);
             }
@@ -670,8 +751,20 @@ impl Walker<'_, '_> {
             Expr::Not(x) | Expr::Await(x) => self.expr(x, loc),
             // A module constant used here: its value is part of what the entity does.
             Expr::Ident(n) if !self.env.vars.contains_key(n) => {
-                if let Some(v) = self.ix.const_str(self.env, e).filter(|v| v.parse::<f64>().is_ok() || v == "true" || v == "false") {
-                    self.e.consts.insert(n.clone(), v);
+                // Numbers and flags by value, strings quoted, small literal maps as written.
+                match self.ix.const_str(self.env, e) {
+                    Some(v) if v.parse::<f64>().is_ok() || v == "true" || v == "false" => {
+                        self.e.consts.insert(n.clone(), v);
+                    }
+                    Some(v) if v.chars().count() <= 200 && self.is_module_const(n) => {
+                        self.e.consts.insert(n.clone(), format!("{v:?}"));
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let Some(v) = self.ix.const_text(self.env, e) {
+                            self.e.consts.insert(n.clone(), v);
+                        }
+                    }
                 }
             }
             Expr::Spawn(x) => {
@@ -694,6 +787,14 @@ impl Walker<'_, '_> {
                 self.depth -= 1;
             }
             Expr::Jsx(j) => {
+                // `onMouseEnter={() => setActive(i)}`: the event and what it does.
+                for (k, v) in &j.attrs {
+                    let is_event = k.len() > 2 && k.starts_with("on") && k[2..].starts_with(|c: char| c.is_ascii_uppercase());
+                    if is_event && !j.tag.is_empty() {
+                        let does = self.handler_does(v);
+                        self.e.handlers.push(HandlerFact { element: format!("<{}>", j.tag), event: k.clone(), does, loc: loc.clone() });
+                    }
+                }
                 j.attrs.iter().for_each(|(_, v)| self.expr(v, loc));
                 j.children.iter().for_each(|c| self.expr(c, loc));
             }
@@ -701,7 +802,7 @@ impl Walker<'_, '_> {
                 // A closure used as a value (not registered as a handler/route) is
                 // assumed to run on behalf of this entity.
                 if !self.consumed_closures.contains(id) => {
-                    self.e.calls.push(CallFact { target: id.clone(), loc: loc.clone(), conditional: true, spawned: self.spawn_depth > 0 });
+                    self.e.calls.push(CallFact { target: id.clone(), loc: loc.clone(), conditional: true, spawned: self.spawn_depth > 0, args: vec![], arg_skeletons: vec![], arg_params: vec![] });
                     // By its name within this entity, so the conditions it is used under count.
                     // By kind, not position: inserting a sibling renumbers `useMemo#4` to `#5`.
                     let name = id.strip_prefix(&format!("{}.", self.e.id)).unwrap_or(id);
@@ -732,7 +833,10 @@ impl Walker<'_, '_> {
                     loc: loc.clone(),
                     effect: false,
                 });
-                self.e.calls.push(CallFact { target, loc: loc.clone(), conditional: self.depth > 0, spawned: self.spawn_depth > 0 });
+                let args = c.args.iter().map(arg_text).collect();
+                let arg_skeletons = c.args.iter().map(|a| self.ix.string_skeleton(self.env, a).filter(|s| s != "…")).collect();
+                let arg_params = c.args.iter().map(|a| self.param_index(a)).collect();
+                self.e.calls.push(CallFact { target, loc: loc.clone(), conditional: self.depth > 0, spawned: self.spawn_depth > 0, args, arg_skeletons, arg_params });
             }
             Callee::External(api) if self.cat.is_filter(&api) => {
                 if self.filter_depth == 0 {
@@ -916,7 +1020,7 @@ impl Walker<'_, '_> {
     /// Record what a catalogued external call means; `false` if the catalog does not know it.
     fn external_call(&mut self, api: &str, c: &ir::Call) -> bool {
         enum Found {
-            Effect(EffectKey, bool),
+            Effect(EffectKey, bool, Option<usize>),
             Subscribe(String, i32),
             Route(String, String, i32),
             Nothing,
@@ -936,13 +1040,19 @@ impl Walker<'_, '_> {
                 }
                 let method = rule.method.as_ref().and_then(|m| catalog::eval_spec(m, &site));
                 let dynamic = target.is_none();
+                // `fetch(url)` where `url` is a parameter: the caller decides where it goes.
+                let from_param = if dynamic {
+                    rule.target.split(':').nth(1).and_then(|x| x.split(['|', ':']).next()?.parse::<usize>().ok()).and_then(|i| site.walker.param_index(c.args.get(i)?))
+                } else {
+                    None
+                };
                 // A target built at runtime still has a readable shape: `…/search`.
                 let target = target.or_else(|| {
                     let i: usize = rule.target.split(':').nth(1)?.split(['|', ':']).next()?.parse().ok()?;
                     let skeleton = self.ix.string_skeleton(self.env, c.args.get(i)?)?;
                     (skeleton != "…").then_some(skeleton)
                 });
-                Found::Effect(EffectKey { kind: rule.kind.clone(), target: target.unwrap_or_else(|| "<dynamic>".into()), method }, dynamic)
+                Found::Effect(EffectKey { kind: rule.kind.clone(), target: target.unwrap_or_else(|| "<dynamic>".into()), method }, dynamic, from_param)
             } else if let Some(rule) = self.cat.subscription_for(api, false) {
                 Found::Subscribe(catalog::eval_spec(&rule.event, &site).unwrap_or_else(|| "<dynamic>".into()), rule.handler_arg.unwrap_or(-1))
             } else if let Some(rule) = self.cat.route_for(api, false) {
@@ -956,12 +1066,12 @@ impl Walker<'_, '_> {
             }
         };
         match found {
-            Found::Effect(key, dynamic) => {
-                if dynamic {
+            Found::Effect(key, dynamic, from_param) => {
+                if dynamic && from_param.is_none() {
                     self.e.unknowns.push(Unknown { question: format!("effect target of `{api}` is not a constant"), loc: c.loc.clone() });
                 }
-                let payload = if key.kind == "http" { self.request_body(c) } else { None };
-                self.e.effects.push(EffectFact { key, api: api.to_string(), payload, loc: c.loc.clone() });
+                let payload = if key.kind == "http" { self.request_body(api, c) } else { None };
+                self.e.effects.push(EffectFact { key, api: api.to_string(), payload, loc: c.loc.clone(), from_param });
             }
             Found::Subscribe(event, idx) => {
                 if let Some(handler) = self.handler_arg(c, idx) {
@@ -998,7 +1108,7 @@ impl Walker<'_, '_> {
         let Some(mut flow) = text.as_deref().and_then(|q| crate::sqlflow::analyze_with(q, &value, &is_var)) else {
             self.e.unknowns.push(Unknown { question: format!("SQL of `{api}` is not a constant"), loc: c.loc.clone() });
             let key = EffectKey { kind: "db_query".into(), target: "<dynamic>".into(), method: None };
-            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone() });
+            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone(), from_param: None });
             return;
         };
         // Text that says nothing SQL can read (not a statement at all) is not an effect to drop.
@@ -1010,17 +1120,17 @@ impl Walker<'_, '_> {
         if flow.reads.is_empty() && flow.writes.is_empty() && flow.ddl.is_empty() && !quiet.contains(&first.as_str()) {
             self.e.unknowns.push(Unknown { question: format!("SQL of `{api}` could not be read"), loc: c.loc.clone() });
             let key = EffectKey { kind: "db_query".into(), target: "<dynamic>".into(), method: None };
-            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone() });
+            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone(), from_param: None });
             return;
         }
         flow.filters = flow.filters.into_iter().map(&fill).collect();
         flow.columns = std::mem::take(&mut flow.columns).into_iter().map(|(k, v)| (k, fill(v))).collect();
         let mut push = |kind: &str, target: &str, method: Option<String>| {
             let key = EffectKey { kind: kind.into(), target: target.into(), method };
-            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone() });
+            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone(), from_param: None });
         };
         for t in &flow.writes {
-            push("db_write", t, None);
+            push(if flow.deletes.contains(t) { "db_delete" } else { "db_write" }, t, None);
         }
         for t in flow.reads.difference(&flow.writes) {
             push("db_read", t, None);
@@ -1129,13 +1239,90 @@ impl Walker<'_, '_> {
             }
             // Only an `if` that does nothing but move on filters; one that does work first
             // (`if … { arms = append(…); continue }`) is another way of handling the item.
+            // `if a { if b { continue } … }`: skipped when `a ∧ b`.
+            for inner in then.iter() {
+                if let Stmt::If { test: t2, then: th2, otherwise: o2, loc: l2 } = inner {
+                    if o2.is_empty() && matches!(th2.as_slice(), [Stmt::Jump(_)]) {
+                        let when = format!("{} ∧ {}", self.pred(test).render(), self.pred(t2).render());
+                        self.e.skips.push(SkipFact { over: over.to_string(), when, loc: l2.clone() });
+                    }
+                }
+            }
             if matches!(then.as_slice(), [Stmt::Jump(_)]) {
                 self.e.skips.push(SkipFact { over: over.to_string(), when: self.pred(test).render(), loc: loc.clone() });
             } else if k + 1 == body.len() && !matches!(then.last(), Some(Stmt::Return(..) | Stmt::Throw(..))) {
-                self.e.skips.push(SkipFact { over: over.to_string(), when: self.pred(test).negate().render(), loc: loc.clone() });
+                let when = self.flag_search(&body[..k], test).unwrap_or_else(|| self.pred(test).negate().render());
+                // An earlier `if c { …; continue }` handles its items another way: the trailing
+                // `if` only decides for the others.
+                let mut parts: Vec<String> = body[..k]
+                    .iter()
+                    .filter_map(|t| match t {
+                        Stmt::If { test, then, otherwise, .. } if otherwise.is_empty() && then.len() > 1 && matches!(then.last(), Some(Stmt::Jump(_))) => {
+                            Some(self.pred(test).negate().render())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                parts.push(when);
+                self.e.skips.push(SkipFact { over: over.to_string(), when: parts.join(" ∧ "), loc: loc.clone() });
                 self.loop_skips(then, over);
             }
         }
+    }
+
+    /// A loop body with `if d { flag = true/false; …; break }`.
+    fn searches(&self, body: &[Stmt]) -> bool {
+        body.iter().any(|t| match t {
+            Stmt::If { then, otherwise, .. } if otherwise.is_empty() && matches!(then.last(), Some(Stmt::Jump(_))) => then.iter().any(|x| {
+                matches!(x, Stmt::Expr(Expr::Assign { target, value, .. }, _) if matches!(target.as_ref(), Expr::Ident(_)) && matches!(value.as_ref(), Expr::Bool(_)))
+            }),
+            _ => false,
+        })
+    }
+
+    /// `keep := true; for _, w := range ws { if c { continue }; if d { keep = false; break } }`
+    /// then `if keep { … }`: the flag says whether some `w` (not skipped by `c`) meets `d`.
+    /// Returns when the `if` on the flag does not run: `for some w in ws where ¬c: d`.
+    fn flag_search(&self, before: &[Stmt], test: &Expr) -> Option<String> {
+        let (flag, wanted) = match test {
+            Expr::Ident(f) => (f, true),
+            Expr::Not(x) => match x.as_ref() {
+                Expr::Ident(f) => (f, false),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let start = before.iter().rev().find_map(|s| match s {
+            Stmt::Let { name, init: Some(Expr::Bool(v)), .. } if name == flag => Some(*v),
+            _ => None,
+        })?;
+        for s in before.iter().rev() {
+            let Stmt::Loop { binding: Some(b), iter: Some(it), body, .. } = s else { continue };
+            let sets = |then: &[Stmt]| {
+                then.iter().any(|t| matches!(t, Stmt::Expr(Expr::Assign { target, value, .. }, _)
+                    if matches!(target.as_ref(), Expr::Ident(x) if x == flag) && matches!(value.as_ref(), Expr::Bool(v) if *v != start)))
+                    && matches!(then.last(), Some(Stmt::Jump(_)))
+            };
+            let Some(found) = body.iter().find_map(|t| match t {
+                Stmt::If { test, then, otherwise, .. } if otherwise.is_empty() && sets(then) => Some(test),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let except: Vec<String> = body
+                .iter()
+                .filter_map(|t| match t {
+                    Stmt::If { test, then, otherwise, .. } if otherwise.is_empty() && matches!(then.as_slice(), [Stmt::Jump(_)]) => Some(self.pred(test).negate().render()),
+                    _ => None,
+                })
+                .collect();
+            let over = format!("{b} in {}", render(it));
+            let over = if except.is_empty() { over } else { format!("{over} where {}", except.join(" ∧ ")) };
+            let hit = self.pred(found).render();
+            // The `if` runs when the flag is `wanted`; it ends up `!start` when some item hit.
+            return Some(if start == wanted { format!("for some {over}: {hit}") } else { format!("for no {over}: {hit}") });
+        }
+        None
     }
 
     /// Program functions whose results `e` is made from: called in it, or flowing in through
@@ -1179,6 +1366,69 @@ impl Walker<'_, '_> {
 
     /// `e` with numeric module constants replaced by their values, so a formula reads
     /// `0.25 * math.Log1p(breadth)` and a changed weight is a changed formula.
+    /// A name bound by a module-level `const` (not an import alias, enum or local).
+    fn is_module_const(&self, n: &str) -> bool {
+        self.ix.is_module_const(&self.env.module, n)
+    }
+
+    /// What an event handler does: its one expression (`setActive(i)`), or the functions it calls.
+    fn handler_does(&self, v: &Expr) -> String {
+        let clip = |s: String| if s.chars().count() > 120 { format!("{}…", s.chars().take(119).collect::<String>()) } else { s };
+        let Expr::Closure(id) = v else { return clip(render(v)) };
+        let Some(f) = self.ix.function(id) else { return clip(render(v)) };
+        // A small object passed whole: `setFailed({ src, count: failures + 1 })`.
+        let full = |e: &Expr| -> String {
+            let Expr::Call(c) = e else { return render(e) };
+            let args: Vec<String> = c
+                .args
+                .iter()
+                .map(|a| match a {
+                    Expr::Object(props) if props.len() <= 4 => {
+                        let fields: Vec<String> = props
+                            .iter()
+                            .map(|(k, v)| match v {
+                                Expr::Ident(n) if n == k => k.clone(),
+                                v => format!("{k}: {}", render(v)),
+                            })
+                            .collect();
+                        format!("{{{}}}", fields.join(", "))
+                    }
+                    a => render(a),
+                })
+                .collect();
+            format!("{}({})", render(&c.callee), args.join(", "))
+        };
+        match f.body.as_slice() {
+            [Stmt::Expr(e, _)] | [Stmt::Return(Some(e), _)] => clip(full(e)),
+            body => {
+                let mut names: Vec<String> = vec![];
+                visit_calls(body, &mut |c| {
+                    let n = render(&c.callee);
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
+                });
+                clip(names.iter().map(|n| format!("{n}(…)")).collect::<Vec<_>>().join("; "))
+            }
+        }
+    }
+
+    /// The index of the parameter an expression names (`url` in `fetchWithAuth(url, …)`).
+    fn param_index(&self, e: &Expr) -> Option<usize> {
+        let Expr::Ident(n) = e else { return None };
+        if self.defs.contains_key(n) {
+            return None;
+        }
+        self.e.params.iter().position(|p| p.split(':').next().unwrap_or(p).trim().trim_end_matches('?') == n)
+    }
+
+    /// The parameter an expression names, unless the function rebinds it (`into = …`).
+    fn param(&self, e: &Expr) -> Option<String> {
+        let Expr::Ident(n) = e else { return None };
+        let named = self.e.params.iter().any(|p| p.split(':').next().unwrap_or(p).trim().trim_end_matches('?') == n);
+        (named && !self.defs.contains_key(n)).then(|| n.clone())
+    }
+
     fn inline_consts(&self, e: &Expr) -> Expr {
         let b = |x: &Expr| Box::new(self.inline_consts(x));
         match e {
@@ -1217,9 +1467,15 @@ impl Walker<'_, '_> {
 
     /// The fields an HTTP call sends: the `body` of its options (through `JSON.stringify`),
     /// or an object passed as the data argument (`axios.post(url, { … })`).
-    fn request_body(&self, c: &ir::Call) -> Option<String> {
+    fn request_body(&self, api: &str, c: &ir::Call) -> Option<String> {
+        // `fetch(url, init)`: the body is `init.body`; the rest of `init` is how, not what.
+        let init_only = api.trim_end_matches("()").rsplit('.').next() == Some("fetch");
         let body = c.args.iter().skip(1).find_map(|a| match a {
-            Expr::Object(props) => Some(props.iter().find(|(k, _)| k == "body" || k == "data").map(|(_, v)| v).unwrap_or(a)),
+            Expr::Object(props) => match props.iter().find(|(k, _)| k == "body" || k == "data").map(|(_, v)| v) {
+                Some(v) => Some(v),
+                None if init_only => None,
+                None => Some(a),
+            },
             _ => None,
         })?;
         let body = match body {
@@ -1431,7 +1687,13 @@ impl Walker<'_, '_> {
                     // By canonical name, so `semver.satisfies(v)` and `satisfies(v)` agree.
                     Callee::External(canon) => {
                         let args = c.args.iter().map(render).collect::<Vec<_>>().join(", ");
-                        Pred::Opaque { text: format!("{}({args})", canon.trim_end_matches("()")), negated: false }
+                        // A method of a value (`through.Equal(started)`, canonically `time.Time#.Equal`)
+                        // keeps its receiver: which value it asks about is the condition.
+                        let text = match &c.callee {
+                            Expr::Member { object, property } if canon.contains("#.") => format!("{}.{property}({args})", render(object)),
+                            _ => format!("{}({args})", canon.trim_end_matches("()")),
+                        };
+                        Pred::Opaque { text, negated: false }
                     }
                     Callee::Unresolved(_) => Pred::Opaque { text: render(e), negated: false },
                 }
@@ -1500,7 +1762,19 @@ impl CallSite for Site<'_, '_, '_> {
         match ty {
             Ty::Class(id) => self.walker.ix.class(&id).map(|c| c.name.clone()),
             Ty::Record { name, .. } => Some(name),
-            _ => None,
+            // A type from code not analysed here: the name it is constructed by,
+            // `models.ProductVariant{…}` (directly or through the local holding it).
+            _ => {
+                let arg = self.call.args.get(i)?;
+                let built = match arg {
+                    Expr::Ident(n) => self.walker.def_exprs.get(n)?,
+                    other => other,
+                };
+                match built {
+                    Expr::New { callee, .. } => Some(render(callee).rsplit('.').next()?.to_string()),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -1725,4 +1999,19 @@ fn clause_shape(ix: &Index, envs: &Envs, id: &str, depth: u32) -> Option<String>
     let one = crate::clause::unparen(&one.split_whitespace().collect::<Vec<_>>().join(" "));
     // A long builder reads better by name than spelled out.
     (one.chars().count() <= 200).then_some(one)
+}
+
+/// An argument as written, a constructed record by its first field: `Entity{Kind: KindBrand, …}`,
+/// so calls passing different records read apart.
+fn arg_text(e: &Expr) -> String {
+    match e {
+        Expr::New { callee, args, .. } => match args.as_slice() {
+            [Expr::Object(props)] => match props.first() {
+                Some((k, v)) => format!("{}{{{k}: {}{}}}", render(callee), render(v), if props.len() > 1 { ", …" } else { "" }),
+                None => format!("{}{{}}", render(callee)),
+            },
+            _ => render(e),
+        },
+        _ => render(e),
+    }
 }

@@ -576,13 +576,15 @@ impl<'s> Lowerer<'s> {
                 }
                 ir::Stmt::Block(out)
             }
+            // `function onQuery() {…}` inside a function is `const onQuery = () => {…}`: its
+            // name is bound, so calls to it (from siblings too) reach it.
             Statement::FunctionDeclaration(f) => {
-                if let Some(id) = &f.id {
-                    let q = self.closure_name(Some(id.name.as_str().to_string()));
-                    let parent = self.scope.last().map(|p| self.entity_id(p));
-                    self.function(f, &q, None, ir::FunctionKind::Closure, false, parent);
-                }
-                return None;
+                let id = f.id.as_ref()?;
+                let name = id.name.as_str().to_string();
+                let q = self.closure_name(Some(name.clone()));
+                let parent = self.scope.last().map(|p| self.entity_id(p));
+                let fid = self.function(f, &q, None, ir::FunctionKind::Closure, false, parent);
+                ir::Stmt::Let { name, ty: None, init: Some(ir::Expr::Closure(fid)), loc }
             }
             Statement::EmptyStatement(_) => return None,
             Statement::BreakStatement(_) | Statement::ContinueStatement(_) => ir::Stmt::Jump(loc),

@@ -5,7 +5,7 @@ use crate::model::*;
 use crate::pred::Pred;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const WRITE_EFFECTS: &[&str] = &["db_write", "db_query", "http", "event_emit", "fs_write", "queue", "cache_write"];
+pub const WRITE_EFFECTS: &[&str] = &["db_write", "db_delete", "db_query", "http", "event_emit", "fs_write", "queue", "cache_write"];
 
 pub fn compute(model: &mut Model) {
     let handlers = handlers_by_event(model);
@@ -15,6 +15,9 @@ pub fn compute(model: &mut Model) {
     for e in model.entities.values() {
         let mut s = Summary::default();
         for eff in &e.effects {
+            if let Some(i) = eff.from_param {
+                s.by_param.entry(i).or_default().insert(eff.key.clone());
+            }
             let info = s.effects.entry(eff.key.clone()).or_default();
             info.modes.insert("sync".into());
             info.via.insert("direct".into());
@@ -35,13 +38,27 @@ pub fn compute(model: &mut Model) {
             let mut reads = BTreeSet::new();
             let mut writes = BTreeSet::new();
             let mut access = vec![];
+            let mut passed: Vec<(usize, EffectKey)> = vec![];
             for c in &e.calls {
                 let Some(cs) = sums.get(&c.target) else { continue };
                 // A callee's dynamic requirement is the caller's to fill in.
                 access.extend(cs.access.values().filter(|a| !a.dynamic()).cloned());
                 for (k, info) in &cs.effects {
+                    // A target the callee takes as a parameter: what this call passes there.
+                    let param = cs.by_param.iter().find(|(_, ks)| ks.contains(k)).map(|(i, _)| *i);
+                    let k = match param {
+                        Some(i) => match (c.arg_skeletons.get(i).cloned().flatten(), c.arg_params.get(i).copied().flatten()) {
+                            (Some(target), _) => EffectKey { target, ..k.clone() },
+                            (None, Some(own)) => {
+                                passed.push((own, k.clone()));
+                                k.clone()
+                            }
+                            _ => k.clone(),
+                        },
+                        None => k.clone(),
+                    };
                     add.push((
-                        k.clone(),
+                        k,
                         EffectInfo {
                             modes: if c.spawned { BTreeSet::from(["async via goroutine".to_string()]) } else { info.modes.clone() },
                             via: BTreeSet::from([c.target.clone()]),
@@ -70,6 +87,9 @@ pub fn compute(model: &mut Model) {
                 }
             }
             let s = sums.get_mut(&e.id).unwrap();
+            for (i, k) in passed {
+                changed |= s.by_param.entry(i).or_default().insert(k);
+            }
             for (k, info) in add {
                 let slot = s.effects.entry(k).or_default();
                 let before = (slot.modes.len(), slot.via.len(), slot.evidence.len(), slot.payloads.len());
@@ -99,6 +119,8 @@ pub fn compute(model: &mut Model) {
         .filter(|e| {
             let s = &sums[&e.id];
             e.throws
+                // A validator checks what it is given: `signOut()` throws, but checks nothing.
+                && !e.params.is_empty()
                 && e.returns.is_none()
                 && s.writes.is_empty()
                 && !s.effects.keys().any(|k| WRITE_EFFECTS.contains(&k.kind.as_str()))

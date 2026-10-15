@@ -562,6 +562,7 @@ fn effect(e: &str) -> String {
     let thing = |label: &str, what: &str| if dynamic { format!("{label} chosen at runtime") } else { format!("`{rest}` {what}") };
     match kind {
         "db_write" => format!("writes {}", thing("a table", "table")).replace("writes `", "writes the `"),
+        "db_delete" => format!("deletes rows from {}", thing("a table", "table")).replace("from `", "from the `"),
         "db_read" => format!("reads {}", thing("a table", "table")).replace("reads `", "reads the `"),
         "db_query" => "runs database queries".into(),
         "http" => {
@@ -745,7 +746,7 @@ pub(crate) fn calls_summary(before: &str, after: &str) -> String {
 }
 
 /// `typed.trim()…toLowerCase() when x` → `toLowerCase`; `UserRepository.update(_)` → `UserRepository.update`.
-fn call_name(shape: &str) -> String {
+pub(crate) fn call_name(shape: &str) -> String {
     let target = shape.split(" when ").next().unwrap_or(shape).trim();
     // Drop only the final argument list: `a.toLowerCase().indexOf(_)` → `a.toLowerCase().indexOf`.
     let target = match target.strip_suffix(')') {
@@ -803,7 +804,11 @@ fn also(t: &Transition, _plan: &NewCode) -> Option<String> {
         }
     };
     let mut parts = vec![];
-    let added = names("ENTITY_ADDED");
+    let mut added = names("ENTITY_ADDED");
+    // A closure inside an added function (`addDimensionWords.FieldsFunc`) is part of it.
+    let mut whole = added.clone();
+    whole.extend(t.contracts.iter().map(|c| format!("`{}`", c.name)));
+    added.retain(|n| !whole.iter().any(|o| o != n && n.starts_with(&format!("{}.", o.trim_end_matches('`')))));
     if !added.is_empty() {
         parts.push(format!("added {}", few(added)));
     }
@@ -980,7 +985,7 @@ fn contract_headline(t: &Transition) -> String {
 
 /// Unchanged writes as context: own writes grouped by type (`Partner{ID, Kind} written`),
 /// writes made by callees only counted. Assignments of a value (`:=`) stay as they are.
-fn compress_writes(items: Vec<String>) -> Vec<String> {
+pub(crate) fn compress_writes(items: Vec<String>) -> Vec<String> {
     let mut own: Vec<(String, Vec<String>)> = vec![];
     let mut by_callees = 0;
     let mut out = vec![];
@@ -1230,6 +1235,7 @@ pub(crate) fn item(row: &str, text: &str) -> String {
     let (kind, rest) = (words.next().unwrap_or(""), words.next().unwrap_or("").replace("<dynamic>", "(dynamic)"));
     let verb = match kind {
         "db_write" => format!("write {rest}"),
+        "db_delete" => format!("delete {rest}"),
         "db_read" => format!("read {rest}"),
         "db_query" => format!("query {rest}"),
         // `create index i on t`, `alter table t`: the schema change as written.
@@ -1252,4 +1258,26 @@ pub(crate) fn item(row: &str, text: &str) -> String {
 /// The structural remainder in one line, for other views.
 pub(crate) fn also_line(t: &Transition) -> Option<String> {
     also(t, &NewCode::plan(t))
+}
+
+/// The top-level comma-separated parts of an argument list: `a, f(b, c)` → `[a, f(b, c)]`.
+pub(crate) fn top_level_args(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth) = (vec![], String::new(), 0i32);
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
 }

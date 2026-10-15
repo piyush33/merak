@@ -870,3 +870,57 @@ fn a_typed_change_does_not_hide_other_changes_in_the_same_function() {
     assert!(residue.iter().any(|r| r.contains("getAll")), "reading from the URL stays visible: {:#?}", t.ops);
     assert!(!residue.iter().any(|r| r.contains("JSON.stringify")), "the request body is part of the request: {:#?}", t.ops);
 }
+
+/// A React component whose handler, through nested `function`s, now calls a fetch wrapper:
+/// the request is the component's, at the URL the call site builds, under the conditions on
+/// the way there.
+#[test]
+fn a_request_through_nested_functions_and_a_fetch_wrapper_is_seen() {
+    let wrapper = "export async function fetchWithAuth(url: string, options: RequestInit = {}) {\n  const res = await fetch(url, { ...options, headers: { Authorization: 'x' } });\n  return res;\n}\n";
+    let before = files(&[
+        ("lib/fetchWrapper.ts", wrapper),
+        ("Picker.tsx", "export function Picker() {\n  function onQuery(v: string) {\n    console.log(v);\n  }\n  return <input onChange={(e) => onQuery(e.target.value)} />;\n}\n"),
+    ]);
+    let after = files(&[
+        ("lib/fetchWrapper.ts", wrapper),
+        (
+            "Picker.tsx",
+            "import { fetchWithAuth } from './lib/fetchWrapper';\nconst isLink = (s: string) => s.startsWith('http');\nexport function Picker() {\n  async function goToLink(v: string) {\n    await fetchWithAuth(`/go-api/maps/resolve?url=${encodeURIComponent(v)}`);\n  }\n  function onQuery(v: string) {\n    if (isLink(v)) {\n      goToLink(v);\n      return;\n    }\n    console.log(v);\n  }\n  return <input onChange={(e) => onQuery(e.target.value)} />;\n}\n",
+        ),
+    ]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    assert!(text.contains("now calls GET /go-api/maps/resolve?url=… when isLink()"), "{text}");
+}
+
+/// A list row that stops handling an event and gains a class in a template `className`:
+/// what the handler did, and the class, not "a callback is gone".
+#[test]
+fn a_removed_row_handler_and_a_template_class_are_named() {
+    let row = |extra_attr: &str, hover: &str| {
+        format!(
+            "import {{ useState }} from 'react';\nexport function List({{ items }}: {{ items: string[] }}) {{\n  const [active, setActive] = useState(-1);\n  return (\n    <div>\n      {{items.map((item, i) => (\n        <button key={{item}}{extra_attr} className={{`flex px-2{hover} ${{i === active ? \"bg-gray-50\" : \"bg-white\"}}`}}>{{item}}</button>\n      ))}}\n    </div>\n  );\n}}\n"
+        )
+    };
+    let before = files(&[("List.tsx", &row(" onMouseEnter={() => setActive(i)}", ""))]);
+    let after = files(&[("List.tsx", &row("", " hover:bg-gray-50"))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    assert!(text.contains("each <button> no longer reacts to mouse enter (it ran setActive(i))"), "{text}");
+    assert!(text.contains("hover:bg-gray-50"), "{text}");
+    assert!(!text.contains("? CALLS"), "{text}");
+}
+
+/// What a component shows from constant maps and lists: a changed label map key by key, an
+/// icon picked from a map instead of one fixed icon, and what an element tells a screen reader.
+#[test]
+fn constant_maps_icons_and_labels_in_markup_are_seen() {
+    let before = "import { ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';\nexport const LABELS: Record<string, string> = { relevance: \"Sort\", price_asc: \"Price ↑\" };\nexport default function Bar({ sort }: { sort: string }) {\n  return (\n    <button className=\"pill\">\n      <ArrowUpDown size={16} />\n      <span>{LABELS[sort]}</span>\n    </button>\n  );\n}\n";
+    let after = "import { ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';\nexport const LABELS: Record<string, string> = { relevance: \"Price\", price_asc: \"Price\" };\nconst ICONS = { relevance: ArrowUpDown, price_asc: ArrowUp };\nconst NEXT: Record<string, string> = { relevance: \"Sort by price\", price_asc: \"Clear\" };\nexport default function Bar({ sort }: { sort: string }) {\n  const Icon = ICONS[sort];\n  return (\n    <button className=\"pill\" aria-label={NEXT[sort]}>\n      <Icon size={16} />\n      <span>{LABELS[sort]}</span>\n    </button>\n  );\n}\n";
+    let (b, a) = (files(&[("Bar.tsx", before)]), files(&[("Bar.tsx", after)]));
+    let t = merak_cli::diff(&b, &a).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &b, &a);
+    // Icon and label are read together, per state: the arrow moved from the text to the icon.
+    assert!(text.contains(r#"by sort, now shows ArrowUpDown "Price", ArrowUp "Price" (was ArrowUpDown "Sort", ArrowUpDown "Price ↑")"#), "{text}");
+    assert!(text.contains("<button> now tells aria-label=NEXT[sort]"), "{text}");
+}

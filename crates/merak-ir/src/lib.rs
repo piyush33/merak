@@ -172,10 +172,27 @@ pub struct Jsx {
 }
 
 impl Jsx {
-    /// The literal `className` / `class`, if any.
-    pub fn class(&self) -> Option<&str> {
+    /// The literal `className` / `class`, if any: a template's fixed classes too
+    /// (`` `flex px-2 ${active ? "a" : "b"}` `` → `flex px-2`), leaving out a word a hole is glued to.
+    pub fn class(&self) -> Option<String> {
         self.attrs.iter().find(|(k, _)| k == "className" || k == "class").and_then(|(_, v)| match v {
-            Expr::Str(s) => Some(s.as_str()),
+            Expr::Str(s) => Some(s.clone()),
+            Expr::Template { quasis, .. } => {
+                let last = quasis.len().saturating_sub(1);
+                let mut words: Vec<&str> = vec![];
+                for (i, q) in quasis.iter().enumerate() {
+                    let mut ws: Vec<&str> = q.split_whitespace().collect();
+                    // `…-${x}` / `${x}-…`: half a class, not one.
+                    if i < last && !q.ends_with(char::is_whitespace) {
+                        ws.pop();
+                    }
+                    if i > 0 && !q.starts_with(char::is_whitespace) && !ws.is_empty() {
+                        ws.remove(0);
+                    }
+                    words.extend(ws);
+                }
+                (!words.is_empty()).then(|| words.join(" "))
+            }
             _ => None,
         })
     }

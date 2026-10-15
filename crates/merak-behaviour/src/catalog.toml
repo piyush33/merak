@@ -16,8 +16,14 @@
 
 # ---- databases -------------------------------------------------------------
 [[effect]]
-api = "@prisma/client.PrismaClient#.*.{create,createMany,update,updateMany,upsert,delete,deleteMany}()"
+api = "@prisma/client.PrismaClient#.*.{create,createMany,update,updateMany,upsert}()"
 kind = "db_write"
+target = "seg:2"
+
+# Deleting rows is its own kind: data is gone, not changed.
+[[effect]]
+api = "@prisma/client.PrismaClient#.*.{delete,deleteMany}()"
+kind = "db_delete"
 target = "seg:2"
 
 [[effect]]
@@ -26,8 +32,13 @@ kind = "db_read"
 target = "seg:2"
 
 [[effect]]
-api = "{typeorm,mongoose,sequelize}.*#.{save,insert,update,delete,remove,upsert,create,destroy,updateOne,updateMany,deleteOne,deleteMany,insertMany}()"
+api = "{typeorm,mongoose,sequelize}.*#.{save,insert,update,upsert,create,updateOne,updateMany,insertMany}()"
 kind = "db_write"
+target = "seg:1"
+
+[[effect]]
+api = "{typeorm,mongoose,sequelize}.*#.{delete,remove,destroy,deleteOne,deleteMany}()"
+kind = "db_delete"
 target = "seg:1"
 
 [[effect]]
@@ -43,8 +54,13 @@ target = "seg:0"
 # Kysely: anywhere in a chain (`db.with(…).selectFrom()`) or on an expression
 # builder (`eb.exists(eb.selectFrom(…))`).
 [[effect]]
-api = "kysely.**.{insertInto,replaceInto,updateTable,deleteFrom,mergeInto}()"
+api = "kysely.**.{insertInto,replaceInto,updateTable,mergeInto}()"
 kind = "db_write"
+target = "arg:0"
+
+[[effect]]
+api = "kysely.**.deleteFrom()"
+kind = "db_delete"
 target = "arg:0"
 
 [[effect]]
@@ -173,8 +189,13 @@ kind = "sql"
 target = "sql:0"
 
 [[effect]]
-api = "gorm.DB#.**.{Create,CreateInBatches,Save,Update,Updates,UpdateColumn,UpdateColumns,Delete,FirstOrCreate}()"
+api = "gorm.DB#.**.{Create,CreateInBatches,Save,Update,Updates,UpdateColumn,UpdateColumns,FirstOrCreate}()"
 kind = "db_write"
+target = "model|gorm"
+
+[[effect]]
+api = "gorm.DB#.**.Delete()"
+kind = "db_delete"
 target = "model|gorm"
 
 [[effect]]
@@ -183,8 +204,13 @@ kind = "db_read"
 target = "model|gorm"
 
 [[effect]]
-api = "mongo-driver/mongo.**.{InsertOne,InsertMany,UpdateOne,UpdateMany,UpdateByID,ReplaceOne,DeleteOne,DeleteMany,FindOneAndUpdate,FindOneAndDelete,FindOneAndReplace,BulkWrite}()"
+api = "mongo-driver/mongo.**.{InsertOne,InsertMany,UpdateOne,UpdateMany,UpdateByID,ReplaceOne,FindOneAndUpdate,FindOneAndReplace,BulkWrite}()"
 kind = "db_write"
+target = "lit:mongo"
+
+[[effect]]
+api = "mongo-driver/mongo.**.{DeleteOne,DeleteMany,FindOneAndDelete}()"
+kind = "db_delete"
 target = "lit:mongo"
 
 [[effect]]

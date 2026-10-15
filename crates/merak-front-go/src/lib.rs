@@ -276,6 +276,8 @@ struct Lowerer<'s> {
     results: Results,
     /// Error variables and the call that last set them: `err` ← `h.svc.Cancel`.
     err_sources: HashMap<String, String>,
+    /// `_, ok := m[k]`: `ok` is `m.has(k)`, so a check on it says what it checks.
+    present: HashMap<String, ir::Expr>,
     /// Each callee's arguments at its first call in the current function.
     callee_args: HashMap<String, String>,
     /// String variables' current values in straight-line code (`query := "SELECT …"`, then
@@ -301,6 +303,7 @@ impl<'s> Lowerer<'s> {
             receiver: None,
             results: Results::default(),
             err_sources: HashMap::new(),
+            present: HashMap::new(),
             callee_args: HashMap::new(),
             strings: HashMap::new(),
             assigned: vec![],
@@ -562,8 +565,10 @@ impl<'s> Lowerer<'s> {
         let saved = (std::mem::take(&mut self.locals), std::mem::replace(&mut self.receiver, receiver.clone()), std::mem::replace(&mut self.results, results));
         let saved_strings = std::mem::take(&mut self.strings);
         let saved_callees = std::mem::take(&mut self.callee_args);
+        let saved_present = std::mem::take(&mut self.present);
         // A closure sees its enclosing function's variables.
         if parent.is_some() {
+            self.present = saved_present.clone();
             self.locals = saved.0.clone();
             if self.receiver.is_none() {
                 self.receiver = saved.1.clone();
@@ -578,6 +583,7 @@ impl<'s> Lowerer<'s> {
         (self.locals, self.receiver, self.results) = saved;
         self.strings = saved_strings;
         self.callee_args = saved_callees;
+        self.present = saved_present;
         let body_hash = ir::body_hash(&body);
         self.module.functions.push(ir::Function {
             id: id.clone(),
@@ -812,6 +818,26 @@ impl<'s> Lowerer<'s> {
     }
 
     /// `a, b := f()` / `var x T = v`: one binding per name; a tuple result binds the first.
+    /// `v, ok := m[k]`: remember `ok` as `m.has(k)`; any other binding of a name forgets it.
+    fn note_present(&mut self, names: &[Node], values: &[Node]) {
+        for n in names {
+            self.present.remove(self.t(*n));
+        }
+        if let ([_, ok], [v]) = (names, values) {
+            if v.kind() == "index_expression" && self.t(*ok) != "_" {
+                if let (Some(m), Some(k)) = (field(*v, "operand"), field(*v, "index")) {
+                    let (m, k) = (self.expr(m, None), self.expr(k, None));
+                    let has = ir::Expr::Call(Box::new(ir::Call {
+                        callee: ir::Expr::Member { object: Box::new(m), property: "has".into() },
+                        args: vec![k],
+                        loc: self.loc(*v),
+                    }));
+                    self.present.insert(self.t(*ok).to_string(), has);
+                }
+            }
+        }
+    }
+
     /// Remember the call that sets each name, for naming error checks on them.
     fn note_sources(&mut self, names: &[Node], values: &[Node]) {
         // `anchorPredicate`; the second call of it with other arguments is `anchorPredicate(c)`,
@@ -849,6 +875,7 @@ impl<'s> Lowerer<'s> {
                 };
                 ir::Expr::Binary { op, left: Box::new(left), right }
             }
+            ir::Expr::Ident(x) if self.present.contains_key(&x) => self.present[&x].clone(),
             // `if !exists`: a result of `store.FeedExists(…)`.
             ir::Expr::Ident(x) if self.err_sources.contains_key(&x) => ir::Expr::Ident(format!("{x}({})", self.err_sources[&x])),
             ir::Expr::Logical { op, left, right } => {
@@ -861,6 +888,7 @@ impl<'s> Lowerer<'s> {
 
     fn declare(&mut self, names: &[Node], values: &[Node], ty: Option<ir::TypeRef>, loc: ir::Loc) -> Vec<ir::Stmt> {
         self.note_sources(names, values);
+        self.note_present(names, values);
         let names: Vec<String> = names.iter().map(|n| self.t(*n).to_string()).collect();
         let mut out = vec![];
         if values.len() == names.len() {
@@ -894,6 +922,7 @@ impl<'s> Lowerer<'s> {
     fn assign(&mut self, left: &[Node], right: &[Node], op: &str, loc: ir::Loc) -> Vec<ir::Stmt> {
         if op == "=" {
             self.note_sources(left, right);
+            self.note_present(left, right);
         }
         let binop = match op.trim_end_matches('=') {
             "+" => Some(ir::BinOp::Add),
@@ -911,8 +940,20 @@ impl<'s> Lowerer<'s> {
             left.iter().enumerate().map(|(i, l)| (*l, if i == 0 { right.first().copied() } else { None })).collect()
         };
         let mut out = vec![];
-        for (l, r) in pairs {
-            let Some(r) = r else { continue };
+        for (i, (l, r)) in pairs.into_iter().enumerate() {
+            // `content, ct, key = f()`: `key` is f's result now too, whatever it was before.
+            let Some(r) = r else {
+                if l.kind() == "identifier" && self.t(l) != "_" {
+                    if let Some(call) = right.first() {
+                        let name = self.t(l).to_string();
+                        let text: String = self.t(*call).split_whitespace().collect::<Vec<_>>().join(" ");
+                        self.track(&name, None);
+                        let value = ir::Expr::Opaque(format!("{text}[{i}]"));
+                        out.push(ir::Stmt::Expr(ir::Expr::Assign { target: Box::new(ir::Expr::Ident(name)), value: Box::new(value), loc: loc.clone() }, loc.clone()));
+                    }
+                }
+                continue;
+            };
             let hint = (l.kind() == "identifier").then(|| self.t(l).to_string());
             let value = self.expr(r, hint);
             if self.t(l) == "_" {
@@ -1217,7 +1258,19 @@ impl<'s> Lowerer<'s> {
                     index => ir::Expr::Index { object, index: Box::new(index) },
                 }
             }
-            "slice_expression" | "type_assertion_expression" | "type_conversion_expression" => {
+            // `w[:len(w)-1]` is `w.slice(0, len(w) - 1)`, as TS writes it: the bounds are
+            // what it returns.
+            "slice_expression" => {
+                let Some(obj) = field(n, "operand") else { return self.opaque(n) };
+                let object = self.expr(obj, None);
+                let start = field(n, "start").map(|x| self.expr(x, None)).unwrap_or(ir::Expr::Num(0.0));
+                let mut args = vec![start];
+                args.extend(field(n, "end").map(|x| self.expr(x, None)));
+                ir::Expr::Call(Box::new(ir::Call { callee: ir::Expr::Member { object: Box::new(object), property: "slice".into() }, args, loc: self.loc(n) }))
+            }
+            // `f(xs...)` passes `xs`.
+            "variadic_argument" => children(n).first().map(|x| self.expr(*x, hint)).unwrap_or(ir::Expr::Undefined),
+            "type_assertion_expression" | "type_conversion_expression" => {
                 let inner = field(n, "operand").or_else(|| children(n).last().copied());
                 inner.map(|x| self.expr(x, hint)).unwrap_or(ir::Expr::Undefined)
             }
@@ -1315,10 +1368,19 @@ impl<'s> Lowerer<'s> {
             ir::Expr::Opaque(_) if func.kind() == "func_literal" => self.func_literal(func, hint),
             other => other,
         };
+        // A string variable stands for the text it was built from where that text is read
+        // (SQL handed to the database). Elsewhere a value built by calls stays a name: its
+        // calls happened where it was built, not again at each use (`filepath.Ext(key)`).
+        let sql_sink = matches!(
+            &callee,
+            ir::Expr::Member { property, .. } if matches!(property.as_str(),
+                "Raw" | "Exec" | "Query" | "QueryRow" | "QueryContext" | "ExecContext" | "QueryRowContext" | "Select" | "Where" | "Or" | "Not"
+                | "Joins" | "Having" | "Order" | "Group" | "Table" | "Prepare" | "PrepareContext" | "Get" | "MustExec" | "NamedExec" | "Queryx" | "SelectContext" | "GetContext")
+        );
         let args = arg_nodes
             .iter()
             .map(|a| match self.expr(*a, arg_hint.clone()) {
-                ir::Expr::Ident(v) if self.strings.contains_key(&v) => self.strings[&v].clone(),
+                ir::Expr::Ident(v) if self.strings.contains_key(&v) && (sql_sink || !has_call(&self.strings[&v])) => self.strings[&v].clone(),
                 other => other,
             })
             .collect();
@@ -1349,6 +1411,11 @@ impl<'s> Lowerer<'s> {
                 let value = self.literal_value(body, None);
                 ir::Expr::New { callee: Box::new(callee), args: vec![value], loc: self.loc(n) }
             }
+            // `map[string]any{}`: an empty map is an object, not an empty list.
+            _ if ty.is_some_and(|t| t.kind() == "map_type") => match self.literal_value(body, None) {
+                ir::Expr::Array(xs) if xs.is_empty() => ir::Expr::Object(vec![]),
+                other => other,
+            },
             _ => self.literal_value(body, None),
         }
     }
@@ -1534,5 +1601,22 @@ mod tests {
         assert!(
             matches!(&f.body[0], ir::Stmt::Return(Some(ir::Expr::Template { quasis, .. }), _) if quasis == &vec!["".to_string(), "/orders/".into(), "".into()])
         );
+    }
+}
+
+/// Whether an expression makes a call anywhere inside it.
+fn has_call(e: &ir::Expr) -> bool {
+    use ir::Expr as E;
+    match e {
+        E::Call(_) | E::New { .. } => true,
+        E::Member { object, .. } => has_call(object),
+        E::Index { object, index } => has_call(object) || has_call(index),
+        E::Binary { left, right, .. } | E::Logical { left, right, .. } => has_call(left) || has_call(right),
+        E::Not(x) | E::Await(x) => has_call(x),
+        E::Template { exprs, .. } => exprs.iter().any(has_call),
+        E::Array(xs) => xs.iter().any(has_call),
+        E::Object(props) => props.iter().any(|(_, v)| has_call(v)),
+        E::Conditional { test, then, otherwise } => has_call(test) || has_call(then) || has_call(otherwise),
+        _ => false,
     }
 }

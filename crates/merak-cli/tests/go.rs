@@ -276,7 +276,7 @@ func (r *Repo) Close(id string) {
     let m = merak_cli::model(&files(&[("repo/repo.go", src)])).unwrap();
     let effects = |id: &str| -> Vec<String> { m.entities[id].effects.iter().map(|e| e.key.render()).collect() };
     assert_eq!(effects("repo::Repo.Open"), ["db_read orders"]);
-    assert_eq!(effects("repo::Repo.Close"), ["db_write Order", "db_write audit"]);
+    assert_eq!(effects("repo::Repo.Close"), ["db_write Order", "db_delete audit"]);
     let filters: Vec<&str> = m.entities["repo::Repo.Open"].filters.iter().map(|f| f.expr.as_str()).collect();
     assert_eq!(filters, ["orders: status = 'open'", "orders: deleted_at is null"]);
 }
@@ -505,4 +505,153 @@ fn a_builder_that_ands_in_another_term_narrows_the_filter() {
 	let m = merak_cli::model(&before).unwrap();
 	let returns: Vec<&str> = m.entities["suggest::scopePredicate"].outputs.iter().map(|o| o.value.as_str()).collect();
 	assert!(returns.contains(&"[⟨anchorPredicate(sc.Anchor)⟩ AND ⟨anchorPredicate(c), each c in sc.Context⟩, args, true]"), "{returns:?}");
+}
+
+/// Calls inside a spread argument (`f(g(x)...)`) are calls, and a slice keeps its bounds:
+/// wrapping what is passed in a new filter is a change, and the filter says what it returns.
+#[test]
+fn spread_arguments_and_slices_are_seen() {
+    let before = files(&[(
+        "vocab.go",
+        "package vocab\n\nfunc push(xs ...string) {}\n\nfunc Load(names map[string][]string, b string) {\n\tpush(names[b]...)\n}\n",
+    )]);
+    let after = files(&[(
+        "vocab.go",
+        "package vocab\n\nfunc push(xs ...string) {}\n\nfunc singular(w string) string {\n\tif len(w) > 3 {\n\t\treturn w[:len(w)-1]\n\t}\n\treturn w\n}\n\nfunc only(xs []string) []string {\n\tout := []string{}\n\tfor _, x := range xs {\n\t\tout = append(out, singular(x))\n\t}\n\treturn out\n}\n\nfunc Load(names map[string][]string, b string) {\n\tpush(only(names[b])...)\n}\n",
+    )]);
+    let m = merak_cli::model(&after).unwrap();
+    let load = &m.entities[".::Load"];
+    assert!(load.calls.iter().any(|c| c.target == ".::only"), "{:?}", load.calls);
+    let outputs: Vec<&str> = m.entities[".::singular"].outputs.iter().map(|o| o.value.as_str()).collect();
+    assert_eq!(outputs, ["w.slice(0, len(w) - 1)", "w"]);
+    // The caller's unexplained change is the call into the new helper, not the helper's insides.
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let un: Vec<&str> = t.ops.iter().filter(|o| o.kind == "UNCLASSIFIED_CHANGE").filter_map(|o| o.after.as_deref()).collect();
+    assert_eq!(un, ["only(_)"]);
+}
+
+/// Writing into a map the caller passed is behaviour the caller sees: a new helper that does
+/// only that still has a contract, its write under `post`.
+#[test]
+fn writes_into_a_parameter_are_behaviour() {
+    let after = files(&[(
+        "vocab.go",
+        "package vocab\n\nfunc add(into map[string]struct{}, names ...string) {\n\tfor _, n := range names {\n\t\tinto[n] = struct{}{}\n\t}\n}\n\nfunc local() int {\n\tm := map[string]int{}\n\tm[\"a\"] = 1\n\treturn len(m)\n}\n",
+    )]);
+    let m = merak_cli::model(&after).unwrap();
+    let writes: Vec<&str> = m.entities[".::add"].mutates.iter().map(|w| w.field.as_str()).collect();
+    assert_eq!(writes, ["into[n]"]);
+    // A map of its own is not the caller's.
+    assert!(m.entities[".::local"].mutates.is_empty());
+}
+
+/// The integrative links of a change: what a function now passes through new code, what it
+/// builds to hand that code, and a search loop read as "for some".
+#[test]
+fn what_is_passed_through_new_code_is_linked() {
+    let before = files(&[(
+        "vocab.go",
+        "package vocab\n\nfunc push(xs ...string) {}\n\nfunc Load(names map[string][]string, b string, cats []string) {\n\tfor _, c := range cats {\n\t\tpush(c)\n\t}\n\tpush(names[b]...)\n}\n",
+    )]);
+    let after = files(&[(
+        "vocab.go",
+        "package vocab\n\nfunc push(xs ...string) {}\n\nfunc add(into map[string]struct{}, ns ...string) {\n\tfor _, n := range ns {\n\t\tinto[n] = struct{}{}\n\t}\n}\n\nfunc only(xs []string, dim map[string]struct{}) []string {\n\tout := []string{}\n\tfor _, x := range xs {\n\t\tkeep := true\n\t\tfor _, w := range []string{x} {\n\t\t\tif _, d := dim[w]; d {\n\t\t\t\tkeep = false\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif keep {\n\t\t\tout = append(out, x)\n\t\t}\n\t}\n\treturn out\n}\n\nfunc Load(names map[string][]string, b string, cats []string) {\n\tseen := map[string]struct{}{}\n\tfor _, c := range cats {\n\t\tadd(seen, c)\n\t\tpush(c)\n\t}\n\tpush(only(names[b], seen)...)\n}\n",
+    )]);
+    let m = merak_cli::model(&after).unwrap();
+    let skips: Vec<String> = m.entities[".::only"].skips.iter().map(|s| format!("{}: {}", s.over, s.when)).collect();
+    assert_eq!(skips, ["x in xs: for some w in [x]: dim.has(w)"]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let load = t.contracts.iter().find(|c| c.name == "Load").unwrap();
+    let links: Vec<String> = load.clauses.iter().filter(|x| matches!(x.row.as_str(), "passes" | "fills")).map(|x| format!("{} {} ({})", x.row, x.after.clone().unwrap_or_default(), x.tag.clone().unwrap_or_default())).collect();
+    assert_eq!(links, ["passes push(only(names[b], seen)) (now through only)", "fills seen ← add(c) (filled here)"]);
+    // Linked, the new calls need no hand check.
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    assert!(!text.contains("? CALLS"), "{text}");
+    assert!(text.contains("names[b] now goes through new `only` before push(…)"), "{text}");
+}
+
+/// Moving logic is not removing it: a query extracted into a helper keeps its filters, a loop
+/// filter that moved into new code's query says so, and a subquery rewrite is one change.
+#[test]
+fn moved_filters_are_moves_not_removals() {
+    let base = "package app\n\nimport \"gorm.io/gorm\"\n\ntype Payment struct{ ID string; Status string }\n\ntype Repo struct{ db *gorm.DB }\n\n";
+    let before = files(&[(
+        "app.go",
+        &format!("{base}func (r *Repo) Active() []Payment {{\n\tvar ps []Payment\n\tr.db.Table(\"payments\").Where(\"status = 'active'\").Where(\"deleted_at IS NULL\").Find(&ps)\n\treturn ps\n}}\n\nfunc (r *Repo) All() []Payment {{\n\tvar ps []Payment\n\tr.db.Find(&ps)\n\treturn ps\n}}\n\nfunc Check(r *Repo) int {{\n\tn := 0\n\tfor _, p := range r.All() {{\n\t\tif p.Status != \"pending\" {{\n\t\t\tcontinue\n\t\t}}\n\t\tn++\n\t}}\n\treturn n\n}}\n"),
+    )]);
+    let after = files(&[(
+        "app.go",
+        &format!("{base}func (r *Repo) Active() []Payment {{\n\treturn r.load()\n}}\n\nfunc (r *Repo) load() []Payment {{\n\tvar ps []Payment\n\tr.db.Table(\"payments\").Where(\"status = 'active'\").Where(\"deleted_at IS NULL\").Find(&ps)\n\treturn ps\n}}\n\nfunc (r *Repo) All() []Payment {{\n\tvar ps []Payment\n\tr.db.Find(&ps)\n\treturn ps\n}}\n\nfunc (r *Repo) Pending() []Payment {{\n\tvar ps []Payment\n\tr.db.Where(\"status = 'pending'\").Find(&ps)\n\treturn ps\n}}\n\nfunc Check(r *Repo) int {{\n\tn := 0\n\tfor range r.Pending() {{\n\t\tn++\n\t}}\n\treturn n\n}}\n"),
+    )]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let kinds: Vec<String> = t.ops.iter().filter(|o| o.layer != merak_transition::Layer::Structural).map(|o| format!("{} {}", o.kind, o.subject.rsplit("::").next().unwrap_or(""))).collect();
+    assert!(!kinds.iter().any(|k| k.starts_with("QUERY_FILTER_REMOVED")), "{kinds:?}");
+    assert!(kinds.contains(&"SKIP_MOVED_TO_QUERY Check".to_string()), "{kinds:?}");
+    assert!(!kinds.iter().any(|k| k.starts_with("SKIP_REMOVED")), "{kinds:?}");
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    // The extracted query changed nothing: `Active` is not reported at all.
+    assert!(!text.contains("Repo.Active ·"), "{text}");
+    assert!(text.contains("moved into the query of `Repo.Pending`"), "{text}");
+    assert!(!text.contains("▲ FILTER") && !text.contains("· ▲ wider"), "{text}");
+}
+
+/// A column written `COALESCE(existing, new)` keeps what is there; writing the new value
+/// plainly overwrites it. Dropping that guard is a wider write, as a dropped check is.
+#[test]
+fn a_set_only_when_empty_write_becoming_an_overwrite_is_wider() {
+    let src = |value: &str, skip: &str| {
+        format!(
+            "package app\n\nimport (\n\t\"strings\"\n\t\"gorm.io/gorm\"\n)\n\ntype Variant struct{{ ID string; ZohoItemID *string }}\n\nfunc Save(db *gorm.DB, id string, zid string) {{\n\tupdates := map[string]any{{}}\n\tif strings.TrimSpace(zid) != \"\" {{\n\t\tupdates[\"zoho_item_id\"] = {value}\n\t}}\n\tdb.Model(&Variant{{}}).Where(\"id = ?\", id).Updates(updates)\n}}\n\nfunc Audit(prior Variant, fields map[string]any) []string {{\n\tvar out []string\n\tfor col := range fields {{\n{skip}\t\tout = append(out, col)\n\t}}\n\treturn out\n}}\n"
+        )
+    };
+    let skip = "\t\tif col == \"zoho_item_id\" {\n\t\t\tif prior.ZohoItemID != nil {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t}\n";
+    let before = files(&[("app.go", &src(r#"gorm.Expr("COALESCE(NULLIF(BTRIM(variants.zoho_item_id), ''), ?)", zid)"#, skip))]);
+    let after = files(&[("app.go", &src("zid", ""))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    assert!(text.contains("▲ WRITES    now overwrites an existing zoho_item_id (it was set only when empty)"), "{text}");
+    assert!(text.contains("no longer skips an iteration when col = zoho_item_id"), "{text}");
+}
+
+/// Deleting rows is its own effect, with the rows it removes: a reviewer reads "now deletes
+/// CartItem rows where cart_id = ?", not "now writes CartItem".
+#[test]
+fn a_new_delete_says_which_rows_it_removes() {
+    let base = "package app\n\nimport \"gorm.io/gorm\"\n\ntype CartItem struct{ ID string; CartID string }\n\ntype Repo struct{ db *gorm.DB }\n\n";
+    let before = files(&[("app.go", &format!("{base}func (r *Repo) Clear(cartID string) {{\n}}\n"))]);
+    let after = files(&[("app.go", &format!("{base}func (r *Repo) Clear(cartID string) {{\n\tr.db.Where(\"cart_id = ?\", cartID).Delete(&CartItem{{}})\n}}\n"))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    assert!(text.contains("now deletes CartItem rows where cart_id = ?"), "{text}");
+}
+
+/// Moving an inline block into a helper that returns the values it changed
+/// (`content, ct, key = u.normalize(content, ct, key)`) passes the same `key` on: no
+/// phantom "now passes …" or calls copied from how `key` was first built.
+#[test]
+fn values_reassigned_from_an_extracted_helper_are_not_their_old_definition() {
+    let head = "package up\n\nimport (\n\t\"fmt\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"time\"\n)\n\ntype U struct{ On bool }\n\nfunc (u *U) url(k string) string { return \"https://cdn/\" + k }\n\n";
+    let before = files(&[(
+        "up.go",
+        &format!("{head}func (u *U) Put(folder, name string, ct string) string {{\n\tkey := fmt.Sprintf(\"%s/%d_%s\", folder, time.Now().Unix(), name)\n\tif u.On {{\n\t\tif ext := \".jpg\"; !strings.EqualFold(filepath.Ext(key), ext) {{\n\t\t\tkey = strings.TrimSuffix(key, filepath.Ext(key)) + ext\n\t\t}}\n\t\tct = \"image/jpeg\"\n\t}}\n\t_ = ct\n\treturn u.url(key)\n}}\n"),
+    )]);
+    let after = files(&[(
+        "up.go",
+        &format!("{head}func (u *U) Put(folder, name string, ct string) string {{\n\tkey := fmt.Sprintf(\"%s/%d_%s\", folder, time.Now().Unix(), name)\n\tct, key = u.normalize(ct, key)\n\t_ = ct\n\treturn u.url(key)\n}}\n\nfunc (u *U) normalize(ct, key string) (string, string) {{\n\tif !u.On {{\n\t\treturn ct, key\n\t}}\n\tif ext := \".jpg\"; !strings.EqualFold(filepath.Ext(key), ext) {{\n\t\tkey = strings.TrimSuffix(key, filepath.Ext(key)) + ext\n\t}}\n\treturn \"image/jpeg\", key\n}}\n"),
+    )]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    assert!(!text.contains("PASSES"), "{text}");
+    assert!(!text.contains("returns something else"), "{text}");
+    assert!(!text.contains("NewString") && !text.contains("time.Now() when"), "{text}");
+}
+
+/// A condition on a method of a value names the value: `searches.through.Equal(started)`, not
+/// the method's type (`time.Time#.Equal(started)`).
+#[test]
+fn a_method_condition_keeps_its_receiver() {
+    let src = "package app\n\nimport \"time\"\n\ntype log struct{ through time.Time }\n\ntype S struct{ searches *log }\n\nfunc (s *S) Refresh(started time.Time) int {\n\tif !s.searches.through.Equal(started) {\n\t\treturn 0\n\t}\n\treturn 1\n}\n";
+    let m = merak_cli::model(&files(&[("app.go", src)])).unwrap();
+    let g: Vec<String> = m.entities[".::S.Refresh"].guards.iter().map(|g| g.requires.render()).collect();
+    assert!(g.iter().any(|t| t.contains("searches.through.Equal(started)") && !t.contains('#')), "{g:?}");
 }
