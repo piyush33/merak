@@ -493,28 +493,26 @@ func (r *Repo) Partners(scopes []Scope) {
 
 #[test]
 fn a_builder_that_ands_in_another_term_narrows_the_filter() {
-	let after = COMPOSED.replace("clause, _, ok := anchorPredicate(sc.Anchor)", "clause, _, ok := scopePredicate(sc)");
-	let t = merak_cli::diff(&files(&[("suggest/s.go", COMPOSED)]), &files(&[("suggest/s.go", &after)])).unwrap();
-	let op = t.ops.iter().find(|o| o.kind == "QUERY_FILTER_CHANGED").unwrap_or_else(|| panic!("{:#?}", t.ops));
-	assert_eq!(op.before.as_deref(), Some("products: any of (⟨built by anchorPredicate⟩)"));
-	assert_eq!(op.after.as_deref(), Some("products: any of (⟨anchorPredicate(sc.Anchor)⟩ AND ⟨anchorPredicate(c), each c in sc.Context⟩)"));
-	assert_eq!(op.note.as_deref(), Some("the query now also requires ⟨anchorPredicate(c), each c in sc.Context⟩: it reaches fewer rows"));
-	let (before, after) = (files(&[("suggest/s.go", COMPOSED)]), files(&[("suggest/s.go", &after)]));
-	let view = merak_cli::render(&t, "contracts", "test", &before, &after);
-	assert!(view.contains("**`Repo.Partners` reads fewer rows:** rows must now also match ⟨anchorPredicate(c), each c in sc.Context⟩."), "{view}");
-	let m = merak_cli::model(&before).unwrap();
-	let returns: Vec<&str> = m.entities["suggest::scopePredicate"].outputs.iter().map(|o| o.value.as_str()).collect();
-	assert!(returns.contains(&"[⟨anchorPredicate(sc.Anchor)⟩ AND ⟨anchorPredicate(c), each c in sc.Context⟩, args, true]"), "{returns:?}");
+    let after = COMPOSED.replace("clause, _, ok := anchorPredicate(sc.Anchor)", "clause, _, ok := scopePredicate(sc)");
+    let t = merak_cli::diff(&files(&[("suggest/s.go", COMPOSED)]), &files(&[("suggest/s.go", &after)])).unwrap();
+    let op = t.ops.iter().find(|o| o.kind == "QUERY_FILTER_CHANGED").unwrap_or_else(|| panic!("{:#?}", t.ops));
+    assert_eq!(op.before.as_deref(), Some("products: any of (⟨built by anchorPredicate⟩)"));
+    assert_eq!(op.after.as_deref(), Some("products: any of (⟨anchorPredicate(sc.Anchor)⟩ AND ⟨anchorPredicate(c), each c in sc.Context⟩)"));
+    assert_eq!(op.note.as_deref(), Some("the query now also requires ⟨anchorPredicate(c), each c in sc.Context⟩: it reaches fewer rows"));
+    let (before, after) = (files(&[("suggest/s.go", COMPOSED)]), files(&[("suggest/s.go", &after)]));
+    let view = merak_cli::render(&t, "contracts", "test", &before, &after);
+    assert!(view.contains("**`Repo.Partners` reads fewer rows:** rows must now also match ⟨anchorPredicate(c), each c in sc.Context⟩."), "{view}");
+    let m = merak_cli::model(&before).unwrap();
+    let returns: Vec<&str> = m.entities["suggest::scopePredicate"].outputs.iter().map(|o| o.value.as_str()).collect();
+    assert!(returns.contains(&"[⟨anchorPredicate(sc.Anchor)⟩ AND ⟨anchorPredicate(c), each c in sc.Context⟩, args, true]"), "{returns:?}");
 }
 
 /// Calls inside a spread argument (`f(g(x)...)`) are calls, and a slice keeps its bounds:
 /// wrapping what is passed in a new filter is a change, and the filter says what it returns.
 #[test]
 fn spread_arguments_and_slices_are_seen() {
-    let before = files(&[(
-        "vocab.go",
-        "package vocab\n\nfunc push(xs ...string) {}\n\nfunc Load(names map[string][]string, b string) {\n\tpush(names[b]...)\n}\n",
-    )]);
+    let before =
+        files(&[("vocab.go", "package vocab\n\nfunc push(xs ...string) {}\n\nfunc Load(names map[string][]string, b string) {\n\tpush(names[b]...)\n}\n")]);
     let after = files(&[(
         "vocab.go",
         "package vocab\n\nfunc push(xs ...string) {}\n\nfunc singular(w string) string {\n\tif len(w) > 3 {\n\t\treturn w[:len(w)-1]\n\t}\n\treturn w\n}\n\nfunc only(xs []string) []string {\n\tout := []string{}\n\tfor _, x := range xs {\n\t\tout = append(out, singular(x))\n\t}\n\treturn out\n}\n\nfunc Load(names map[string][]string, b string) {\n\tpush(only(names[b])...)\n}\n",
@@ -562,7 +560,12 @@ fn what_is_passed_through_new_code_is_linked() {
     assert_eq!(skips, ["x in xs: for some w in [x]: dim.has(w)"]);
     let t = merak_cli::diff(&before, &after).unwrap();
     let load = t.contracts.iter().find(|c| c.name == "Load").unwrap();
-    let links: Vec<String> = load.clauses.iter().filter(|x| matches!(x.row.as_str(), "passes" | "fills")).map(|x| format!("{} {} ({})", x.row, x.after.clone().unwrap_or_default(), x.tag.clone().unwrap_or_default())).collect();
+    let links: Vec<String> = load
+        .clauses
+        .iter()
+        .filter(|x| matches!(x.row.as_str(), "passes" | "fills"))
+        .map(|x| format!("{} {} ({})", x.row, x.after.clone().unwrap_or_default(), x.tag.clone().unwrap_or_default()))
+        .collect();
     assert_eq!(links, ["passes push(only(names[b], seen)) (now through only)", "fills seen ← add(c) (filled here)"]);
     // Linked, the new calls need no hand check.
     let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
@@ -584,7 +587,12 @@ fn moved_filters_are_moves_not_removals() {
         &format!("{base}func (r *Repo) Active() []Payment {{\n\treturn r.load()\n}}\n\nfunc (r *Repo) load() []Payment {{\n\tvar ps []Payment\n\tr.db.Table(\"payments\").Where(\"status = 'active'\").Where(\"deleted_at IS NULL\").Find(&ps)\n\treturn ps\n}}\n\nfunc (r *Repo) All() []Payment {{\n\tvar ps []Payment\n\tr.db.Find(&ps)\n\treturn ps\n}}\n\nfunc (r *Repo) Pending() []Payment {{\n\tvar ps []Payment\n\tr.db.Where(\"status = 'pending'\").Find(&ps)\n\treturn ps\n}}\n\nfunc Check(r *Repo) int {{\n\tn := 0\n\tfor range r.Pending() {{\n\t\tn++\n\t}}\n\treturn n\n}}\n"),
     )]);
     let t = merak_cli::diff(&before, &after).unwrap();
-    let kinds: Vec<String> = t.ops.iter().filter(|o| o.layer != merak_transition::Layer::Structural).map(|o| format!("{} {}", o.kind, o.subject.rsplit("::").next().unwrap_or(""))).collect();
+    let kinds: Vec<String> = t
+        .ops
+        .iter()
+        .filter(|o| o.layer != merak_transition::Layer::Structural)
+        .map(|o| format!("{} {}", o.kind, o.subject.rsplit("::").next().unwrap_or("")))
+        .collect();
     assert!(!kinds.iter().any(|k| k.starts_with("QUERY_FILTER_REMOVED")), "{kinds:?}");
     assert!(kinds.contains(&"SKIP_MOVED_TO_QUERY Check".to_string()), "{kinds:?}");
     assert!(!kinds.iter().any(|k| k.starts_with("SKIP_REMOVED")), "{kinds:?}");
@@ -619,7 +627,8 @@ fn a_set_only_when_empty_write_becoming_an_overwrite_is_wider() {
 fn a_new_delete_says_which_rows_it_removes() {
     let base = "package app\n\nimport \"gorm.io/gorm\"\n\ntype CartItem struct{ ID string; CartID string }\n\ntype Repo struct{ db *gorm.DB }\n\n";
     let before = files(&[("app.go", &format!("{base}func (r *Repo) Clear(cartID string) {{\n}}\n"))]);
-    let after = files(&[("app.go", &format!("{base}func (r *Repo) Clear(cartID string) {{\n\tr.db.Where(\"cart_id = ?\", cartID).Delete(&CartItem{{}})\n}}\n"))]);
+    let after =
+        files(&[("app.go", &format!("{base}func (r *Repo) Clear(cartID string) {{\n\tr.db.Where(\"cart_id = ?\", cartID).Delete(&CartItem{{}})\n}}\n"))]);
     let t = merak_cli::diff(&before, &after).unwrap();
     let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
     assert!(text.contains("now deletes CartItem rows where cart_id = ?"), "{text}");

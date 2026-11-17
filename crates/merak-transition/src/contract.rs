@@ -163,7 +163,13 @@ fn items(
         let Some(ke) = model.entities.get(k) else { continue };
         for o in ke.outputs.iter().filter(|o| o.formula) {
             let when = if o.when.is_empty() { String::new() } else { format!(" when {}", o.when.join(" ∧ ")) };
-            out.push(Item { row: "computes", key: format!("{}{when}", ke.name), text: format!("{}{when} = {}", ke.name, o.value), loc: Some(o.loc.clone()), when: None });
+            out.push(Item {
+                row: "computes",
+                key: format!("{}{when}", ke.name),
+                text: format!("{}{when} = {}", ke.name, o.value),
+                loc: Some(o.loc.clone()),
+                when: None,
+            });
         }
     }
     // Loop filters, its closures' included (`go func() { for _, ddl := range […] … }()`), and
@@ -194,7 +200,13 @@ fn items(
             for o in &ke.outputs {
                 for r in &o.renders {
                     let shown = if r.when.is_empty() { r.content.clone() } else { format!("{} if {}", r.content, r.when) };
-                    out.push(Item { row: "renders", key: format!("each|{shown}"), text: format!("{shown}: {}", r.style), loc: Some(o.loc.clone()), when: None });
+                    out.push(Item {
+                        row: "renders",
+                        key: format!("each|{shown}"),
+                        text: format!("{shown}: {}", r.style),
+                        loc: Some(o.loc.clone()),
+                        when: None,
+                    });
                 }
             }
         }
@@ -462,14 +474,18 @@ fn tag(row: &str, mark: char, before: Option<&str>, after: Option<&str>) -> Opti
         ("where", '+') => "reaches fewer rows",
         ("where", '-') => "reaches more rows",
         // `v.status = 'active'` → `v.status = 'active' ⟨dynamic⟩`: more conditions can be added at run time.
-        ("where", '~') if after.is_some_and(|a| a.strip_suffix(" ⟨dynamic⟩").is_some_and(|x| Some(x) == before)) => "also takes conditions built at run time",
-        ("where", '~') => return Some(match reach(before.unwrap_or(""), after.unwrap_or("")) {
-            Some(Reach::Narrower(extra)) => format!("narrower: rows must now also match {extra}"),
-            Some(Reach::Wider(extra)) => format!("wider: rows can now also match {extra}"),
-            Some(Reach::Looser(gone)) => format!("wider: rows no longer have to match {gone}"),
-            Some(Reach::Tighter(gone)) => format!("narrower: rows matching only {gone} are no longer reached"),
-            None => "reaches different rows".into(),
-        }),
+        ("where", '~') if after.is_some_and(|a| a.strip_suffix(" ⟨dynamic⟩").is_some_and(|x| Some(x) == before)) => {
+            "also takes conditions built at run time"
+        }
+        ("where", '~') => {
+            return Some(match reach(before.unwrap_or(""), after.unwrap_or("")) {
+                Some(Reach::Narrower(extra)) => format!("narrower: rows must now also match {extra}"),
+                Some(Reach::Wider(extra)) => format!("wider: rows can now also match {extra}"),
+                Some(Reach::Looser(gone)) => format!("wider: rows no longer have to match {gone}"),
+                Some(Reach::Tighter(gone)) => format!("narrower: rows matching only {gone} are no longer reached"),
+                None => "reaches different rows".into(),
+            })
+        }
         ("post", '+') => "new write",
         ("post", '-') => "no longer written",
         // `col := COALESCE(NULLIF(col, ''), ?)` keeps what is there; a plain value replaces it.
@@ -561,7 +577,9 @@ pub(crate) fn reach(before: &str, after: &str) -> Option<Reach> {
         }
         v
     };
-    for (sep, grows, shrinks) in [(" AND ", Reach::Narrower as fn(String) -> Reach, Reach::Looser as fn(String) -> Reach), (" OR ", Reach::Wider, Reach::Tighter)] {
+    for (sep, grows, shrinks) in
+        [(" AND ", Reach::Narrower as fn(String) -> Reach, Reach::Looser as fn(String) -> Reach), (" OR ", Reach::Wider, Reach::Tighter)]
+    {
         let (ta, tb) = (terms(a, sep), terms(b, sep));
         let (ta, tb): (Vec<&str>, Vec<&str>) = (ta.iter().map(|s| s.as_str()).collect(), tb.iter().map(|s| s.as_str()).collect());
         if ta.len() == tb.len() {
@@ -580,7 +598,8 @@ pub(crate) fn reach(before: &str, after: &str) -> Option<Reach> {
 /// The differing middles of two filters, cut outside atoms. `None` under a negation, where a
 /// narrower term would mean more rows.
 pub(crate) fn differing<'s>(a: &'s str, b: &'s str) -> Option<(&'s str, &'s str)> {
-    let (ca, cb): (Vec<(usize, char)>, Vec<(usize, char)>) = (a.char_indices().collect(), b.char_indices().collect());
+    let ca: Vec<(usize, char)> = a.char_indices().collect();
+    let cb: Vec<(usize, char)> = b.char_indices().collect();
     // Whether a cut before char `i` of `cs` is outside every atom.
     let outside = |cs: &[(usize, char)], i: usize| cs[..i].iter().fold(0i32, |d, (_, c)| d + i32::from(*c == '⟨') - i32::from(*c == '⟩')) == 0;
     let mut p = ca.iter().zip(&cb).take_while(|(x, y)| x.1 == y.1).count();
@@ -914,7 +933,9 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     let table_pred = |t: &str| t.split_once(": ").map_or(t.to_string(), |(_, p)| p.to_string());
                     let gone = op.before.as_deref().map(table_pred);
                     for x in c.clauses.iter_mut().filter(|x| x.row == "where" && matches!(x.mark, '-' | '~')) {
-                        if x.before.as_deref().map(table_pred) == gone || x.before.as_deref().is_some_and(|bf| op.before.as_deref().is_some_and(|ob| bf.contains(ob) || ob.contains(bf))) {
+                        if x.before.as_deref().map(table_pred) == gone
+                            || x.before.as_deref().is_some_and(|bf| op.before.as_deref().is_some_and(|ob| bf.contains(ob) || ob.contains(bf)))
+                        {
                             x.mark = '~';
                             x.tag = Some(format!("moved into memory: {}", op.note.clone().unwrap_or_default()));
                         }
@@ -1075,7 +1096,10 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
         for caller in &c.callers {
             let Some(ida) = backward.get(caller) else { continue };
             let before: BTreeSet<String> = items(a, &kids_a, ida, &|_| true, None, Some(&[])).iter().map(|i| format!("{}|{}", i.row, norm(&i.text))).collect();
-            let moved = |x: &Clause| matches!(x.row.as_str(), "effects" | "where" | "post" | "skips") && x.after.as_deref().is_some_and(|t| before.contains(&format!("{}|{}", x.row, norm(t))));
+            let moved = |x: &Clause| {
+                matches!(x.row.as_str(), "effects" | "where" | "post" | "skips")
+                    && x.after.as_deref().is_some_and(|t| before.contains(&format!("{}|{}", x.row, norm(t))))
+            };
             // A query or a loop that moved, not just fields both happen to write.
             let logic = c.clauses.iter().filter(|x| matches!(x.row.as_str(), "where" | "skips") && moved(x)).count();
             let all = c.clauses.iter().filter(|x| moved(x)).count();
@@ -1238,7 +1262,11 @@ fn risk(c: &ContractDiff) -> u8 {
     let any = |row: &str, marks: &[char]| c.clauses.iter().any(|x| x.row == row && marks.contains(&x.mark));
     if c.has('!') {
         0
-    } else if any("who", &['-', '~']) || any("pre", &['-']) || any("where", &['-']) || c.clauses.iter().any(|x| x.tag.as_deref().is_some_and(|t| t == "widened" || t.starts_with("wider:"))) {
+    } else if any("who", &['-', '~'])
+        || any("pre", &['-'])
+        || any("where", &['-'])
+        || c.clauses.iter().any(|x| x.tag.as_deref().is_some_and(|t| t == "widened" || t.starts_with("wider:")))
+    {
         1
     } else if c.status == "changed" && !c.untyped_only() {
         2

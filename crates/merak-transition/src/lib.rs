@@ -764,8 +764,8 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         };
         // A call gone from here that new code it now calls makes moved there with it.
         let name = |c: &CallShape| crate::render::call_name(&c.key()).rsplit('.').next().unwrap_or("").to_string();
-        let moved: BTreeSet<String> = new.iter().filter(|x| sb.iter().position(|y| std::ptr::eq(**x, y)).is_some_and(|i| via_b[i].is_some())).map(|x| name(x)).collect();
-        let mut gone = gone;
+        let moved: BTreeSet<String> =
+            new.iter().filter(|x| sb.iter().position(|y| std::ptr::eq(**x, y)).is_some_and(|i| via_b[i].is_some())).map(|x| name(x)).collect();
         gone.retain(|g| !moved.contains(&name(g)));
         if gone.is_empty() && new.is_empty() {
             continue;
@@ -1010,8 +1010,16 @@ fn skips_change(
         });
         match moved {
             Some((by, f)) => {
-                out.push("SKIP_MOVED_TO_QUERY", Layer::Behaviour, subject, Some(text(s)), Some(format!("{by}: {}", f.expr)), vec![s.loc.clone()], vec![f.loc.clone()]).note =
-                    Some(format!("the loop no longer filters these items; the query of {by} now tests the same value"));
+                out.push(
+                    "SKIP_MOVED_TO_QUERY",
+                    Layer::Behaviour,
+                    subject,
+                    Some(text(s)),
+                    Some(format!("{by}: {}", f.expr)),
+                    vec![s.loc.clone()],
+                    vec![f.loc.clone()],
+                )
+                .note = Some(format!("the loop no longer filters these items; the query of {by} now tests the same value"));
             }
             None => {
                 out.push("SKIP_REMOVED", Layer::Behaviour, subject, Some(text(s)), None, vec![s.loc.clone()], vec![]);
@@ -1219,8 +1227,16 @@ fn query_filters(out: &mut Builder, subject: &str, fa: &[&QueryFilter], fb: &[&Q
     });
     for (gs, n) in rewrites {
         let before = gs.iter().map(|g| g.expr.clone()).collect::<Vec<_>>().join(" · ");
-        out.push("QUERY_FILTER_CHANGED", Layer::Behaviour, subject, Some(before), Some(n.expr.clone()), gs.iter().map(|g| g.loc.clone()).collect(), vec![n.loc.clone()])
-            .note = Some("rewritten as a subquery (check that it reaches the same rows)".into());
+        out.push(
+            "QUERY_FILTER_CHANGED",
+            Layer::Behaviour,
+            subject,
+            Some(before),
+            Some(n.expr.clone()),
+            gs.iter().map(|g| g.loc.clone()).collect(),
+            vec![n.loc.clone()],
+        )
+        .note = Some("rewritten as a subquery (check that it reaches the same rows)".into());
     }
     if let ([g], [n]) = (gone.as_slice(), new.as_slice()) {
         pairs.push((*g, *n));
@@ -1233,8 +1249,8 @@ fn query_filters(out: &mut Builder, subject: &str, fa: &[&QueryFilter], fb: &[&Q
             contract::Reach::Wider(t) => format!("the query now also accepts {t}: it can reach more rows"),
             contract::Reach::Looser(t) => format!("the query no longer requires {t}: it can reach more rows"),
         });
-        out.push("QUERY_FILTER_CHANGED", Layer::Behaviour, subject, Some(g.expr.clone()), Some(n.expr.clone()), vec![g.loc.clone()], vec![n.loc.clone()]).note =
-            note;
+        out.push("QUERY_FILTER_CHANGED", Layer::Behaviour, subject, Some(g.expr.clone()), Some(n.expr.clone()), vec![g.loc.clone()], vec![n.loc.clone()])
+            .note = note;
     }
     for g in gone {
         out.push("QUERY_FILTER_REMOVED", Layer::Behaviour, subject, Some(g.expr.clone()), None, vec![g.loc.clone()], vec![]).note =

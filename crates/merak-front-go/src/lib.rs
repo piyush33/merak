@@ -949,7 +949,10 @@ impl<'s> Lowerer<'s> {
                         let text: String = self.t(*call).split_whitespace().collect::<Vec<_>>().join(" ");
                         self.track(&name, None);
                         let value = ir::Expr::Opaque(format!("{text}[{i}]"));
-                        out.push(ir::Stmt::Expr(ir::Expr::Assign { target: Box::new(ir::Expr::Ident(name)), value: Box::new(value), loc: loc.clone() }, loc.clone()));
+                        out.push(ir::Stmt::Expr(
+                            ir::Expr::Assign { target: Box::new(ir::Expr::Ident(name)), value: Box::new(value), loc: loc.clone() },
+                            loc.clone(),
+                        ));
                     }
                 }
                 continue;
@@ -1542,6 +1545,23 @@ fn sprintf(format: &str, args: Vec<ir::Expr>) -> ir::Expr {
     ir::Expr::Template { quasis, exprs }
 }
 
+/// Whether an expression makes a call anywhere inside it.
+fn has_call(e: &ir::Expr) -> bool {
+    use ir::Expr as E;
+    match e {
+        E::Call(_) | E::New { .. } => true,
+        E::Member { object, .. } => has_call(object),
+        E::Index { object, index } => has_call(object) || has_call(index),
+        E::Binary { left, right, .. } | E::Logical { left, right, .. } => has_call(left) || has_call(right),
+        E::Not(x) | E::Await(x) => has_call(x),
+        E::Template { exprs, .. } => exprs.iter().any(has_call),
+        E::Array(xs) => xs.iter().any(has_call),
+        E::Object(props) => props.iter().any(|(_, v)| has_call(v)),
+        E::Conditional { test, then, otherwise } => has_call(test) || has_call(then) || has_call(otherwise),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,22 +1621,5 @@ mod tests {
         assert!(
             matches!(&f.body[0], ir::Stmt::Return(Some(ir::Expr::Template { quasis, .. }), _) if quasis == &vec!["".to_string(), "/orders/".into(), "".into()])
         );
-    }
-}
-
-/// Whether an expression makes a call anywhere inside it.
-fn has_call(e: &ir::Expr) -> bool {
-    use ir::Expr as E;
-    match e {
-        E::Call(_) | E::New { .. } => true,
-        E::Member { object, .. } => has_call(object),
-        E::Index { object, index } => has_call(object) || has_call(index),
-        E::Binary { left, right, .. } | E::Logical { left, right, .. } => has_call(left) || has_call(right),
-        E::Not(x) | E::Await(x) => has_call(x),
-        E::Template { exprs, .. } => exprs.iter().any(has_call),
-        E::Array(xs) => xs.iter().any(has_call),
-        E::Object(props) => props.iter().any(|(_, v)| has_call(v)),
-        E::Conditional { test, then, otherwise } => has_call(test) || has_call(then) || has_call(otherwise),
-        _ => false,
     }
 }

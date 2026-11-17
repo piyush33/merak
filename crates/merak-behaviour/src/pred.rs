@@ -165,7 +165,9 @@ fn merge(ps: Vec<Pred>, is_or: bool) -> Pred {
                 v2.retain(|v| !v1.contains(v));
                 true
             }
-            (Pred::NotIn { field: f1, values: v1 }, q @ Pred::In { .. }) if is_or && q.field() == Some(f1.as_str()) && matches!(q, Pred::In { .. }) && !q_covers(q, v1) => {
+            (Pred::NotIn { field: f1, values: v1 }, q @ Pred::In { .. })
+                if is_or && q.field() == Some(f1.as_str()) && matches!(q, Pred::In { .. }) && !q_covers(q, v1) =>
+            {
                 let Pred::In { values: v2, .. } = &*q else { unreachable!() };
                 let kept: BTreeSet<String> = v1.difference(v2).cloned().collect();
                 *q = Pred::NotIn { field: f1.clone(), values: kept };

@@ -509,7 +509,9 @@ impl Walker<'_, '_> {
                 // `updates := map[string]any{}`, `make(map[string]any)`, `const f = {}`.
                 let fresh_record = match init {
                     Some(Expr::Object(props)) => props.is_empty(),
-                    Some(Expr::Call(c)) => matches!(&c.callee, Expr::Ident(n) if n == "make") && matches!(c.args.first(), Some(Expr::Opaque(t)) if t.starts_with("map[")),
+                    Some(Expr::Call(c)) => {
+                        matches!(&c.callee, Expr::Ident(n) if n == "make") && matches!(c.args.first(), Some(Expr::Opaque(t)) if t.starts_with("map["))
+                    }
                     _ => false,
                 };
                 if fresh_record {
@@ -602,7 +604,8 @@ impl Walker<'_, '_> {
                     // `<SortIcon/>` where `const SortIcon = SORT_ICONS[sort]`: the element it is.
                     for r in renders.iter_mut() {
                         let Some(tag) = r.content.strip_prefix('<').and_then(|t| t.strip_suffix('>')).map(str::to_string) else { continue };
-                        if let Some(def) = self.def_exprs.get(&tag).filter(|d| matches!(d, Expr::Index { .. } | Expr::Member { .. } | Expr::Conditional { .. })) {
+                        if let Some(def) = self.def_exprs.get(&tag).filter(|d| matches!(d, Expr::Index { .. } | Expr::Member { .. } | Expr::Conditional { .. }))
+                        {
                             let real = render(def);
                             r.content = format!("<{real}>");
                             if let Some(rest) = r.style.strip_prefix(tag.as_str()) {
@@ -862,7 +865,15 @@ impl Walker<'_, '_> {
                 let args = c.args.iter().map(arg_text).collect();
                 let arg_skeletons = c.args.iter().map(|a| self.ix.string_skeleton(self.env, a).filter(|s| s != "…")).collect();
                 let arg_params = c.args.iter().map(|a| self.param_index(a)).collect();
-                self.e.calls.push(CallFact { target, loc: loc.clone(), conditional: self.depth > 0, spawned: self.spawn_depth > 0, args, arg_skeletons, arg_params });
+                self.e.calls.push(CallFact {
+                    target,
+                    loc: loc.clone(),
+                    conditional: self.depth > 0,
+                    spawned: self.spawn_depth > 0,
+                    args,
+                    arg_skeletons,
+                    arg_params,
+                });
             }
             Callee::External(api) if self.cat.is_filter(&api) => {
                 if self.filter_depth == 0 {
@@ -988,7 +999,11 @@ impl Walker<'_, '_> {
             // When the passing side ends the function too, the branch picks between two
             // endings (two error messages, two results): not a check.
             let passing = if arm == Arm::Then { then } else { otherwise };
-            if if passing.is_empty() { self.cd.rest_ends(n) } else { always_ends(passing) || self.cd.rest_ends(n) && !passing.iter().any(|s| matches!(s, Stmt::Jump(_))) } {
+            if if passing.is_empty() {
+                self.cd.rest_ends(n)
+            } else {
+                always_ends(passing) || self.cd.rest_ends(n) && !passing.iter().any(|s| matches!(s, Stmt::Jump(_)))
+            } {
                 continue;
             }
             // In a loop, returning a found item or a flag ends a search, not a rejection.
@@ -1142,7 +1157,11 @@ impl Walker<'_, '_> {
                 let dynamic = target.is_none();
                 // `fetch(url)` where `url` is a parameter: the caller decides where it goes.
                 let from_param = if dynamic {
-                    rule.target.split(':').nth(1).and_then(|x| x.split(['|', ':']).next()?.parse::<usize>().ok()).and_then(|i| site.walker.param_index(c.args.get(i)?))
+                    rule.target
+                        .split(':')
+                        .nth(1)
+                        .and_then(|x| x.split(['|', ':']).next()?.parse::<usize>().ok())
+                        .and_then(|i| site.walker.param_index(c.args.get(i)?))
                 } else {
                     None
                 };
@@ -1399,9 +1418,10 @@ impl Walker<'_, '_> {
         for s in before.iter().rev() {
             let Stmt::Loop { binding: Some(b), iter: Some(it), body, .. } = s else { continue };
             let sets = |then: &[Stmt]| {
-                then.iter().any(|t| matches!(t, Stmt::Expr(Expr::Assign { target, value, .. }, _)
-                    if matches!(target.as_ref(), Expr::Ident(x) if x == flag) && matches!(value.as_ref(), Expr::Bool(v) if *v != start)))
-                    && matches!(then.last(), Some(Stmt::Jump(_)))
+                then.iter().any(|t| {
+                    matches!(t, Stmt::Expr(Expr::Assign { target, value, .. }, _)
+                    if matches!(target.as_ref(), Expr::Ident(x) if x == flag) && matches!(value.as_ref(), Expr::Bool(v) if *v != start))
+                }) && matches!(then.last(), Some(Stmt::Jump(_)))
             };
             let Some(found) = body.iter().find_map(|t| match t {
                 Stmt::If { test, then, otherwise, .. } if otherwise.is_empty() && sets(then) => Some(test),
@@ -1412,7 +1432,9 @@ impl Walker<'_, '_> {
             let except: Vec<String> = body
                 .iter()
                 .filter_map(|t| match t {
-                    Stmt::If { test, then, otherwise, .. } if otherwise.is_empty() && matches!(then.as_slice(), [Stmt::Jump(_)]) => Some(self.pred(test).negate().render()),
+                    Stmt::If { test, then, otherwise, .. } if otherwise.is_empty() && matches!(then.as_slice(), [Stmt::Jump(_)]) => {
+                        Some(self.pred(test).negate().render())
+                    }
                     _ => None,
                 })
                 .collect();
@@ -2072,10 +2094,7 @@ fn any(ps: Vec<Pred>) -> Pred {
     }
     // Factor out what every term shares.
     let common: Vec<Pred> = terms[0].iter().filter(|c| terms[1..].iter().all(|t| t.contains(c))).cloned().collect();
-    let rest: Vec<Pred> = terms
-        .into_iter()
-        .map(|t| all(t.into_iter().filter(|c| !common.contains(c)).collect()))
-        .collect();
+    let rest: Vec<Pred> = terms.into_iter().map(|t| all(t.into_iter().filter(|c| !common.contains(c)).collect())).collect();
     let mut out = common;
     out.push(Pred::Or(rest));
     all(out)

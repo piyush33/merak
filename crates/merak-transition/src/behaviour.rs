@@ -166,8 +166,14 @@ fn helper(c: &ContractDiff) -> bool {
 /// service.cacheDocs`. `None` when it only computes.
 fn does(t: &Transition, name: &str) -> Option<String> {
     let c = t.contracts.iter().find(|c| c.status == "new" && last(&c.name) == name)?;
-    let reads: Vec<String> =
-        c.clauses.iter().filter(|x| x.row == "effects").filter_map(|x| x.after.as_deref()).filter_map(|a| a.strip_prefix("db_read ")).map(str::to_string).collect();
+    let reads: Vec<String> = c
+        .clauses
+        .iter()
+        .filter(|x| x.row == "effects")
+        .filter_map(|x| x.after.as_deref())
+        .filter_map(|a| a.strip_prefix("db_read "))
+        .map(str::to_string)
+        .collect();
     let writes: Vec<String> = c
         .clauses
         .iter()
@@ -246,7 +252,11 @@ fn sentence(blocks: &[(&ContractDiff, Vec<Line>, Vec<String>)]) -> Vec<String> {
                 return Some((3, c, outputs.join("; ")));
             }
             // New code that only acts (a script): what it touches; a script, statement by statement.
-            let sql: Vec<String> = ls.iter().filter(|l| l.kind == "SQL").map(|l| l.text.split(':').next().unwrap_or(&l.text).split(" where ").next().unwrap_or("").to_string()).collect();
+            let sql: Vec<String> = ls
+                .iter()
+                .filter(|l| l.kind == "SQL")
+                .map(|l| l.text.split(':').next().unwrap_or(&l.text).split(" where ").next().unwrap_or("").to_string())
+                .collect();
             if !sql.is_empty() {
                 return Some((4, c, sql.join("; ")));
             }
@@ -270,7 +280,8 @@ fn sentence(blocks: &[(&ContractDiff, Vec<Line>, Vec<String>)]) -> Vec<String> {
         for l in ls.iter().filter(|l| l.kind == "PASSES") {
             let Some(g) = l.text.split('`').nth(1) else { continue };
             if let Some((_, gl, _)) = blocks.iter().find(|(h, _, _)| h.status == "new" && last(&h.name) == g) {
-                let what: Vec<&str> = gl.iter().filter(|x| matches!(x.kind, "FILTER" | "CHECK" | "WRITES" | "EFFECT")).map(|x| x.text.as_str()).take(2).collect();
+                let what: Vec<&str> =
+                    gl.iter().filter(|x| matches!(x.kind, "FILTER" | "CHECK" | "WRITES" | "EFFECT")).map(|x| x.text.as_str()).take(2).collect();
                 if !what.is_empty() {
                     lead.push(format!("`{g}` {}.", what.join("; ")));
                 }
@@ -313,7 +324,9 @@ fn touches(cs: &[&ContractDiff]) -> Option<String> {
                 continue;
             }
             let (verb, what) = match it.split_once(' ') {
-                Some((v, w)) if ["read", "write", "query", "emit", "queue", "delete"].contains(&v) => (format!("{v}s").replace("querys", "queries"), w.to_string()),
+                Some((v, w)) if ["read", "write", "query", "emit", "queue", "delete"].contains(&v) => {
+                    (format!("{v}s").replace("querys", "queries"), w.to_string())
+                }
                 _ => ("calls".to_string(), it.clone()),
             };
             match by_verb.iter_mut().find(|(v, _)| *v == verb) {
@@ -390,10 +403,8 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
 
     // One parameter out and one in: the input was replaced (or renamed, when the type is the same).
     let takes: Vec<usize> = (0..c.clauses.len()).filter(|&i| c.clauses[i].row == "takes").collect();
-    let (outs, ins): (Vec<usize>, Vec<usize>) = (
-        takes.iter().copied().filter(|&i| c.clauses[i].mark == '-').collect(),
-        takes.iter().copied().filter(|&i| c.clauses[i].mark == '+').collect(),
-    );
+    let (outs, ins): (Vec<usize>, Vec<usize>) =
+        (takes.iter().copied().filter(|&i| c.clauses[i].mark == '-').collect(), takes.iter().copied().filter(|&i| c.clauses[i].mark == '+').collect());
     if !new && outs.len() == 1 && ins.len() == 1 {
         let (b, a) = (&c.clauses[outs[0]], &c.clauses[ins[0]]);
         let (bt, at) = (b.before.as_deref().unwrap_or(""), a.after.as_deref().unwrap_or(""));
@@ -413,14 +424,7 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
             _ if ty(bt) == ty(at) => ('◆', format!("{bt} → {at}")),
             _ => ('~', format!("{bt} → {at}")),
         };
-        out.push(Line {
-            glyph,
-            kind: "INPUT",
-            text,
-            detail: vec![],
-            evidence: evidence(a, source, &c.loc.file),
-            places: 1, work: None
-        });
+        out.push(Line { glyph, kind: "INPUT", text, detail: vec![], evidence: evidence(a, source, &c.loc.file), places: 1, work: None });
         used[outs[0]] = true;
         used[ins[0]] = true;
     }
@@ -449,8 +453,11 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
             let after = c.clauses[j].after.clone().unwrap_or_default();
             let content = after.rsplit_once(": ").map_or(after.as_str(), |(c, _)| c);
             let when = content.split_once(" if ").map(|(_, w)| format!(" when {}", plain(w))).unwrap_or_default();
-            let swaps: Vec<String> =
-                pairs.iter().filter(|(x, y)| changing.contains(x.as_str()) || changing.contains(y.as_str())).map(|(x, y)| format!("<{y}> instead of <{x}>")).collect();
+            let swaps: Vec<String> = pairs
+                .iter()
+                .filter(|(x, y)| changing.contains(x.as_str()) || changing.contains(y.as_str()))
+                .map(|(x, y)| format!("<{y}> instead of <{x}>"))
+                .collect();
             out.push(Line {
                 glyph: '~',
                 kind: "RENDERS",
@@ -469,7 +476,8 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
                 text: format!("{} now uses {}", noun(&b.row), swapped.join(", ")),
                 detail: vec![format!("was  {}", strip_verb(&text)), format!("now  {}", strip_verb(&now))],
                 evidence: evidence(&c.clauses[j], source, &c.loc.file),
-                places: 1, work: None
+                places: 1,
+                work: None,
             });
         } else {
             folded.push(&b.row);
@@ -501,7 +509,13 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
             let came = called(x.after.as_deref().unwrap_or(""));
             let gone = called(x.before.as_deref().unwrap_or(""));
             let new_code: Vec<String> = came.iter().filter(|n| fresh.contains(*n) && !gone.contains(n)).map(|n| format!("`{n}`")).collect();
-            let linked: String = c.clauses.iter().filter(|y| matches!(y.row.as_str(), "passes" | "fills" | "skips")).filter_map(|y| y.after.clone()).collect::<Vec<_>>().join(" ");
+            let linked: String = c
+                .clauses
+                .iter()
+                .filter(|y| matches!(y.row.as_str(), "passes" | "fills" | "skips"))
+                .filter_map(|y| y.after.clone())
+                .collect::<Vec<_>>()
+                .join(" ");
             let new_code: Vec<String> = new_code.into_iter().filter(|n| !linked.contains(n.trim_matches('`'))).collect();
             if !new_code.is_empty() {
                 out.push(Line {
@@ -521,7 +535,10 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         }
         // A text constant it starts or stops using (`StatusPaid = "paid"`) is context; a map
         // (`SORT_ICONS = {…}`) says what it can show, so it stays.
-        if x.row == "consts" && matches!(x.mark, '+' | '-') && x.before.as_deref().or(x.after.as_deref()).is_some_and(|v| v.split_once(" = ").is_some_and(|(_, v)| v.starts_with('"'))) {
+        if x.row == "consts"
+            && matches!(x.mark, '+' | '-')
+            && x.before.as_deref().or(x.after.as_deref()).is_some_and(|v| v.split_once(" = ").is_some_and(|(_, v)| v.starts_with('"')))
+        {
             continue;
         }
         // A changed output that is markup: `RENDERS` lines say how.
@@ -534,7 +551,8 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         if x.mark == '?' {
             let (gone, came) = (called(x.before.as_deref().unwrap_or("")), called(x.after.as_deref().unwrap_or("")));
             // What it passes and builds already names every new call: nothing is left to check by hand.
-            let linked: String = c.clauses.iter().filter(|y| matches!(y.row.as_str(), "passes" | "fills")).filter_map(|y| y.after.clone()).collect::<Vec<_>>().join(" ");
+            let linked: String =
+                c.clauses.iter().filter(|y| matches!(y.row.as_str(), "passes" | "fills")).filter_map(|y| y.after.clone()).collect::<Vec<_>>().join(" ");
             if gone.is_empty() && !came.is_empty() && came.iter().all(|n| linked.contains(&format!("{n}("))) {
                 continue;
             }
@@ -546,7 +564,8 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
                     text: format!("now calls new {}", names.join(", ")),
                     detail: vec![],
                     evidence: call_sites(t, c, &came, source),
-                    places: 1, work: None
+                    places: 1,
+                    work: None,
                 });
                 continue;
             }
@@ -587,7 +606,9 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         let over = |t: &str| t.split(": skipped when ").next().unwrap_or("").to_string();
         let b = x.before.clone().unwrap_or_default();
         let ins: Vec<&Clause> = c.clauses.iter().filter(|y| y.row == "skips" && y.mark == '+' && over(y.after.as_deref().unwrap_or("")) == over(&b)).collect();
-        let outs: Vec<usize> = (0..c.clauses.len()).filter(|&j| c.clauses[j].row == "skips" && c.clauses[j].mark == '-' && over(c.clauses[j].before.as_deref().unwrap_or("")) == over(&b)).collect();
+        let outs: Vec<usize> = (0..c.clauses.len())
+            .filter(|&j| c.clauses[j].row == "skips" && c.clauses[j].mark == '-' && over(c.clauses[j].before.as_deref().unwrap_or("")) == over(&b))
+            .collect();
         // As many in as out: paired in order.
         if new || used[i] || ins.len() != outs.len() {
             continue;
@@ -664,25 +685,27 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
             .and_then(|(m, k)| {
                 let map = c.clauses.iter().find_map(|y| y.after.as_deref().filter(|v| y.row == "consts" && v.starts_with(&format!("{m} = {{"))))?;
                 let inner = map.split_once(" = ")?.1.strip_prefix('{')?.strip_suffix('}')?;
-                let vals: Vec<String> = crate::render::top_level_args(inner).into_iter().filter_map(|kv| kv.split_once(": ").map(|(_, v)| v.to_string())).collect();
+                let vals: Vec<String> =
+                    crate::render::top_level_args(inner).into_iter().filter_map(|kv| kv.split_once(": ").map(|(_, v)| v.to_string())).collect();
                 Some(format!(" ({} by {})", join_or(&vals), k.trim_end_matches(']')))
             })
             .unwrap_or_default();
         let when = if wb.is_empty() { String::new() } else { format!(" when {}", plain(&wb)) };
-        let (tb, ta) = (format!("no longer renders {}", plain(b.before.as_deref().unwrap_or(""))), format!("now renders {}", plain(a.after.as_deref().unwrap_or(""))));
+        let (tb, ta) =
+            (format!("no longer renders {}", plain(b.before.as_deref().unwrap_or(""))), format!("now renders {}", plain(a.after.as_deref().unwrap_or(""))));
         out.retain(|l| !(l.kind == "RENDERS" && (l.text == tb || l.text == ta)));
         // The element picked from a map shown beside text from another map on the same key
         // (`<SORT_ICONS[sort]/> {SORT_LABELS[sort]}`): what a person sees in each state.
         if let Some(seen) = shown_by_key(c, &ea, &eb) {
             let (k, rows, label_map) = seen;
             let icons = ea.trim_start_matches('<').split('[').next().unwrap_or("").to_string();
-            out.retain(|l| {
-                !(l.kind == "CONSTANT" && (l.text.starts_with(&format!("{label_map}: ")) || l.text.starts_with(&format!("now uses {icons} = "))))
-            });
+            out.retain(|l| !(l.kind == "CONSTANT" && (l.text.starts_with(&format!("{label_map}: ")) || l.text.starts_with(&format!("now uses {icons} = ")))));
             // `ArrowUp "Price"`, per state, now and before.
             let side = |now: bool| -> String {
                 rows.iter()
-                    .filter_map(|r| r.split_once("  →  ").map(|(b, a)| if now { a.to_string() } else { b.split_whitespace().skip(1).collect::<Vec<_>>().join(" ") }))
+                    .filter_map(|r| {
+                        r.split_once("  →  ").map(|(b, a)| if now { a.to_string() } else { b.split_whitespace().skip(1).collect::<Vec<_>>().join(" ") })
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -746,7 +769,8 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         }
     }
     // Columns a new script sets, by table: `material_groups: title := Lighting, slug := lighting …`.
-    let sets: Vec<usize> = (0..out.len()).filter(|&i| new && out[i].kind == "WRITES" && out[i].text.starts_with("sets ") && out[i].text.contains(" := ")).collect();
+    let sets: Vec<usize> =
+        (0..out.len()).filter(|&i| new && out[i].kind == "WRITES" && out[i].text.starts_with("sets ") && out[i].text.contains(" := ")).collect();
     if sets.len() > 2 {
         let mut by_table: Vec<(String, Vec<String>)> = vec![];
         for &i in &sets {
@@ -766,7 +790,18 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         let ev = out[first].evidence.clone();
         out.remove(first);
         for (k, (table, cols)) in by_table.into_iter().enumerate() {
-            out.insert(first + k, Line { glyph: '+', kind: "WRITES", text: format!("sets {table}: {}", cols.join(", ")), detail: vec![], evidence: ev.clone(), places: 1, work: None });
+            out.insert(
+                first + k,
+                Line {
+                    glyph: '+',
+                    kind: "WRITES",
+                    text: format!("sets {table}: {}", cols.join(", ")),
+                    detail: vec![],
+                    evidence: ev.clone(),
+                    places: 1,
+                    work: None,
+                },
+            );
         }
     }
     // A check that moved to another call and gained a way through: `err(catchUp) = null` →
@@ -777,7 +812,9 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         let was = out[*g].text.trim_start_matches("no longer requires ").to_string();
         let now = out[*n].text.trim_start_matches("now requires ").to_string();
         let terms: Vec<&str> = now.split(" or ").collect();
-        let hit = terms.iter().position(|t| renames(&was, t).is_some_and(|ps| ps.iter().all(|(x, y)| fresh.contains(y) || changing.contains(y.as_str()) || fresh.contains(x))));
+        let hit = terms
+            .iter()
+            .position(|t| renames(&was, t).is_some_and(|ps| ps.iter().all(|(x, y)| fresh.contains(y) || changing.contains(y.as_str()) || fresh.contains(x))));
         if let Some(k) = hit {
             let swaps: Vec<String> = renames(&was, terms[k]).unwrap_or_default().into_iter().map(|(x, y)| format!("`{y}` instead of `{x}`")).collect();
             let rest: Vec<&str> = terms.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, t)| *t).collect();
@@ -790,7 +827,15 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
             let (hi, lo) = if g > n { (*g, *n) } else { (*n, *g) };
             out.remove(hi);
             out.remove(lo);
-            out.push(Line { glyph, kind: "CHECK", text, detail: vec![format!("was  requires {was}"), format!("now  requires {now}")], evidence: ev, places: 1, work: None });
+            out.push(Line {
+                glyph,
+                kind: "CHECK",
+                text,
+                detail: vec![format!("was  requires {was}"), format!("now  requires {now}")],
+                evidence: ev,
+                places: 1,
+                work: None,
+            });
         }
     }
     // A new component's handlers: one line, `<button> click, <input> change …`.
@@ -805,10 +850,13 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         }
     }
     // Fields written by callees: one line, grouped by type.
-    let by_callees: Vec<usize> = (0..out.len()).filter(|&i| out[i].kind == "WRITES" && out[i].glyph == '+' && out[i].text.ends_with(" (in a callee)")).collect();
+    let by_callees: Vec<usize> =
+        (0..out.len()).filter(|&i| out[i].kind == "WRITES" && out[i].glyph == '+' && out[i].text.ends_with(" (in a callee)")).collect();
     if by_callees.len() > 1 {
-        let fields: Vec<String> =
-            by_callees.iter().map(|&i| format!("{} is written", out[i].text.trim_start_matches("now ").trim_start_matches("writes ").trim_end_matches(" (in a callee)"))).collect();
+        let fields: Vec<String> = by_callees
+            .iter()
+            .map(|&i| format!("{} is written", out[i].text.trim_start_matches("now ").trim_start_matches("writes ").trim_end_matches(" (in a callee)")))
+            .collect();
         let grouped = crate::render::compress_writes(fields);
         let at = by_callees[0];
         out[at].text = format!("{}writes {} (in callees)", if new { "" } else { "now " }, grouped.join(" · ").replace(" written", ""));
@@ -829,14 +877,17 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
             text: format!("{} unchanged but for names{what}", plural(folded.len(), one, &many)),
             detail: vec![],
             evidence: vec![],
-            places: 1, work: None
+            places: 1,
+            work: None,
         });
     }
     // Lists a loop runs through that gained or lost items (`for _, ddl := range […]`): the items.
     for x in c.clauses.iter().filter(|x| x.row == "skips" && x.mark == '-') {
         let Some((var, items_b, when)) = listed(x.before.as_deref().unwrap_or("")) else { continue };
         let Some(j) = (0..c.clauses.len()).find(|&j| {
-            c.clauses[j].row == "skips" && c.clauses[j].mark == '+' && listed(c.clauses[j].after.as_deref().unwrap_or("")).is_some_and(|(v, _, w)| v == var && w == when)
+            c.clauses[j].row == "skips"
+                && c.clauses[j].mark == '+'
+                && listed(c.clauses[j].after.as_deref().unwrap_or("")).is_some_and(|(v, _, w)| v == var && w == when)
         }) else {
             continue;
         };
@@ -873,14 +924,14 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
                 let by = l.text.split('`').nth(1).unwrap_or("");
                 Some(format!("loads only rows where {q}, instead of filtering them in a loop (the query of `{by}`)"))
             }
-            ("FILTER", '~') if l.text.contains("is now checked in memory, not in the query") => {
-                Some(format!("{} (the query reads every row)", l.text))
-            }
+            ("FILTER", '~') if l.text.contains("is now checked in memory, not in the query") => Some(format!("{} (the query reads every row)", l.text)),
             ("FILTER", '~') if l.text.starts_with("rewritten as a subquery") => {
                 let q = l.detail.iter().find_map(|d| d.strip_prefix("now  ")).unwrap_or("");
                 Some(format!("a filter is rewritten as {q} (check that it reaches the same rows)"))
             }
-            ("EFFECT", '-') if reads_left && l.text.starts_with("no longer: read ") => Some(format!("its queries no longer read {}", l.text.trim_start_matches("no longer: read "))),
+            ("EFFECT", '-') if reads_left && l.text.starts_with("no longer: read ") => {
+                Some(format!("its queries no longer read {}", l.text.trim_start_matches("no longer: read ")))
+            }
             // A unique index is a constraint (inserts can fail): not the same results.
             ("EFFECT", '+') if l.text.starts_with("create index") => {
                 Some(format!("adds {}", l.text.split(" (later").next().unwrap_or(&l.text).trim_start_matches("create ")))
@@ -986,7 +1037,10 @@ fn glyph(x: &Clause) -> char {
         || matches!(tag, "narrowed" | "reaches fewer rows" | "leaves more items out" | "new check" | "new requirement" | "fewer ways to reach this state");
     let wider = tag.starts_with("wider")
         || tag.starts_with("now overwrites")
-        || matches!(tag, "widened" | "reaches more rows" | "no longer leaves these out" | "check dropped" | "requirement dropped" | "more ways to reach this state");
+        || matches!(
+            tag,
+            "widened" | "reaches more rows" | "no longer leaves these out" | "check dropped" | "requirement dropped" | "more ways to reach this state"
+        );
     match (narrower, wider) {
         (true, _) => '▼',
         (_, true) => '▲',
@@ -1060,7 +1114,11 @@ fn phrase(x: &Clause, new: bool) -> (String, Vec<String>) {
                 let words = |s: &str| -> Vec<String> {
                     s.split(|c: char| c.is_whitespace() || matches!(c, '.' | '<' | '>' | '{' | '}' | '(' | ')' | ','))
                         // Event attributes are the HANDLES lines' to tell.
-                        .filter(|w| !w.is_empty() && !w.starts_with('/') && !(w.len() > 2 && w.starts_with("on") && w[2..].starts_with(|c: char| c.is_ascii_uppercase())))
+                        .filter(|w| {
+                            !w.is_empty()
+                                && !w.starts_with('/')
+                                && !(w.len() > 2 && w.starts_with("on") && w[2..].starts_with(|c: char| c.is_ascii_uppercase()))
+                        })
                         .map(str::to_string)
                         .collect()
                 };
@@ -1157,7 +1215,13 @@ fn phrase(x: &Clause, new: bool) -> (String, Vec<String>) {
         ("effects", '-') => format!("no longer: {}", item("effects", x.before.as_deref().unwrap_or(""))),
         ("effects", '~') => {
             let tag = x.tag.clone().unwrap_or_default();
-            return (tag, vec![format!("was  {}", item("effects", x.before.as_deref().unwrap_or(""))), format!("now  {}", item("effects", x.after.as_deref().unwrap_or("")))]);
+            return (
+                tag,
+                vec![
+                    format!("was  {}", item("effects", x.before.as_deref().unwrap_or(""))),
+                    format!("now  {}", item("effects", x.after.as_deref().unwrap_or(""))),
+                ],
+            );
         }
         ("consts", '~') => {
             let v = |s: &str| s.split_once(" = ").map(|(_, v)| v.to_string()).unwrap_or_default();
@@ -1166,7 +1230,12 @@ fn phrase(x: &Clause, new: bool) -> (String, Vec<String>) {
             // A map: the keys whose value changed, `relevance "Sort" → "Price"`.
             let entries = |m: &str| -> Option<Vec<(String, String)>> {
                 let inner = m.strip_prefix('{')?.strip_suffix('}')?;
-                Some(crate::render::top_level_args(inner).into_iter().filter_map(|kv| kv.split_once(": ").map(|(k, v)| (k.to_string(), v.to_string()))).collect())
+                Some(
+                    crate::render::top_level_args(inner)
+                        .into_iter()
+                        .filter_map(|kv| kv.split_once(": ").map(|(k, v)| (k.to_string(), v.to_string())))
+                        .collect(),
+                )
             };
             match (entries(&vb), entries(&va)) {
                 (Some(eb), Some(ea)) => {
@@ -1345,7 +1414,8 @@ fn fills(s: &str) -> String {
     let heads: BTreeSet<&str> = calls.iter().map(|c| c.split('(').next().unwrap_or(c)).collect();
     match heads.iter().next() {
         Some(g) if heads.len() == 1 => {
-            let args: Vec<&str> = calls.iter().map(|c| c.strip_prefix(g).and_then(|r| r.strip_prefix('(')).and_then(|r| r.strip_suffix(')')).unwrap_or(c)).collect();
+            let args: Vec<&str> =
+                calls.iter().map(|c| c.strip_prefix(g).and_then(|r| r.strip_prefix('(')).and_then(|r| r.strip_suffix(')')).unwrap_or(c)).collect();
             format!("builds `{local}` with `{g}` from {}", args.join(", "))
         }
         _ => format!("builds `{local}` with {}", calls.join(", ")),
@@ -1413,7 +1483,9 @@ fn steps_changed(before: &str, after: &str) -> Option<Vec<String>> {
                     (None, Some(c)) => Some(format!("now only when {}", plain(c))),
                     _ => None,
                 };
-                let what = extra.unwrap_or_else(|| format!("now when {} (was when {})", c.as_deref().map(plain).unwrap_or_default(), bc.as_deref().map(plain).unwrap_or_default()));
+                let what = extra.unwrap_or_else(|| {
+                    format!("now when {} (was when {})", c.as_deref().map(plain).unwrap_or_default(), bc.as_deref().map(plain).unwrap_or_default())
+                });
                 out.push(format!("`{}` {what}", short(v)));
             }
             None => out.push(format!("`{}` added{}", short(v), c.as_deref().map(|c| format!(" when {}", plain(c))).unwrap_or_default())),
@@ -1643,7 +1715,8 @@ fn evidence(x: &Clause, source: SourceLine, file: &str) -> Vec<String> {
 /// `  225   push(…)`, or `synonyms.go:93   …` from another file.
 fn code_line(loc: &merak_ir::Loc, before: bool, source: SourceLine, file: &str) -> Option<String> {
     let text = source(loc, before)?;
-    let at = if loc.file == file || file.is_empty() { loc.line.to_string() } else { format!("{}:{}", loc.file.rsplit('/').next().unwrap_or(&loc.file), loc.line) };
+    let at =
+        if loc.file == file || file.is_empty() { loc.line.to_string() } else { format!("{}:{}", loc.file.rsplit('/').next().unwrap_or(&loc.file), loc.line) };
     let sign = if before { "-" } else { " " };
     let line = format!("{at:>4} {sign} {}", text.trim());
     Some(clip(&line).chars().take(WIDTH - TEXT).collect())
@@ -1652,8 +1725,13 @@ fn code_line(loc: &merak_ir::Loc, before: bool, source: SourceLine, file: &str) 
 /// For calls Merak cannot type: the first line in the function that calls each name, from
 /// the operation's evidence.
 fn call_sites(t: &Transition, c: &ContractDiff, names: &[String], source: SourceLine) -> Vec<String> {
-    let locs: Vec<&merak_ir::Loc> =
-        t.ops.iter().filter(|o| o.kind == "UNCLASSIFIED_CHANGE" && c.ops.contains(&o.id)).flat_map(|o| &o.evidence_after).filter(|l| l.file == c.loc.file).collect();
+    let locs: Vec<&merak_ir::Loc> = t
+        .ops
+        .iter()
+        .filter(|o| o.kind == "UNCLASSIFIED_CHANGE" && c.ops.contains(&o.id))
+        .flat_map(|o| &o.evidence_after)
+        .filter(|l| l.file == c.loc.file)
+        .collect();
     let mut out = vec![];
     for n in names {
         let call = format!("{n}(");
@@ -1669,8 +1747,37 @@ fn call_sites(t: &Transition, c: &ContractDiff, names: &[String], source: Source
 
 /// Words that are not names: a clause that swaps one for another changed.
 const KEYWORDS: &[&str] = &[
-    "when", "skipped", "in", "is", "not", "set", "each", "any", "of", "all", "and", "or", "AND", "OR", "NOT", "else", "end", "case", "join", "left", "on",
-    "otherwise", "true", "false", "null", "nil", "undefined", "len", "ok", "exists", "written",
+    "when",
+    "skipped",
+    "in",
+    "is",
+    "not",
+    "set",
+    "each",
+    "any",
+    "of",
+    "all",
+    "and",
+    "or",
+    "AND",
+    "OR",
+    "NOT",
+    "else",
+    "end",
+    "case",
+    "join",
+    "left",
+    "on",
+    "otherwise",
+    "true",
+    "false",
+    "null",
+    "nil",
+    "undefined",
+    "len",
+    "ok",
+    "exists",
+    "written",
 ];
 
 /// The consistent renames that turn `a` into `b`, when they have the same shape: `len(anchors)`
@@ -1754,7 +1861,11 @@ pub(crate) fn plain(s: &str) -> String {
         }
     });
     // Go's `strings.Contains(s, x)`, `HasPrefix`, `HasSuffix`, read as words; negated ones too.
-    for (f, yes, no) in [("strings.Contains(", "contains", "does not contain"), ("strings.HasPrefix(", "starts with", "does not start with"), ("strings.HasSuffix(", "ends with", "does not end with")] {
+    for (f, yes, no) in [
+        ("strings.Contains(", "contains", "does not contain"),
+        ("strings.HasPrefix(", "starts with", "does not start with"),
+        ("strings.HasSuffix(", "ends with", "does not end with"),
+    ] {
         s = rewrite_call(&s, f, |inner, before, after| {
             let parts = crate::render::top_level_args(inner);
             let [x, y] = parts.as_slice() else { return None };
@@ -1814,10 +1925,10 @@ pub(crate) fn plain(s: &str) -> String {
     out2.push_str(rest);
     let out = out2;
     // `err(f) = null`: what Merak calls the error `f` returns.
-    let out = rewrite_call(&out, "err(", |inner, before, after| after.strip_prefix(" = null").map(|rest| (before.to_string(), format!("{inner} returns no error"), rest.to_string())));
-    out.replace(" ∉ {null}", " is not null")
-        .replace(" = null", " is null")
-        .replace(" ∨ ", " or ").replace(" ∧ ", " and ").replace(" ∉ ", " not in ")
+    let out = rewrite_call(&out, "err(", |inner, before, after| {
+        after.strip_prefix(" = null").map(|rest| (before.to_string(), format!("{inner} returns no error"), rest.to_string()))
+    });
+    out.replace(" ∉ {null}", " is not null").replace(" = null", " is null").replace(" ∨ ", " or ").replace(" ∧ ", " and ").replace(" ∉ ", " not in ")
 }
 
 /// Rewrite every `name(inner)` whose surroundings `f` recognises; `f` gets the inner text,
@@ -1890,7 +2001,10 @@ mod tests {
     #[test]
     fn predicates_read_as_words() {
         assert_eq!(plain("len(scopes) ∈ {0} ∨ limit <= 0"), "scopes is empty or limit <= 0");
-        assert_eq!(plain("0 < len(a.context) ∧ len(raw) ∈ {0} ∧ !(a.match.Entity.IsTerminal())"), "a.context is not empty and raw is empty and not a.match.Entity.IsTerminal()");
+        assert_eq!(
+            plain("0 < len(a.context) ∧ len(raw) ∈ {0} ∧ !(a.match.Entity.IsTerminal())"),
+            "a.context is not empty and raw is empty and not a.match.Entity.IsTerminal()"
+        );
         assert_eq!(plain("ok(scopePredicate) is not set"), "scopePredicate fails");
         assert_eq!(plain("User.role ∈ {ADMIN, OWNER}"), "User.role is one of ADMIN, OWNER");
         assert_eq!(plain("status ∈ {open}"), "status = open");
