@@ -688,3 +688,23 @@ fn a_check_in_a_loop_is_a_guard_but_a_search_is_not() {
     let t = merak_cli::diff(&before, &after).unwrap();
     assert!(!t.ops.iter().any(|o| o.kind.starts_with("GUARD")), "{:#?}", t.ops);
 }
+
+/// A value a loop builds (`ddl = append(ddl, …)` for each item) is returned as the whole
+/// chain: what it starts as, then what each pass adds. A list built by a new loop, or a
+/// pass that now skips items, is a changed output; capacity hints are not.
+#[test]
+fn a_value_built_by_a_loop_is_compared_by_how_it_is_built() {
+    let src = |init: &str, body: &str| {
+        format!(
+            "package app\n\ntype Item struct{{ Name string; Qty int }}\n\nfunc Names(items []Item) []string {{\n\t{init}\n\tfor _, it := range items {{\n{body}\t\tout = append(out, it.Name)\n\t}}\n\treturn out\n}}\n"
+        )
+    };
+    let base = src("var out []string", "");
+    let output = |after: &str| {
+        let t = merak_cli::diff(&files(&[("app.go", &base)]), &files(&[("app.go", after)])).unwrap();
+        t.ops.into_iter().find(|o| o.kind == "OUTPUT_CHANGED")
+    };
+    let skip = output(&src("var out []string", "\t\tif it.Qty == 0 {\n\t\t\tcontinue\n\t\t}\n")).expect("a pass that skips items changes the output");
+    assert!(skip.after.as_deref().is_some_and(|a| a.contains("for each it in items: append(out, it.Name) when")), "{skip:#?}");
+    assert!(output(&src("out := make([]string, 0, len(items))", "")).is_none(), "a capacity hint is not a change");
+}

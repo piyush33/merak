@@ -337,6 +337,8 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
         spawn_depth: 0,
         defs: HashMap::new(),
         def_vals: HashMap::new(),
+        steps: HashMap::new(),
+        loops: vec![],
         closure_writes: closure_writes(ix, &f.body),
         made_by: HashMap::new(),
         ctes: scope_ctes(ix, f),
@@ -445,6 +447,11 @@ struct Walker<'a, 'p> {
     /// The value each assignment gives its local (other locals substituted), by the
     /// statement node that makes it; read through reaching definitions (`value_of`).
     def_vals: HashMap<(usize, String), Expr>,
+    /// Each assignment of a local as a step of how the local is built, by statement node.
+    /// The value a local is returned with is the chain of the steps that reach the `return`.
+    steps: HashMap<(usize, String), Step>,
+    /// The loops the statement being walked is in, innermost last: `c in checks`.
+    loops: Vec<String>,
     /// Locals a nested closure assigns (`n++` in a transaction callback): their value
     /// depends on when the closure runs, so none is known here.
     closure_writes: HashSet<String>,
@@ -524,6 +531,11 @@ impl Walker<'_, '_> {
                 } else {
                     self.records.remove(name);
                 }
+                if init.is_none() {
+                    // `var out []T`: starts empty.
+                    let zero = if matches!(ty, Some(ir::TypeRef::Array(_))) { "[]" } else { "unset" };
+                    self.step(name, zero.into(), format!("= {zero}"));
+                }
                 if let Some(init) = init {
                     let m = self.makers(init);
                     self.made_by.entry(name.clone()).or_default().extend(m);
@@ -533,6 +545,7 @@ impl Walker<'_, '_> {
                     if text.chars().count() <= 300 {
                         self.def_vals.insert((self.cur, name.clone()), value);
                     }
+                    self.step(name, slice_lit(&text), format!("= {text}"));
                     self.defs.insert(name.clone(), text);
                     self.expr(init, loc);
                     // `const order: Order = { status: …, … }` constructs a record.
@@ -623,13 +636,15 @@ impl Walker<'_, '_> {
                             let rest: Vec<String> = xs.iter().skip(1).map(render).collect();
                             (format!("[{}]", std::iter::once(self.clause.clone().unwrap_or_default()).chain(rest).collect::<Vec<_>>().join(", ")), true)
                         }
-                        Expr::Ident(x) if self.defs.get(x).is_some_and(|d| is_formula(d)) => (self.defs[x].clone(), true),
+                        Expr::Ident(x) if self.chain(x).is_some_and(|d| is_formula(&d)) => (self.chain(x).unwrap_or_default(), true),
                         // `return clause, args, true` (Go): each local by what it was built from.
-                        Expr::Array(xs) if xs.iter().any(|x| matches!(x, Expr::Ident(n) if self.defs.get(n).is_some_and(|d| is_formula(d)))) => {
+                        // (Which locals: those computed by arithmetic or built by a loop. A query's
+                        // argument list, built by conditions, is already its filters.)
+                        Expr::Array(xs) if xs.iter().any(|x| matches!(x, Expr::Ident(n) if self.built(n))) => {
                             let parts: Vec<String> = xs
                                 .iter()
                                 .map(|x| match x {
-                                    Expr::Ident(n) if self.defs.get(n).is_some_and(|d| is_formula(d)) => self.defs[n].clone(),
+                                    Expr::Ident(n) if self.built(n) => self.chain(n).unwrap_or_else(|| self.defs[n].clone()),
                                     x => render(x),
                                 })
                                 .collect();
@@ -665,7 +680,9 @@ impl Walker<'_, '_> {
                     self.loop_skips(body, &over);
                 }
                 self.depth += 1;
+                self.loops.push(over);
                 self.stmts(body, false);
+                self.loops.pop();
                 self.depth -= 1;
             }
             Stmt::Try { body, handler, finalizer, .. } => {
@@ -694,13 +711,21 @@ impl Walker<'_, '_> {
                 if let Expr::Ident(x) = target.as_ref() {
                     // The value this assignment gives `x`, read later through reaching definitions.
                     let assigned = self.inline_consts(value);
-                    if render(&assigned).chars().count() <= 300 {
+                    let plain = render(&assigned);
+                    if plain.chars().count() <= 300 {
                         self.def_vals.insert((self.cur, x.clone()), assigned);
                     }
                     let m = self.makers(value);
                     self.made_by.entry(x.clone()).or_default().extend(m);
                     let when = self.conditions(false);
                     let when = if when.is_empty() { String::new() } else { format!(" when {}", when.join(" ∧ ")) };
+                    match value.as_ref() {
+                        Expr::Binary { op: op @ (ir::BinOp::Add | ir::BinOp::Sub), left, right } if matches!(left.as_ref(), Expr::Ident(l) if l == x) => {
+                            let sign = if *op == ir::BinOp::Add { "+" } else { "−" };
+                            self.step(x, plain, format!("{sign}{}", render(&self.inline_consts(right))));
+                        }
+                        _ => self.step(x, slice_lit(&plain), format!("= {plain}")),
+                    }
                     let step = match value.as_ref() {
                         Expr::Binary { op: op @ (ir::BinOp::Add | ir::BinOp::Sub), left, right } if matches!(left.as_ref(), Expr::Ident(l) if l == x) => {
                             let sign = if *op == ir::BinOp::Add { "+" } else { "−" };
@@ -988,6 +1013,43 @@ impl Walker<'_, '_> {
     /// The condition node `n` runs under, from control dependence: for each branch edge
     /// it depends on, the branch's own condition and the edge's (an `if` test or its
     /// negation). `guards` keeps only the function's guard edges, otherwise only the rest.
+    /// Record the assignment of `name` at the statement being walked as a step of how it
+    /// is built: `plain` is its value alone, `step` the change it makes (`+x`, `= v`).
+    fn step(&mut self, name: &str, plain: String, change: String) {
+        let step = Step { seq: self.steps.len(), plain, change, over: self.loops.last().cloned(), when: self.conditions(false) };
+        self.steps.insert((self.cur, name.to_string()), step);
+    }
+
+    /// How local `name` is built by the time of the statement being walked, from the
+    /// assignments that reach it in the order they run: `[…]; for each c in checks:
+    /// append(ddl, …)`, or `a; +6 when c`. The first step reads by its value alone when
+    /// nothing came before it. `None` when an assignment that reaches it is unknown (a
+    /// parameter, or a nested closure assigns it).
+    fn chain(&self, name: &str) -> Option<String> {
+        if self.closure_writes.contains(name) {
+            return None;
+        }
+        let mut steps: Vec<&Step> = self.cd.reaching(self.cur, name).iter().map(|d| self.steps.get(&(*d, name.to_string()))).collect::<Option<_>>()?;
+        steps.sort_by_key(|s| s.seq);
+        // What the `return` itself runs under goes without saying on each step.
+        let here = self.conditions(false);
+        let text = |(i, s): (usize, &&Step)| {
+            let when: Vec<&str> = s.when.iter().filter(|c| !here.contains(c)).map(String::as_str).collect();
+            let when = if when.is_empty() { String::new() } else { format!(" when {}", when.join(" ∧ ")) };
+            match &s.over {
+                Some(over) => format!("for each {over}: {}{when}", s.change.strip_prefix("= ").unwrap_or(&s.change)),
+                None if i == 0 && when.is_empty() => s.plain.clone(),
+                None => format!("{}{when}", s.change),
+            }
+        };
+        Some(steps.iter().enumerate().map(text).collect::<Vec<_>>().join("; "))
+    }
+
+    /// A local of a returned tuple worth showing by how it was built.
+    fn built(&self, name: &str) -> bool {
+        self.defs.get(name).is_some_and(|d| is_formula(d)) || self.chain(name).is_some_and(|c| c.contains("; for each "))
+    }
+
     /// The value local `name` holds at the statement being walked: the value of the one
     /// assignment that reaches it. `None` when several do (it depends on the path), when
     /// none does (a parameter or outer name), or when the value was too long to keep.
@@ -1990,9 +2052,28 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
-/// A computed value worth showing in place of the local it was stored in: arithmetic.
+/// One assignment of a local: `plain` is its value alone, `change` what it does to the
+/// value so far (`+x`, `= v`), `over` the loop it repeats in, `when` its condition.
+struct Step {
+    seq: usize,
+    plain: String,
+    change: String,
+    over: Option<String>,
+    when: Vec<String>,
+}
+
+/// `make([]T, 0, n)` is an empty slice; its capacity is not part of the value.
+fn slice_lit(text: &str) -> String {
+    match text.strip_prefix("make([]").and_then(|r| r.strip_suffix(')')) {
+        Some(r) if r.split(", ").nth(1) == Some("0") => "[]".into(),
+        _ => text.to_string(),
+    }
+}
+
+/// A computed value worth showing in place of the local it was stored in: arithmetic, or
+/// a value a loop builds up (`[]; for each c in cs: append(out, c.Name)`).
 fn is_formula(d: &str) -> bool {
-    [" + ", " - ", " * ", " / ", "; +", "; −", "${"].iter().any(|op| d.contains(op))
+    [" + ", " - ", " * ", " / ", "; +", "; −", "${", "; for each "].iter().any(|op| d.contains(op))
 }
 
 /// A condition as sorted, distinct conjuncts.
