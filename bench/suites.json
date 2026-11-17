@@ -1,0 +1,4 @@
+{
+  "miniflux": {"repo": "~/Documents/merak-refs/miniflux", "ci_repo": "https://github.com/miniflux/v2", "n": 60},
+  "immich": {"repo": "~/Documents/merak-refs/immich", "ci_repo": "https://github.com/immich-app/immich", "root": "server", "n": 60}
+}

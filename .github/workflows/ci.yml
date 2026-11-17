@@ -15,3 +15,16 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+  bench-gate:
+    # Every engine change must leave the pinned public benchmarks identical, or the
+    # difference must be read and accepted (`scripts/gate.py accept`) in the same PR.
+    runs-on: ubuntu-latest
+    env:
+      MERAK_BENCH_REPOS: ${{ github.workspace }}/../bench-repos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: python3 scripts/gate.py clone
+      - run: python3 scripts/gate.py check --detail
