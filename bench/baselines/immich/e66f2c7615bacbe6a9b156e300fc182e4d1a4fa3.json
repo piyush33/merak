@@ -1,0 +1,6 @@
+{
+ "ops": [
+  "{\"after\": \"26 entities changed; behaviour summaries unchanged\", \"confidence\": 1.0, \"kind\": \"PURE_REFACTOR\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"*\"}"
+ ],
+ "view": "## Behaviour change · e66f2c7615bacbe6a9b156e300fc182e4d1a4fa3~1..e66f2c7615bacbe6a9b156e300fc182e4d1a4fa3\n\n**No behaviour change.** 26 functions were restructured (moved, renamed or extracted), and each does what it did before.\n\n"
+}

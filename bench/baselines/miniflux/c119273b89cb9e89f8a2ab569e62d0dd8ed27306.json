@@ -1,0 +1,6 @@
+{
+ "ops": [
+  "{\"affects\": [\"POST /reader/api/0/disable-tag\"], \"after\": \"categories: title <> all (?)\", \"before\": \"categories: title != any (?)\", \"confidence\": 1.0, \"kind\": \"QUERY_FILTER_CHANGED\", \"layer\": \"behaviour\", \"origin\": \"static\", \"subject\": \"internal/storage::Storage.RemoveAndReplaceCategoriesByName\"}"
+ ],
+ "view": "## Behaviour change · c119273b89cb9e89f8a2ab569e62d0dd8ed27306~1..c119273b89cb9e89f8a2ab569e62d0dd8ed27306\n\n### `POST /reader/api/0/disable-tag` · ~ changed\n\n`Storage.RemoveAndReplaceCategoriesByName`: categories: reaches different rows.\n\n    touches     deletes categories · writes feeds · reads categories\n\n    Storage.RemoveAndReplaceCategoriesByName · changed · internal/storage/category.go:247\n      ~ FILTER    categories: reaches different rows\n                  was  != any\n                  now  <> all\n                   256   err = tx.QueryRow(query, userid, titleParam).Scan(&count)\n      same        3 checks · 6 row filters · 1 write\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

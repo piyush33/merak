@@ -3,6 +3,7 @@
 //! invariants and declared design rules.
 
 pub mod catalog;
+pub mod cfg;
 pub mod clause;
 pub mod design;
 pub mod extract;

@@ -1,0 +1,7 @@
+{
+ "ops": [
+  "{\"after\": \"Array#.map(_) when missing.length ∉ {0}\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"src/services/metadata.service.ts::MetadataService.applyTaggedFaces\"}",
+  "{\"confidence\": 1.0, \"kind\": \"ENTITY_ADDED\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"src/services/metadata.service.ts::MetadataService.applyTaggedFaces.map#3\"}"
+ ],
+ "view": "## Behaviour change · a84de0188ee7eeefa483f3964ef5e828d535b39e~1..a84de0188ee7eeefa483f3964ef5e828d535b39e\n\n### `src/services/metadata.service.ts` · ~ changed\n\n`MetadataService.applyTaggedFaces`: `createAll` now gets missing.map(func(…)) instead of missing.\n\n    touches     deletes asset_face · writes asset_face, face_search, person, person_group · queues (dynamic) ·\n                reads (dynamic), person\n\n    MetadataService.applyTaggedFaces · changed · src/services/metadata.service.ts:893\n      ~ PASSES    `createAll` now gets missing.map(func(…)) instead of missing\n                   962   await this.personRepository.createAll(\n      same        2 checks · 2 skip rules\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

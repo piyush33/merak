@@ -924,3 +924,17 @@ fn constant_maps_icons_and_labels_in_markup_are_seen() {
     assert!(text.contains(r#"by sort, now shows ArrowUpDown "Price", ArrowUp "Price" (was ArrowUpDown "Sort", ArrowUpDown "Price ↑")"#), "{text}");
     assert!(text.contains("<button> now tells aria-label=NEXT[sort]"), "{text}");
 }
+
+/// A return inside one `switch` case is conditioned on that case, with the cases before it
+/// left out, so a changed result says which case changed instead of "otherwise".
+#[test]
+fn a_return_in_a_switch_case_says_which_case() {
+    let src = |join: &str| {
+        format!("export function subject(t: string): string {{\n  switch (t) {{\n    case \"welcome\":\n      return \"Hi\";\n    case \"invite\":\n      log(t);\n      return \"{join}\";\n  }}\n  throw new Error(t);\n}}\n")
+    };
+    let before: merak_cli::source::Files = [("src/mail.ts".to_string(), src("Join"))].into_iter().collect();
+    let after: merak_cli::source::Files = [("src/mail.ts".to_string(), src("Join us"))].into_iter().collect();
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    assert!(text.contains("when t = invite"), "{text}");
+}

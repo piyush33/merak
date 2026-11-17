@@ -1,0 +1,7 @@
+{
+ "ops": [
+  "{\"after\": \"db_read feeds (sync)\", \"confidence\": 1.0, \"kind\": \"EFFECT_ADDED\", \"layer\": \"behaviour\", \"origin\": \"static\", \"subject\": \"internal/database::<package>.<closure>#127\"}",
+  "{\"after\": \"entries: feed_id in (select id from feeds)\", \"confidence\": 1.0, \"kind\": \"QUERY_FILTER_ADDED\", \"layer\": \"behaviour\", \"note\": \"the query now applies this predicate: it reaches fewer rows\", \"origin\": \"static\", \"subject\": \"internal/database::<package>.<closure>#127\"}"
+ ],
+ "view": "## Behaviour change · 79d920bc1ac900834322fcfe13b6e228228c2fe0~1..79d920bc1ac900834322fcfe13b6e228228c2fe0\n\n### `internal/database/migrations.go` · ▼ narrower\n\n`<package>.<closure>#127`: new row filter: entries: feed_id in (select id from feeds).\n\n    touches     deletes entries · writes entry_tombstones · reads feeds · calls create index\n                document_vectors_idx on entries, create index entry_tombstones_deleted_at_idx on\n                entry_tombstones, create table entry_tombstones, drop index document_vectors_idx\n\n    <package>.<closure>#127 · changed · internal/database/migrations.go:1470\n      ▼ FILTER    new row filter: entries: feed_id in (select id from feeds)\n                  1490   AND feed_id IN (SELECT id FROM feeds)\n      + EFFECT    now reads feeds\n                  1471   _, err = tx.Exec(`\n      same        2 row filters · 3 writes\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

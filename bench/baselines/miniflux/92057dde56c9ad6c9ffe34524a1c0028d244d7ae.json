@@ -1,0 +1,6 @@
+{
+ "ops": [
+  "{\"after\": \"os.Chmod(_, 660)\", \"before\": \"os.Chmod(_, 666)\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"internal/http/server::createUnixSocketListener\"}"
+ ],
+ "view": "## Behaviour change · 92057dde56c9ad6c9ffe34524a1c0028d244d7ae~1..92057dde56c9ad6c9ffe34524a1c0028d244d7ae\n\n### `internal/http/server/server.go` · ? not modelled\n\n    touches     writes file (dynamic)\n\n    createUnixSocketListener · changed · internal/http/server/server.go:239\n      ? CALLS     the arguments or conditions of its calls to `Chmod` changed\n                   248   if err := os.Chmod(socketFile, 0660); err != nil {\n      same        1 output case\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

@@ -1,0 +1,6 @@
+{
+ "ops": [
+  "{\"after\": \"loop: skipped when isLocked is set\", \"confidence\": 1.0, \"kind\": \"SKIP_ADDED\", \"layer\": \"behaviour\", \"origin\": \"static\", \"subject\": \"src/main.ts::Workers.waitForFreeLock\"}"
+ ],
+ "view": "## Behaviour change · 64a2fc825905d6fc3e9e060aa85923755d3ba90e~1..64a2fc825905d6fc3e9e060aa85923755d3ba90e\n\n### `src/main.ts` · ▼ narrower\n\n`Workers.waitForFreeLock`: now skips an iteration when isLocked is set.\n\n    Workers.waitForFreeLock · changed · src/main.ts:66\n      ▼ FILTER    now skips an iteration when isLocked is set\n                    86   if (!isLocked) {\n      same        1 check\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

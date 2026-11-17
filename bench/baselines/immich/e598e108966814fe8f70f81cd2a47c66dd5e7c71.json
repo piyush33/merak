@@ -1,0 +1,8 @@
+{
+ "ops": [
+  "{\"after\": \"server.on(\\\"connection\\\", _); <fn on(\\\"connection\\\")>\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"src/app.common.ts::configureExpress\"}",
+  "{\"confidence\": 1.0, \"kind\": \"ENTITY_ADDED\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"src/app.common.ts::configureExpress.on(\\\"connection\\\")\"}",
+  "{\"confidence\": 1.0, \"kind\": \"ENTITY_ADDED\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"src/app.common.ts::configureExpress.on(\\\"connection\\\").on(\\\"error\\\")\"}"
+ ],
+ "view": "## Behaviour change · e598e108966814fe8f70f81cd2a47c66dd5e7c71~1..e598e108966814fe8f70f81cd2a47c66dd5e7c71\n\n### `src/app.common.ts` · ? not modelled\n\n    touches     writes file (dynamic)\n\n    configureExpress · changed · src/app.common.ts:24\n      ? CALLS     it now also calls `on` and `on(\"connection\") callback`\n                    95   server.on('connection', (socket) => {\n      same        1 check · 2 constants\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

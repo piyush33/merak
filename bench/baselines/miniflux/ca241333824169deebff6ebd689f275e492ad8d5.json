@@ -1,0 +1,7 @@
+{
+ "ops": [
+  "{\"after\": \"effects: db_schema drop index entries_user_status_changed_idx\", \"confidence\": 1.0, \"kind\": \"BEHAVIOUR_ADDED\", \"layer\": \"behaviour\", \"origin\": \"static\", \"subject\": \"internal/database::<package>.<closure>#133\"}",
+  "{\"confidence\": 1.0, \"kind\": \"ENTITY_ADDED\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"internal/database::<package>.<closure>#133\"}"
+ ],
+ "view": "## Behaviour change · ca241333824169deebff6ebd689f275e492ad8d5~1..ca241333824169deebff6ebd689f275e492ad8d5\n\n### `internal/database/migrations.go` · + new\n\n`<package>.<closure>#133`: drop index entries_user_status_changed_idx.\n\n    touches     calls drop index entries_user_status_changed_idx\n\n    + <package>.<closure>#133(tx: sql.Tx) · new · internal/database/migrations.go:1560\n      + EFFECT    drop index entries_user_status_changed_idx\n                  1566   _, err = tx.Exec(`\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

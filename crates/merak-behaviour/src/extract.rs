@@ -2,6 +2,7 @@
 //! calls, effects, reads, writes, guards, subscriptions and routes.
 
 use crate::catalog::{self, CallSite, Catalog};
+use crate::cfg::{Arm, ControlDeps};
 use crate::model::*;
 use crate::pred::Pred;
 use crate::resolve::{render, Callee, Env, Index, Ty};
@@ -339,7 +340,11 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
         made_by: HashMap::new(),
         ctes: scope_ctes(ix, f),
         records: BTreeSet::new(),
-        path: vec![],
+        cd: ControlDeps::build(&f.body),
+        labels: HashMap::new(),
+        guarded: HashSet::new(),
+        runs_memo: Default::default(),
+        cur: 0,
         consumed_closures: BTreeSet::new(),
         clause: clause_shape(ix, envs, &f.id, 0),
         e: Entity {
@@ -389,6 +394,7 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
         },
     };
     w.stmts(&f.body, true);
+    w.cur = 0;
     w.decorators(f);
     if is_predicate_fn(f) {
         let returns: Vec<(&Expr, &Loc)> = f
@@ -443,11 +449,18 @@ struct Walker<'a, 'p> {
     ctes: BTreeSet<String>,
     /// Locals that start as an empty map or object: records built key by key.
     records: BTreeSet<String>,
-    /// Conditions under which the current statement runs: enclosing `if` tests and the
-    /// negations of earlier early exits. Part of every call shape, so a condition added
-    /// around a call is a change, while `if (c) { f() }` and `if (!c) return; f()` agree.
-    /// Top-level guards are marked (`true`): guard facts already compare them.
-    path: Vec<(Pred, bool)>,
+    /// Control dependence of the body's statements (see `cfg`), the condition of each
+    /// `if` once walked (by node), and the statement being walked. The conditions a
+    /// statement runs under are derived from them (`runs_under`) and are part of every
+    /// call shape, so a condition added around a call is a change, while `if (c) { f() }`
+    /// and `if (!c) return; f()` agree.
+    cd: ControlDeps,
+    labels: HashMap<usize, Pred>,
+    /// `if` nodes whose check is already a guard fact (the top-level rules).
+    guarded: HashSet<usize>,
+    /// Conditions already derived, by node and guard side.
+    runs_memo: std::cell::RefCell<HashMap<(usize, bool), Pred>>,
+    cur: usize,
     consumed_closures: BTreeSet<String>,
     /// What this function builds, when it assembles a string clause: `⟨a⟩ AND ⟨b, each c in cs⟩`.
     clause: Option<String>,
@@ -456,35 +469,40 @@ struct Walker<'a, 'p> {
 
 impl Walker<'_, '_> {
     fn stmts(&mut self, stmts: &[Stmt], top: bool) {
-        let scope = self.path.len();
         for (i, s) in stmts.iter().enumerate() {
             // At function top level, a trailing `if (c) { … }` (no else, no exit inside)
             // is the same as `if (!c) return; …`: record the guard, walk the body as top level.
             if let (true, true, Stmt::If { test, then, otherwise, loc }) = (top, i + 1 == stmts.len(), s) {
                 if otherwise.is_empty() && !matches!(then.last(), Some(Stmt::Throw(..) | Stmt::Return(..))) {
+                    self.enter(s);
                     self.expr(test, loc);
+                    if let Some(n) = self.cd.node(s) {
+                        let p = self.pred(test);
+                        self.labels.insert(n, p);
+                    }
                     let requires = self.pred(test);
                     let requires = self.with_domain(requires);
                     self.e.guards.push(GuardFact { requires, on_fail: OnFail::Return, loc: loc.clone(), returns_value: false });
-                    self.path.push((self.pred(test), true));
+                    if let Some(n) = self.cd.node(s) {
+                        self.guarded.insert(n);
+                    }
                     self.stmts(then, true);
                     continue;
                 }
             }
             self.stmt(s, top);
-            // After `if (c) return|throw|continue;` the rest of the block runs under ¬c
-            // (after a top-level return/throw, a guard).
-            if let Stmt::If { test, then, otherwise, .. } = s {
-                if otherwise.is_empty() && matches!(then.last(), Some(Stmt::Throw(..) | Stmt::Return(..) | Stmt::Jump(..))) {
-                    let guard = top && !matches!(then.last(), Some(Stmt::Jump(..)));
-                    self.path.push((self.pred(test).negate(), guard));
-                }
-            }
         }
-        self.path.truncate(scope);
+    }
+
+    /// Make `s` the statement being walked: conditions are read for it.
+    fn enter(&mut self, s: &Stmt) {
+        if let Some(n) = self.cd.node(s) {
+            self.cur = n;
+        }
     }
 
     fn stmt(&mut self, s: &Stmt, top: bool) {
+        self.enter(s);
         match s {
             Stmt::Expr(e, loc) => self.expr(e, loc),
             Stmt::Let { name, ty, init, loc } => {
@@ -539,6 +557,9 @@ impl Walker<'_, '_> {
                         let requires = self.with_domain(requires);
                         let returns_value = matches!(then.last(), Some(Stmt::Return(Some(_), _)));
                         self.e.guards.push(GuardFact { requires, on_fail, loc: loc.clone(), returns_value });
+                        if let Some(n) = self.cd.node(s) {
+                            self.guarded.insert(n);
+                        }
                     } else {
                         // `if err != nil { log(…); if !ok { return } }`: it stops when both hold.
                         for inner in then.iter() {
@@ -555,17 +576,22 @@ impl Walker<'_, '_> {
                             let requires = self.with_domain(both.negate());
                             let returns_value = matches!(th2.last(), Some(Stmt::Return(Some(_), _)));
                             self.e.guards.push(GuardFact { requires, on_fail, loc: l2.clone(), returns_value });
+                            if let Some(n) = self.cd.node(inner) {
+                                self.guarded.insert(n);
+                            }
                         }
                     }
                 }
                 self.depth += 1;
                 let cond = self.pred(test);
-                self.path.push((cond.clone(), false));
+                if let Some(n) = self.cd.node(s) {
+                    self.labels.insert(n, cond.clone());
+                    if !self.guarded.contains(&n) {
+                        self.required_checks(n, &cond, then, otherwise, loc);
+                    }
+                }
                 self.stmts(then, false);
-                self.path.pop();
-                self.path.push((cond.negate(), false));
                 self.stmts(otherwise, false);
-                self.path.pop();
                 self.depth -= 1;
             }
             Stmt::Return(e, loc) => {
@@ -941,17 +967,91 @@ impl Walker<'_, '_> {
         format!("{target}({})", c.args.iter().map(arg).collect::<Vec<_>>().join(", "))
     }
 
-    /// The current path conditions (`guards`: the entity's own guards), rendered for a call shape.
+    /// The conditions the statement being walked runs under, rendered for a call shape:
+    /// the alternatives it sits in (`guards: false`) or the checks it requires (`true`).
     fn conditions(&self, guards: bool) -> Vec<String> {
-        let preds: Vec<Pred> = self.path.iter().filter(|(_, g)| *g == guards).map(|(p, _)| p.clone()).collect();
-        let mut conds: Vec<String> = match Pred::And(preds).simplify() {
-            Pred::And(ps) => ps.iter().map(Pred::render).collect(),
-            Pred::True => vec![],
-            p => vec![p.render()],
-        };
-        conds.sort();
-        conds.dedup();
-        conds
+        split_conds(self.runs_under(self.cur, guards, &mut vec![]).0)
+    }
+
+    /// The condition node `n` runs under, from control dependence: for each branch edge
+    /// it depends on, the branch's own condition and the edge's (an `if` test or its
+    /// negation). `guards` keeps only the function's guard edges, otherwise only the rest.
+    /// A check anywhere in the body whose failing side ends the function (`if err != nil
+    /// { return err }` in a loop or a nested block) is a guard of the function: it
+    /// requires `¬(context ∧ failing condition)`, the context being the alternatives the
+    /// check sits in.
+    fn required_checks(&mut self, n: usize, cond: &Pred, then: &[Stmt], otherwise: &[Stmt], loc: &Loc) {
+        for (arm, exit_side) in [(Arm::Then, otherwise), (Arm::Else, then)] {
+            if !self.cd.is_guard(n, arm) {
+                continue;
+            }
+            // When the passing side ends the function too, the branch picks between two
+            // endings (two error messages, two results): not a check.
+            let passing = if arm == Arm::Then { then } else { otherwise };
+            if if passing.is_empty() { self.cd.rest_ends(n) } else { always_ends(passing) || self.cd.rest_ends(n) && !passing.iter().any(|s| matches!(s, Stmt::Jump(_))) } {
+                continue;
+            }
+            // In a loop, returning a found item or a flag ends a search, not a rejection.
+            if self.cd.in_loop(n) && !rejects(exit_side.last()) {
+                continue;
+            }
+            let fails = if arm == Arm::Then { cond.clone().negate() } else { cond.clone() };
+            let context = self.runs_under(n, false, &mut vec![]).0;
+            let requires = clean(all(vec![context, fails]).negate());
+            if requires == Pred::True {
+                continue;
+            }
+            let requires = self.with_domain(requires);
+            let on_fail = if matches!(exit_side.last(), Some(Stmt::Throw(..))) { OnFail::Throw } else { OnFail::Return };
+            let returns_value = matches!(exit_side.last(), Some(Stmt::Return(Some(_), _)));
+            self.e.guards.push(GuardFact { requires, on_fail, loc: loc.clone(), returns_value });
+        }
+    }
+
+    /// The second value says whether the answer is partial (cut at a loop, or read before
+    /// a branch was walked); only complete answers are remembered.
+    fn runs_under(&self, n: usize, guards: bool, visiting: &mut Vec<usize>) -> (Pred, bool) {
+        let deps = self.cd.deps(n);
+        if deps.is_empty() {
+            return (Pred::True, false);
+        }
+        if let Some(p) = self.runs_memo.borrow().get(&(n, guards)) {
+            return (p.clone(), false);
+        }
+        // Back through a loop to itself: no path that is not already counted (least fixpoint).
+        if visiting.contains(&n) {
+            return (Pred::False, true);
+        }
+        visiting.push(n);
+        let mut terms = vec![];
+        let mut partial = false;
+        for &(b, arm) in deps {
+            // A loop header depends on its own body edge: nothing new.
+            if b == n {
+                continue;
+            }
+            let (base, cut) = self.runs_under(b, guards, visiting);
+            partial |= cut;
+            let edge = if arm == Arm::Plain || self.cd.is_guard(b, arm) != guards {
+                Pred::True
+            } else {
+                match (self.labels.get(&b), arm) {
+                    (Some(p), Arm::Then) => p.clone(),
+                    (Some(p), _) => p.clone().negate(),
+                    (None, _) => {
+                        partial = true;
+                        Pred::True
+                    }
+                }
+            };
+            terms.push(all(vec![base, edge]));
+        }
+        visiting.pop();
+        let p = any(terms);
+        if !partial {
+            self.runs_memo.borrow_mut().insert((n, guards), p.clone());
+        }
+        (p, partial)
     }
 
     /// Access requirements in object arguments: `{ auth, permission: Permission.AlbumRead }`.
@@ -1857,6 +1957,168 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
 /// A computed value worth showing in place of the local it was stored in: arithmetic.
 fn is_formula(d: &str) -> bool {
     [" + ", " - ", " * ", " / ", "; +", "; −", "${"].iter().any(|op| d.contains(op))
+}
+
+/// A condition as sorted, distinct conjuncts.
+fn split_conds(p: Pred) -> Vec<String> {
+    let mut conds: Vec<String> = match Pred::And(vec![p]).simplify() {
+        Pred::And(ps) => ps.iter().map(Pred::render).collect(),
+        Pred::True => vec![],
+        p => vec![p.render()],
+    };
+    conds.sort();
+    conds.dedup();
+    conds
+}
+
+/// Conjunction with `true` dropped and `false` absorbing.
+fn all(ps: Vec<Pred>) -> Pred {
+    let mut out = vec![];
+    for p in ps {
+        match p {
+            Pred::True => {}
+            Pred::False => return Pred::False,
+            Pred::And(inner) => out.extend(inner),
+            p => out.push(p),
+        }
+    }
+    match out.len() {
+        0 => Pred::True,
+        1 => out.pop().unwrap(),
+        _ => Pred::And(out),
+    }
+}
+
+/// Disjunction of conjunctions, simplified the way path conditions merge where
+/// control flow rejoins: `false` dropped and `true` absorbing; `A ∨ (A ∧ B)` is `A`;
+/// `(A ∧ c) ∨ (A ∧ ¬c)` is `A`; conjuncts common to every term are factored out.
+fn any(ps: Vec<Pred>) -> Pred {
+    let mut terms: Vec<Vec<Pred>> = vec![];
+    for p in ps {
+        match p {
+            Pred::True => return Pred::True,
+            Pred::False => {}
+            Pred::And(cs) => terms.push(cs),
+            Pred::Or(inner) => terms.extend(inner.into_iter().map(|q| match q {
+                Pred::And(cs) => cs,
+                q => vec![q],
+            })),
+            p => terms.push(vec![p]),
+        }
+    }
+    let subset = |a: &[Pred], b: &[Pred]| a.iter().all(|x| b.contains(x));
+    loop {
+        let mut changed = false;
+        // Absorption: drop a term that contains another term.
+        let mut i = 0;
+        while i < terms.len() {
+            if (0..terms.len()).any(|j| j != i && subset(&terms[j], &terms[i]) && (terms[j].len() < terms[i].len() || j < i)) {
+                terms.remove(i);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+        // Reduction: `(A ∧ c) ∨ (A ∧ B ∧ ¬c)` is `(A ∧ c) ∨ (A ∧ B)`.
+        for i in 0..terms.len() {
+            for j in 0..terms.len() {
+                if i == j {
+                    continue;
+                }
+                let extra: Vec<Pred> = terms[i].iter().filter(|c| !terms[j].contains(c)).cloned().collect();
+                if extra.is_empty() {
+                    continue;
+                }
+                // The negation of what term i has beyond term j, as one conjunct of term j.
+                let not_extra = all(extra).negate().simplify();
+                if let Some(m) = terms[j].iter().position(|d| *d == not_extra) {
+                    terms[j].remove(m);
+                    changed = true;
+                }
+            }
+        }
+        // Complement merge: `A ∧ c` and `A ∧ ¬c` give `A`.
+        'merge: for i in 0..terms.len() {
+            for j in (i + 1)..terms.len() {
+                if terms[i].len() != terms[j].len() {
+                    continue;
+                }
+                for (k, c) in terms[i].iter().enumerate() {
+                    let rest_i: Vec<&Pred> = terms[i].iter().enumerate().filter(|(x, _)| *x != k).map(|(_, p)| p).collect();
+                    let not_c = c.clone().negate();
+                    let Some(m) = terms[j].iter().position(|d| *d == not_c) else { continue };
+                    let rest_j: Vec<&Pred> = terms[j].iter().enumerate().filter(|(x, _)| *x != m).map(|(_, p)| p).collect();
+                    if rest_i.iter().all(|p| rest_j.contains(p)) && rest_j.iter().all(|p| rest_i.contains(p)) {
+                        let merged: Vec<Pred> = rest_i.into_iter().cloned().collect();
+                        terms.remove(j);
+                        terms[i] = merged;
+                        changed = true;
+                        break 'merge;
+                    }
+                }
+            }
+        }
+        if terms.iter().any(Vec::is_empty) {
+            return Pred::True;
+        }
+        if !changed {
+            break;
+        }
+    }
+    match terms.len() {
+        0 => return Pred::False,
+        1 => return all(terms.pop().unwrap()),
+        _ => {}
+    }
+    // Factor out what every term shares.
+    let common: Vec<Pred> = terms[0].iter().filter(|c| terms[1..].iter().all(|t| t.contains(c))).cloned().collect();
+    let rest: Vec<Pred> = terms
+        .into_iter()
+        .map(|t| all(t.into_iter().filter(|c| !common.contains(c)).collect()))
+        .collect();
+    let mut out = common;
+    out.push(Pred::Or(rest));
+    all(out)
+}
+
+/// Whether a statement list always returns or throws (see `cfg`).
+fn always_ends(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Return(..) | Stmt::Throw(..)) => true,
+        Some(Stmt::If { then, otherwise, .. }) => !otherwise.is_empty() && always_ends(then) && always_ends(otherwise),
+        Some(Stmt::Block(b)) => always_ends(b),
+        _ => false,
+    }
+}
+
+/// A predicate with constants folded away (`false ∨ x` is `x`, `true ∧ x` is `x`).
+fn clean(p: Pred) -> Pred {
+    match p {
+        Pred::And(ps) => all(ps.into_iter().map(clean).collect()),
+        Pred::Or(ps) => any(ps.into_iter().map(clean).collect()),
+        p => p,
+    }
+    .simplify()
+}
+
+/// Whether leaving a loop this way rejects the input: it throws, or returns something
+/// built for the purpose (`fmt.Errorf(…)`, `fail(409, …)`, `nil, err`), not a found
+/// item or a flag.
+fn rejects(last: Option<&Stmt>) -> bool {
+    fn built(e: &Expr) -> bool {
+        match e {
+            Expr::Call(_) | Expr::New { .. } => true,
+            Expr::Ident(n) => n == "err" || n.ends_with("Err") || n.ends_with("Error"),
+            Expr::Array(xs) => xs.iter().any(built),
+            Expr::Await(x) => built(x),
+            _ => false,
+        }
+    }
+    match last {
+        Some(Stmt::Throw(..)) => true,
+        Some(Stmt::Return(Some(e), _)) => built(e),
+        _ => false,
+    }
 }
 
 /// `/prefix/path`, with duplicate and trailing slashes removed.

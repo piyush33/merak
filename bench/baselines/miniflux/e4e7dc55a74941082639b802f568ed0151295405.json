@@ -1,0 +1,6 @@
+{
+ "ops": [
+  "{\"affects\": [\"POST /subscriptions\"], \"after\": \"view.Set(\\\"hasProxyConfigured\\\", _); configOptions.HasHTTPClientProxyURLConfigured()\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"internal/ui::handler.showChooseSubscriptionPage\"}"
+ ],
+ "view": "## Behaviour change · e4e7dc55a74941082639b802f568ed0151295405~1..e4e7dc55a74941082639b802f568ed0151295405\n\n### `POST /subscriptions` · ? not modelled\n\n    touches     deletes feed_icons · queries (dynamic) · writes enclosures, entries, feed_icons, feeds, icons ·\n                calls GET (dynamic) · reads categories, entries, entry_tombstones, feeds, icons\n\n    handler.showChooseSubscriptionPage · changed · internal/ui/subscription_choose.go:18\n      ? CALLS     it now also calls `Set` and `HasHTTPClientProxyURLConfigured`\n                    39   view.Set(\"hasProxyConfigured\", config.Opts.HasHTTPClientProxyURLConfigured())\n      same        13 checks · 178 writes\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

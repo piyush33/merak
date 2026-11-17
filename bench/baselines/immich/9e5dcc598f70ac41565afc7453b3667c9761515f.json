@@ -1,0 +1,6 @@
+{
+ "ops": [
+  "{\"after\": \"ctx.addIssue(\\\"assetIds can only be used with type INDIVIDUAL\\\") when assetIds is set ∧ assetIds.length ∉ {0} ∧ type ∈ {ALBUM}\", \"before\": \"ctx.addIssue(\\\"assetIds can only be used with type INDIVIDUAL\\\") when assetIds is set ∧ type ∈ {ALBUM}\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"src/dtos/shared-link.dto.ts::SharedLinkCreateSchema.superRefine\"}"
+ ],
+ "view": "## Behaviour change · 9e5dcc598f70ac41565afc7453b3667c9761515f~1..9e5dcc598f70ac41565afc7453b3667c9761515f\n\n### `src/dtos/shared-link.dto.ts` · ? not modelled\n\n    SharedLinkCreateSchema.superRefine · changed · src/dtos/shared-link.dto.ts:34\n      ? CALLS     the arguments or conditions of its calls to `addIssue` changed\n                    41   ctx.addIssue(`assetIds can only be used with type ${SharedLinkType.Individual}`);\n      same        2 checks\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

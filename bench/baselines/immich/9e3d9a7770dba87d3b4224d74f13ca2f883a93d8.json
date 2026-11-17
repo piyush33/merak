@@ -1,0 +1,6 @@
+{
+ "ops": [
+  "{\"affects\": [\"POST /oauth/callback\"], \"before\": \"fetch()…headers.get(\\\"content-type\\\")\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"src/repositories/oauth.repository.ts::OAuthRepository.getProfilePicture\"}"
+ ],
+ "view": "## Behaviour change · 9e3d9a7770dba87d3b4224d74f13ca2f883a93d8~1..9e3d9a7770dba87d3b4224d74f13ca2f883a93d8\n\n### `POST /oauth/callback` · ~ changed\n\n`OAuthRepository.getProfilePicture`: otherwise: returns something else.\n\n    touches     calls GET (dynamic)\n\n    OAuthRepository.getProfilePicture · changed · src/repositories/oauth.repository.ts:132\n      ~ OUTPUT    otherwise: returns something else\n                  was  {…}\n                  now  response.arrayBuffer()\n                   138   return response.arrayBuffer();\n      same        1 check\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

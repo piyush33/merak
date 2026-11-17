@@ -160,6 +160,22 @@ fn merge(ps: Vec<Pred>, is_or: bool) -> Pred {
                 v2.extend(v1.iter().cloned());
                 true
             }
+            // `f ∈ A ∨ f ∉ B` is `f ∉ B∖A`; `f ∉ A ∨ f ∉ B` is `f ∉ A∩B`.
+            (Pred::In { field: f1, values: v1 }, Pred::NotIn { field: f2, values: v2 }) if is_or && f1 == f2 && !v2.is_subset(v1) => {
+                v2.retain(|v| !v1.contains(v));
+                true
+            }
+            (Pred::NotIn { field: f1, values: v1 }, q @ Pred::In { .. }) if is_or && q.field() == Some(f1.as_str()) && matches!(q, Pred::In { .. }) && !q_covers(q, v1) => {
+                let Pred::In { values: v2, .. } = &*q else { unreachable!() };
+                let kept: BTreeSet<String> = v1.difference(v2).cloned().collect();
+                *q = Pred::NotIn { field: f1.clone(), values: kept };
+                true
+            }
+            (Pred::NotIn { field: f1, values: v1 }, Pred::NotIn { field: f2, values: v2 }) if is_or && f1 == f2 && !v1.is_disjoint(v2) => {
+                let inter: BTreeSet<String> = v1.intersection(v2).cloned().collect();
+                *v2 = inter;
+                true
+            }
             (Pred::In { field: f1, values: v1 }, Pred::In { field: f2, values: v2 }) if !is_or && f1 == f2 => {
                 let inter: BTreeSet<String> = v1.intersection(v2).cloned().collect();
                 *v2 = inter;
@@ -192,6 +208,11 @@ fn merge(ps: Vec<Pred>, is_or: bool) -> Pred {
     } else {
         Pred::And(out)
     }
+}
+
+/// Whether `q`'s values include all of `v` (merging would leave an empty, always-true set).
+fn q_covers(q: &Pred, v: &BTreeSet<String>) -> bool {
+    matches!(q, Pred::In { values, .. } if v.is_subset(values))
 }
 
 #[cfg(test)]

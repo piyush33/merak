@@ -1,0 +1,6 @@
+{
+ "ops": [
+  "{\"affects\": [\"POST /auth/change-password\"], \"after\": \"UserRepository.update(_, {password, shouldChangePassword=\\\"false\\\"})\", \"before\": \"UserRepository.update(_, {password})\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"src/services/auth.service.ts::AuthService.changePassword\"}"
+ ],
+ "view": "## Behaviour change · db6a5b0d567f5ab7e91ae479e3bbc9b88566035b~1..db6a5b0d567f5ab7e91ae479e3bbc9b88566035b\n\n### `POST /auth/change-password` · ? not modelled\n\n    touches     writes user · reads user\n\n    AuthService.changePassword · changed · src/services/auth.service.ts:128\n      ? CALLS     the arguments or conditions of its calls to `UserRepository.update` changed\n                   138   const updatedUser = await this.userRepository.update(user.id, {\n      same        1 output case · 1 check · 1 constant\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

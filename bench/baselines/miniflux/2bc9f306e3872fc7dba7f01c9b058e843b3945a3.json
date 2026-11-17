@@ -1,0 +1,8 @@
+{
+ "ops": [
+  "{\"after\": \"HTMLBadRequest(_, _, _); errors.New(\\\"invalid or missing CSRF\\\")\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"internal/ui::csrfMiddleware.validate\"}",
+  "{\"after\": \"session(request.WebSession) ∉ {null}\", \"confidence\": 1.0, \"kind\": \"GUARD_ADDED\", \"layer\": \"behaviour\", \"origin\": \"static\", \"subject\": \"internal/ui::csrfMiddleware.validate\"}",
+  "{\"after\": \"when session(request.WebSession) ∈ {null}: false\", \"confidence\": 1.0, \"kind\": \"OUTPUT_CHANGED\", \"layer\": \"behaviour\", \"origin\": \"static\", \"subject\": \"internal/ui::csrfMiddleware.validate\"}"
+ ],
+ "view": "## Behaviour change · 2bc9f306e3872fc7dba7f01c9b058e843b3945a3~1..2bc9f306e3872fc7dba7f01c9b058e843b3945a3\n\n### `internal/ui/csrf_middleware.go` · ~ changed\n\n    csrfMiddleware.validate · changed · internal/ui/csrf_middleware.go:41\n      + OUTPUT    new output case: returns false when session(request.WebSession) is null\n                    45   return false\n      same        2 output cases · 3 writes\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

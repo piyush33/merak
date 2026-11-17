@@ -1,0 +1,8 @@
+{
+ "ops": [
+  "{\"after\": \"LoggingRepository.error(\\\"Error in OAuth discovery\\\", _)\", \"before\": \"LoggingRepository.error(_, _, _)\", \"confidence\": 1.0, \"kind\": \"LOGGING_CHANGED\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"src/repositories/oauth.repository.ts::OAuthRepository.getClient\"}",
+  "{\"after\": \"LoggingRepository.error(\\\"OAuth login failed\\\", _)\", \"before\": \"LoggingRepository.error(_); LoggingRepository.error(_)\", \"confidence\": 1.0, \"kind\": \"LOGGING_CHANGED\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"src/repositories/oauth.repository.ts::OAuthRepository.getProfileAndOAuthSid\"}",
+  "{\"after\": \"LoggingRepository.warn(_, _)\", \"before\": \"LoggingRepository.warn(_)\", \"confidence\": 1.0, \"kind\": \"LOGGING_CHANGED\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"src/repositories/machine-learning.repository.ts::MachineLearningRepository.predict\"}"
+ ],
+ "view": "## Behaviour change · fbd5dc2c618c986c09da63adb31b4c5382eaf5ce~1..fbd5dc2c618c986c09da63adb31b4c5382eaf5ce\n\n**No behaviour change.** Only logging changed.\n\nAlso: logging changed in `MachineLearningRepository.predict`, `OAuthRepository.getClient`, `OAuthRepository.getProfileAndOAuthSid`.\n"
+}

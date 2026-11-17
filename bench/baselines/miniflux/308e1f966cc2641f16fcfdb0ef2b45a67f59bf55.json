@@ -1,0 +1,7 @@
+{
+ "ops": [
+  "{\"after\": \"<fn validator>\", \"confidence\": 0.5, \"kind\": \"UNCLASSIFIED_CHANGE\", \"layer\": \"behaviour\", \"note\": \"calls changed in a way the behaviour model does not classify; review manually\", \"origin\": \"static\", \"subject\": \"internal/config::NewConfigOptions\"}",
+  "{\"confidence\": 1.0, \"kind\": \"ENTITY_ADDED\", \"layer\": \"structural\", \"origin\": \"static\", \"subject\": \"internal/config::NewConfigOptions.validator#29\"}"
+ ],
+ "view": "## Behaviour change · 308e1f966cc2641f16fcfdb0ef2b45a67f59bf55~1..308e1f966cc2641f16fcfdb0ef2b45a67f59bf55\n\n### `internal/config/options.go` · ? not modelled\n\n    NewConfigOptions · changed · internal/config/options.go:63\n      ? CALLS     it now also calls `validator callback`\n                    64   return &configOptions{\n      same        1 output case · 4 checks · 4 writes · 12 constants\n\n`▲` wider · `▼` narrower · `+` added · `-` removed · `~` changed · `◆` renamed · `!` rule broken · `?` not modelled: check by hand\n"
+}

@@ -655,3 +655,27 @@ fn a_method_condition_keeps_its_receiver() {
     let g: Vec<String> = m.entities[".::S.Refresh"].guards.iter().map(|g| g.requires.render()).collect();
     assert!(g.iter().any(|t| t.contains("searches.through.Equal(started)") && !t.contains('#')), "{g:?}");
 }
+
+/// A check inside a loop that rejects the request (`return fmt.Errorf(…)`) is a check of
+/// the function, wherever it sits; a loop that returns what it found is a search, not a check.
+#[test]
+fn a_check_in_a_loop_is_a_guard_but_a_search_is_not() {
+    let src = |check: &str| {
+        format!(
+            "package app\n\nimport \"fmt\"\n\ntype Line struct{{ Qty int }}\n\nfunc Receive(lines []Line) error {{\n\tfor _, li := range lines {{\n{check}\t\tfmt.Println(li.Qty)\n\t}}\n\treturn nil\n}}\n"
+        )
+    };
+    let before = files(&[("app.go", &src(""))]);
+    let after = files(&[("app.go", &src("\t\tif li.Qty < 0 {\n\t\t\treturn fmt.Errorf(\"negative quantity\")\n\t\t}\n"))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let guard = t.ops.iter().find(|o| o.kind == "GUARD_ADDED").unwrap_or_else(|| panic!("{:#?}", t.ops));
+    assert!(guard.subject.ends_with("Receive") && guard.after.as_deref() == Some("0 <= Line.Qty"), "{guard:#?}");
+
+    let search = |found: &str| {
+        format!("package app\n\nfunc Contains(xs []string, x string) bool {{\n\tfor _, v := range xs {{\n{found}\t\t_ = v\n\t}}\n\treturn false\n}}\n")
+    };
+    let before = files(&[("app.go", &search(""))]);
+    let after = files(&[("app.go", &search("\t\tif v == x {\n\t\t\treturn true\n\t\t}\n"))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    assert!(!t.ops.iter().any(|o| o.kind.starts_with("GUARD")), "{:#?}", t.ops);
+}
