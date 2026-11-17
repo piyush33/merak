@@ -938,3 +938,26 @@ fn a_return_in_a_switch_case_says_which_case() {
     let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
     assert!(text.contains("when t = invite"), "{text}");
 }
+
+/// A returned local is compared by its value: `const s = "Join"; return s` changing to
+/// "Join us" is an output change, not a pure refactor.
+#[test]
+fn a_returned_local_is_compared_by_its_value() {
+    let src = |v: &str| format!("export function label(): string {{\n  const s = \"{v}\";\n  return s;\n}}\n");
+    let before: merak_cli::source::Files = [("src/a.ts".to_string(), src("Join"))].into_iter().collect();
+    let after: merak_cli::source::Files = [("src/a.ts".to_string(), src("Join us"))].into_iter().collect();
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let kinds: Vec<&str> = t.ops.iter().map(|o| o.kind.as_str()).collect();
+    assert!(kinds.contains(&"OUTPUT_CHANGED") && !kinds.contains(&"PURE_REFACTOR"), "{kinds:?}");
+}
+
+/// A local a closure changes (`n++` in a callback) has no single value: the function does
+/// not "return 0".
+#[test]
+fn a_local_changed_by_a_closure_has_no_single_value() {
+    let src = "export function count(xs: number[]): number {\n  let n = 0;\n  xs.forEach(() => {\n    n++;\n  });\n  return n;\n}\n";
+    let files: merak_cli::source::Files = [("src/a.ts".to_string(), src.to_string())].into_iter().collect();
+    let m = merak_cli::model(&files).unwrap();
+    let outputs: Vec<&str> = m.entities["src/a.ts::count"].outputs.iter().map(|o| o.value.as_str()).collect();
+    assert_eq!(outputs, ["n"]);
+}

@@ -336,7 +336,8 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
         request_depth: 0,
         spawn_depth: 0,
         defs: HashMap::new(),
-        def_exprs: HashMap::new(),
+        def_vals: HashMap::new(),
+        closure_writes: closure_writes(ix, &f.body),
         made_by: HashMap::new(),
         ctes: scope_ctes(ix, f),
         records: BTreeSet::new(),
@@ -441,8 +442,12 @@ struct Walker<'a, 'p> {
     spawn_depth: u32,
     /// How each local was computed so far, constants by value: `0.25 * log1p(breadth); +6 when …`.
     defs: HashMap<String, String>,
-    /// The same, as expressions (other locals substituted), where a local has one value.
-    def_exprs: HashMap<String, Expr>,
+    /// The value each assignment gives its local (other locals substituted), by the
+    /// statement node that makes it; read through reaching definitions (`value_of`).
+    def_vals: HashMap<(usize, String), Expr>,
+    /// Locals a nested closure assigns (`n++` in a transaction callback): their value
+    /// depends on when the closure runs, so none is known here.
+    closure_writes: HashSet<String>,
     /// Program functions whose results flow into each local, on any path: `predicate` ← `scopePredicate`.
     made_by: HashMap<String, BTreeSet<String>>,
     /// CTE names in scope: reading one is not a table read.
@@ -526,9 +531,7 @@ impl Walker<'_, '_> {
                     let text = render(&value);
                     // Long definitions are not substituted further: formulas stay readable.
                     if text.chars().count() <= 300 {
-                        self.def_exprs.insert(name.clone(), value);
-                    } else {
-                        self.def_exprs.remove(name);
+                        self.def_vals.insert((self.cur, name.clone()), value);
                     }
                     self.defs.insert(name.clone(), text);
                     self.expr(init, loc);
@@ -604,8 +607,7 @@ impl Walker<'_, '_> {
                     // `<SortIcon/>` where `const SortIcon = SORT_ICONS[sort]`: the element it is.
                     for r in renders.iter_mut() {
                         let Some(tag) = r.content.strip_prefix('<').and_then(|t| t.strip_suffix('>')).map(str::to_string) else { continue };
-                        if let Some(def) = self.def_exprs.get(&tag).filter(|d| matches!(d, Expr::Index { .. } | Expr::Member { .. } | Expr::Conditional { .. }))
-                        {
+                        if let Some(def) = self.value_of(&tag).filter(|d| matches!(d, Expr::Index { .. } | Expr::Member { .. } | Expr::Conditional { .. })) {
                             let real = render(def);
                             r.content = format!("<{real}>");
                             if let Some(rest) = r.style.strip_prefix(tag.as_str()) {
@@ -633,6 +635,8 @@ impl Walker<'_, '_> {
                                 .collect();
                             (format!("[{}]", parts.join(", ")), true)
                         }
+                        // `const s = "Join"; return s`: what is returned, when it is a literal.
+                        Expr::Ident(x) if self.value_of(x).is_some_and(is_literal) => (render(self.value_of(x).unwrap_or(e)), false),
                         e => (render(e), false),
                     };
                     self.e.outputs.push(Output { when: self.conditions(false), value, renders, loc: loc.clone(), formula });
@@ -688,6 +692,11 @@ impl Walker<'_, '_> {
             Expr::Assign { target, value, loc: aloc } => {
                 // `s += x` / `s -= x` / `s = x` on a local: the formula grows, with its condition.
                 if let Expr::Ident(x) = target.as_ref() {
+                    // The value this assignment gives `x`, read later through reaching definitions.
+                    let assigned = self.inline_consts(value);
+                    if render(&assigned).chars().count() <= 300 {
+                        self.def_vals.insert((self.cur, x.clone()), assigned);
+                    }
                     let m = self.makers(value);
                     self.made_by.entry(x.clone()).or_default().extend(m);
                     let when = self.conditions(false);
@@ -698,19 +707,11 @@ impl Walker<'_, '_> {
                             Some(format!("{sign}{}{when}", render(&self.inline_consts(right))))
                         }
                         v if when.is_empty() => {
-                            let value = self.inline_consts(v);
-                            let text = render(&value);
-                            if text.chars().count() <= 300 {
-                                self.def_exprs.insert(x.clone(), value);
-                            } else {
-                                self.def_exprs.remove(x);
-                            }
+                            let text = render(&self.inline_consts(v));
                             self.defs.insert(x.clone(), text);
                             None
                         }
                         v => {
-                            // Set on some paths only: no single value to substitute.
-                            self.def_exprs.remove(x);
                             Some(format!("= {}{when}", render(&self.inline_consts(v))))
                         }
                     };
@@ -987,6 +988,19 @@ impl Walker<'_, '_> {
     /// The condition node `n` runs under, from control dependence: for each branch edge
     /// it depends on, the branch's own condition and the edge's (an `if` test or its
     /// negation). `guards` keeps only the function's guard edges, otherwise only the rest.
+    /// The value local `name` holds at the statement being walked: the value of the one
+    /// assignment that reaches it. `None` when several do (it depends on the path), when
+    /// none does (a parameter or outer name), or when the value was too long to keep.
+    fn value_of(&self, name: &str) -> Option<&Expr> {
+        if self.closure_writes.contains(name) {
+            return None;
+        }
+        match self.cd.reaching(self.cur, name).as_slice() {
+            [d] => self.def_vals.get(&(*d, name.to_string())),
+            _ => None,
+        }
+    }
+
     /// A check anywhere in the body whose failing side ends the function (`if err != nil
     /// { return err }` in a loop or a nested block) is a guard of the function: it
     /// requires `¬(context ∧ failing condition)`, the context being the alternatives the
@@ -1559,7 +1573,7 @@ impl Walker<'_, '_> {
                 None => e.clone(),
             },
             // A local by what it was built from (already substituted when it was built).
-            Expr::Ident(n) if self.def_exprs.contains_key(n) && !matches!(self.def_exprs[n], Expr::Ident(_)) => self.def_exprs[n].clone(),
+            Expr::Ident(n) if self.value_of(n).is_some_and(|v| !matches!(v, Expr::Ident(_))) => self.value_of(n).cloned().unwrap_or_else(|| e.clone()),
             Expr::Template { quasis, exprs } => Expr::Template { quasis: quasis.clone(), exprs: exprs.iter().map(|x| self.inline_consts(x)).collect() },
             Expr::Binary { op, left, right } => Expr::Binary { op: *op, left: b(left), right: b(right) },
             Expr::Logical { op, left, right } => Expr::Logical { op: *op, left: b(left), right: b(right) },
@@ -1889,7 +1903,7 @@ impl CallSite for Site<'_, '_, '_> {
             _ => {
                 let arg = self.call.args.get(i)?;
                 let built = match arg {
-                    Expr::Ident(n) => self.walker.def_exprs.get(n)?,
+                    Expr::Ident(n) => self.walker.value_of(n)?,
                     other => other,
                 };
                 match built {
@@ -2098,6 +2112,106 @@ fn any(ps: Vec<Pred>) -> Pred {
     let mut out = common;
     out.push(Pred::Or(rest));
     all(out)
+}
+
+/// Every expression in a body, nested ones included (not into closures, which are
+/// functions of their own).
+fn each_expr<'e>(stmts: &'e [Stmt], f: &mut dyn FnMut(&'e Expr)) {
+    fn expr<'e>(e: &'e Expr, f: &mut dyn FnMut(&'e Expr)) {
+        f(e);
+        match e {
+            Expr::Member { object, .. } => expr(object, f),
+            Expr::Index { object, index } => {
+                expr(object, f);
+                expr(index, f);
+            }
+            Expr::Call(c) => {
+                expr(&c.callee, f);
+                c.args.iter().for_each(|a| expr(a, f));
+            }
+            Expr::New { callee, args, .. } => {
+                expr(callee, f);
+                args.iter().for_each(|a| expr(a, f));
+            }
+            Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                expr(left, f);
+                expr(right, f);
+            }
+            Expr::Not(x) | Expr::Await(x) | Expr::Spawn(x) => expr(x, f),
+            Expr::Conditional { test, then, otherwise } => {
+                expr(test, f);
+                expr(then, f);
+                expr(otherwise, f);
+            }
+            Expr::Template { exprs, .. } | Expr::Array(exprs) => exprs.iter().for_each(|x| expr(x, f)),
+            Expr::Object(props) => props.iter().for_each(|(_, v)| expr(v, f)),
+            Expr::Assign { target, value, .. } => {
+                expr(target, f);
+                expr(value, f);
+            }
+            Expr::Jsx(j) => {
+                j.attrs.iter().for_each(|(_, v)| expr(v, f));
+                j.children.iter().for_each(|c| expr(c, f));
+            }
+            _ => {}
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Expr(e, _) | Stmt::Throw(e, _) => expr(e, f),
+            Stmt::Return(e, _) => e.iter().for_each(|e| expr(e, f)),
+            Stmt::Let { init, .. } => init.iter().for_each(|e| expr(e, f)),
+            Stmt::If { test, then, otherwise, .. } => {
+                expr(test, f);
+                each_expr(then, f);
+                each_expr(otherwise, f);
+            }
+            Stmt::Loop { iter, body, .. } => {
+                iter.iter().for_each(|e| expr(e, f));
+                each_expr(body, f);
+            }
+            Stmt::Try { body, handler, finalizer, .. } => {
+                each_expr(body, f);
+                each_expr(handler, f);
+                each_expr(finalizer, f);
+            }
+            Stmt::Block(b) => each_expr(b, f),
+            Stmt::Jump(_) => {}
+        }
+    }
+}
+
+/// The names assigned inside the closures of a body, at any depth.
+fn closure_writes(ix: &Index, body: &[Stmt]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut todo: Vec<String> = vec![];
+    each_expr(body, &mut |e| {
+        if let Expr::Closure(id) = e {
+            todo.push(id.clone());
+        }
+    });
+    let mut seen = HashSet::new();
+    while let Some(id) = todo.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let Some(f) = ix.function(&id) else { continue };
+        each_expr(&f.body, &mut |e| match e {
+            Expr::Assign { target, .. } => {
+                if let Expr::Ident(x) = target.as_ref() {
+                    out.insert(x.clone());
+                }
+            }
+            Expr::Closure(inner) => todo.push(inner.clone()),
+            _ => {}
+        });
+    }
+    out
+}
+
+/// A value a reader sees as such: a literal or an element.
+fn is_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Str(_) | Expr::Num(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined | Expr::Jsx(_))
 }
 
 /// Whether a statement list always returns or throws (see `cfg`).

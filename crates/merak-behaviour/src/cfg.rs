@@ -19,7 +19,7 @@
 //! other branch is a real alternative, and the statements on each side run *when*
 //! its condition holds.
 
-use merak_ir::Stmt;
+use merak_ir::{Expr, Stmt};
 use std::collections::{HashMap, HashSet};
 
 /// Which way out of a branch.
@@ -46,6 +46,21 @@ pub struct ControlDeps {
     in_loop: HashSet<usize>,
     /// `if` nodes after which the function always ends (`if (c) { return a }; return b`).
     rest_ends: HashSet<usize>,
+    /// Reaching definitions: per node, the assignments of each local that can reach its
+    /// entry, by the node that makes them.
+    reaching: std::cell::OnceCell<Reaching>,
+    succ: Vec<Vec<(usize, Arm)>>,
+    defines: Vec<Vec<String>>,
+}
+
+/// Reaching definitions as bitsets over numbered assignments.
+struct Reaching {
+    /// Assignment number → (node, local).
+    defs: Vec<(usize, String)>,
+    /// Local → the assignments of it.
+    of_var: HashMap<String, Vec<usize>>,
+    /// Per node: the assignments reaching its entry.
+    ins: Vec<Vec<u64>>,
 }
 
 impl ControlDeps {
@@ -56,6 +71,7 @@ impl ControlDeps {
             guard_edges: HashSet::new(),
             in_loop: HashSet::new(),
             rest_ends: HashSet::new(),
+            defines: vec![vec![], vec![]],
             loops: 0,
             catch: vec![],
         };
@@ -63,7 +79,24 @@ impl ControlDeps {
         // Augmented entry: the whole body is control dependent on entering the function.
         b.succ[ENTRY] = vec![(first, Arm::Plain), (EXIT, Arm::Plain)];
         let deps = control_deps(&b.succ);
-        ControlDeps { node_of: b.node_of, deps, guard_edges: b.guard_edges, in_loop: b.in_loop, rest_ends: b.rest_ends }
+        ControlDeps {
+            node_of: b.node_of,
+            deps,
+            guard_edges: b.guard_edges,
+            in_loop: b.in_loop,
+            rest_ends: b.rest_ends,
+            reaching: std::cell::OnceCell::new(),
+            succ: b.succ,
+            defines: b.defines,
+        }
+    }
+
+    /// The nodes whose assignment of `var` can reach node `n` (empty: none in this body,
+    /// so a parameter or an outer name).
+    pub fn reaching(&self, n: usize, var: &str) -> Vec<usize> {
+        let r = self.reaching.get_or_init(|| reaching_defs(&self.succ, &self.defines));
+        let (Some(ins), Some(ds)) = (r.ins.get(n), r.of_var.get(var)) else { return vec![] };
+        ds.iter().filter(|&&i| ins[i / 64] >> (i % 64) & 1 == 1).map(|&i| r.defs[i].0).collect()
     }
 
     pub fn node(&self, s: &Stmt) -> Option<usize> {
@@ -97,6 +130,8 @@ struct Builder {
     guard_edges: HashSet<(usize, Arm)>,
     in_loop: HashSet<usize>,
     rest_ends: HashSet<usize>,
+    /// Per node: the locals it assigns.
+    defines: Vec<Vec<String>>,
     loops: u32,
     /// Where a `throw` goes: the innermost enclosing handler.
     catch: Vec<usize>,
@@ -117,6 +152,7 @@ impl Builder {
     fn alloc(&mut self, s: &Stmt) -> usize {
         let n = self.succ.len();
         self.succ.push(vec![]);
+        self.defines.push(assigned(s));
         self.node_of.insert(s as *const Stmt, n);
         if self.loops > 0 {
             self.in_loop.insert(n);
@@ -195,6 +231,145 @@ impl Builder {
         self.succ[n] = succ;
         n
     }
+}
+
+/// The locals a statement assigns itself (not in nested statements): `let x`, `x = …`,
+/// a loop's binding, and assignments nested in its expressions (`if ((m = re.exec(s)))`).
+fn assigned(s: &Stmt) -> Vec<String> {
+    fn walk(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Assign { target, value, .. } => {
+                if let Expr::Ident(x) = target.as_ref() {
+                    out.push(x.clone());
+                }
+                walk(value, out);
+            }
+            Expr::Member { object, .. } => walk(object, out),
+            Expr::Index { object, index } => {
+                walk(object, out);
+                walk(index, out);
+            }
+            Expr::Call(c) => {
+                walk(&c.callee, out);
+                c.args.iter().for_each(|a| walk(a, out));
+            }
+            Expr::New { callee, args, .. } => {
+                walk(callee, out);
+                args.iter().for_each(|a| walk(a, out));
+            }
+            Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            Expr::Not(x) | Expr::Await(x) | Expr::Spawn(x) => walk(x, out),
+            Expr::Conditional { test, then, otherwise } => {
+                walk(test, out);
+                walk(then, out);
+                walk(otherwise, out);
+            }
+            Expr::Template { exprs, .. } | Expr::Array(exprs) => exprs.iter().for_each(|x| walk(x, out)),
+            Expr::Object(props) => props.iter().for_each(|(_, v)| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    match s {
+        Stmt::Let { name, init, .. } => {
+            out.push(name.clone());
+            if let Some(i) = init {
+                walk(i, &mut out);
+            }
+        }
+        Stmt::Expr(e, _) | Stmt::Throw(e, _) | Stmt::If { test: e, .. } => walk(e, &mut out),
+        Stmt::Return(Some(e), _) => walk(e, &mut out),
+        Stmt::Loop { binding, iter, .. } => {
+            if let Some(i) = iter {
+                walk(i, &mut out);
+            }
+            out.extend(binding.clone());
+        }
+        _ => {}
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Reaching definitions (forward, may): a node's assignment of a local reaches every node
+/// it can flow to without passing another assignment of the same local.
+fn reaching_defs(succ: &[Vec<(usize, Arm)>], defines: &[Vec<String>]) -> Reaching {
+    let n = succ.len();
+    let mut defs: Vec<(usize, String)> = vec![];
+    let mut of_var: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut gen: Vec<Vec<usize>> = vec![vec![]; n];
+    for (v, names) in defines.iter().enumerate() {
+        for x in names {
+            of_var.entry(x.clone()).or_default().push(defs.len());
+            gen[v].push(defs.len());
+            defs.push((v, x.clone()));
+        }
+    }
+    let words = defs.len().div_ceil(64).max(1);
+    // Per node: the assignments it kills (every assignment of the locals it assigns).
+    let kill: Vec<Vec<u64>> = (0..n)
+        .map(|v| {
+            let mut k = vec![0u64; words];
+            for x in &defines[v] {
+                for &i in &of_var[x] {
+                    k[i / 64] |= 1 << (i % 64);
+                }
+            }
+            k
+        })
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![vec![]; n];
+    for (a, out) in succ.iter().enumerate() {
+        for &(b, _) in out {
+            preds[b].push(a);
+        }
+    }
+    // Reverse postorder from the entry, for fast convergence.
+    let mut order = vec![];
+    let mut seen = vec![false; n];
+    let mut stack = vec![(ENTRY, 0usize)];
+    seen[ENTRY] = true;
+    while let Some((v, i)) = stack.pop() {
+        if i < succ[v].len() {
+            stack.push((v, i + 1));
+            let w = succ[v][i].0;
+            if !seen[w] {
+                seen[w] = true;
+                stack.push((w, 0));
+            }
+        } else {
+            order.push(v);
+        }
+    }
+    order.reverse();
+    let mut ins = vec![vec![0u64; words]; n];
+    let mut outs = vec![vec![0u64; words]; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &v in &order {
+            let mut inn = vec![0u64; words];
+            for &p in &preds[v] {
+                for (w, o) in inn.iter_mut().zip(&outs[p]) {
+                    *w |= o;
+                }
+            }
+            let mut out: Vec<u64> = inn.iter().zip(&kill[v]).map(|(i, k)| i & !k).collect();
+            for &i in &gen[v] {
+                out[i / 64] |= 1 << (i % 64);
+            }
+            if out != outs[v] {
+                outs[v] = out;
+                changed = true;
+            }
+            ins[v] = inn;
+        }
+    }
+    Reaching { defs, of_var, ins }
 }
 
 /// Immediate post-dominators (Cooper, Harvey, Kennedy: "A Simple, Fast Dominance
@@ -397,6 +572,35 @@ mod tests {
         assert_eq!(deps_of(&cd, &lb[1]), vec![(skip, Arm::Else)]);
         // After the loop: always runs.
         assert_eq!(deps_of(&cd, &body[1]), vec![(ENTRY, Arm::Plain)]);
+    }
+
+    #[test]
+    fn reaching_definitions_follow_branches_and_loops() {
+        // let s = a; if (c) { s = b }; use(s); for (x of xs) { s = x }; use(s)
+        let assign =
+            |v: &str| Stmt::Expr(Expr::Assign { target: Box::new(Expr::Ident("s".into())), value: Box::new(Expr::Ident(v.into())), loc: loc() }, loc());
+        let body = vec![
+            Stmt::Let { name: "s".into(), ty: None, init: Some(Expr::Ident("a".into())), loc: loc() },
+            iff("c", vec![assign("b")], vec![]),
+            call("use1"),
+            Stmt::Loop { binding: Some("x".into()), iter: None, body: vec![assign("x")], loc: loc() },
+            call("use2"),
+        ];
+        let cd = ControlDeps::build(&body);
+        let n = |s: &Stmt| cd.node(s).unwrap();
+        let Stmt::If { then, .. } = &body[1] else { unreachable!() };
+        let Stmt::Loop { body: lb, .. } = &body[3] else { unreachable!() };
+        let mut at_use1 = cd.reaching(n(&body[2]), "s").to_vec();
+        at_use1.sort();
+        let mut want1 = vec![n(&body[0]), n(&then[0])];
+        want1.sort();
+        assert_eq!(at_use1, want1);
+        let mut at_use2 = cd.reaching(n(&body[4]), "s").to_vec();
+        at_use2.sort();
+        let mut want2 = vec![n(&body[0]), n(&then[0]), n(&lb[0])];
+        want2.sort();
+        assert_eq!(at_use2, want2);
+        assert!(cd.reaching(n(&body[0]), "s").is_empty());
     }
 
     #[test]

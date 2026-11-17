@@ -5,7 +5,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::operator::{BinaryOperator, LogicalOperator, UnaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator};
 use std::collections::BTreeMap;
 
 pub fn is_supported(path: &str) -> bool {
@@ -705,7 +705,36 @@ impl<'s> Lowerer<'s> {
                     },
                     _ => ir::Expr::Opaque(self.text(a.left.span())),
                 };
-                ir::Expr::Assign { target: Box::new(target), value: Box::new(self.expr(&a.right)), loc: self.loc(a.span) }
+                // `s += x` is `s = s + x`: the value assigned, not only the operand.
+                let right = self.expr(&a.right);
+                let bin = |op: ir::BinOp| ir::Expr::Binary { op, left: Box::new(target.clone()), right: Box::new(right.clone()) };
+                let logic = |op: ir::LogicOp| ir::Expr::Logical { op, left: Box::new(target.clone()), right: Box::new(right.clone()) };
+                let value = match a.operator {
+                    AssignmentOperator::Assign => right.clone(),
+                    AssignmentOperator::Addition => bin(ir::BinOp::Add),
+                    AssignmentOperator::Subtraction => bin(ir::BinOp::Sub),
+                    AssignmentOperator::Multiplication => bin(ir::BinOp::Mul),
+                    AssignmentOperator::Division => bin(ir::BinOp::Div),
+                    AssignmentOperator::Remainder => bin(ir::BinOp::Rem),
+                    AssignmentOperator::LogicalOr => logic(ir::LogicOp::Or),
+                    AssignmentOperator::LogicalAnd => logic(ir::LogicOp::And),
+                    AssignmentOperator::LogicalNullish => logic(ir::LogicOp::Coalesce),
+                    _ => bin(ir::BinOp::Other),
+                };
+                ir::Expr::Assign { target: Box::new(target), value: Box::new(value), loc: self.loc(a.span) }
+            }
+            // `n++` is `n = n + 1`, as in Go.
+            Expression::UpdateExpression(u) => {
+                let target = match &u.argument {
+                    SimpleAssignmentTarget::AssignmentTargetIdentifier(i) => ir::Expr::Ident(i.name.as_str().to_string()),
+                    SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                        ir::Expr::Member { object: Box::new(self.expr(&m.object)), property: m.property.name.as_str().to_string() }
+                    }
+                    _ => return ir::Expr::Opaque(self.text(u.span)),
+                };
+                let op = if u.operator == UpdateOperator::Increment { ir::BinOp::Add } else { ir::BinOp::Sub };
+                let value = ir::Expr::Binary { op, left: Box::new(target.clone()), right: Box::new(ir::Expr::Num(1.0)) };
+                ir::Expr::Assign { target: Box::new(target), value: Box::new(value), loc: self.loc(u.span) }
             }
             Expression::ArrowFunctionExpression(a) => {
                 let q = self.closure_name(None);
