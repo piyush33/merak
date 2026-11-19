@@ -1025,3 +1025,19 @@ fn a_helper_is_read_in_its_callers_names() {
     };
     only_new_helper(&call_only(before), &call_only(after));
 }
+
+/// `return pick(p.a)` with `pick` new: its cases, and its early returns, are the caller's,
+/// in the caller's names. Moving them there is a refactor; changing one is still a change.
+#[test]
+fn a_returned_helper_answers_for_its_caller() {
+    let files = |s: &str| -> merak_cli::source::Files { [("src/a.ts".to_string(), s.to_string())].into_iter().collect() };
+    let before = "export function label(p: { a?: string }) {\n  if (p.a === \"x\") {\n    return \"Ex\";\n  }\n  return \"Other\";\n}\n";
+    let after = |other: &str| {
+        format!("export function label(p: {{ a?: string }}) {{\n  return pick(p.a);\n}}\nfunction pick(v?: string) {{\n  if (v === \"x\") {{\n    return \"Ex\";\n  }}\n  return \"{other}\";\n}}\n")
+    };
+    let t = merak_cli::diff(&files(before), &files(&after("Other"))).unwrap();
+    assert!(t.ops.iter().all(|o| matches!(o.kind.as_str(), "ENTITY_ADDED" | "PURE_REFACTOR")), "{:#?}", t.ops);
+    let t = merak_cli::diff(&files(before), &files(&after("Others"))).unwrap();
+    let changed = t.ops.iter().find(|o| o.kind == "OUTPUT_CHANGED").unwrap_or_else(|| panic!("{:#?}", t.ops));
+    assert!(changed.after.as_deref().is_some_and(|a| a.contains("\"Others\"")), "{changed:#?}");
+}

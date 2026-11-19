@@ -555,7 +555,7 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
 
         query_filters(&mut out, idb, &fa, &fb);
         access_change(&mut out, idb, &sa.access, &sb.access);
-        output_change(&mut out, idb, ea, eb);
+        output_change(&mut out, idb, (a, ea, &|t| m.forward.contains_key(t)), (b, eb, &|t| m.backward.contains_key(t)));
         consts_change(&mut out, idb, ea, eb);
         skips_change(&mut out, idb, (a, ida), (b, idb), &|t| m.forward.contains_key(t), &|t| m.backward.contains_key(t));
         filters_to_memory(&mut out.ops[start..], b, idb, &|t| m.backward.contains_key(t));
@@ -981,13 +981,56 @@ fn same_filters(a: &[&QueryFilter], b: &[&QueryFilter]) -> bool {
     sorted(a) == sorted(b)
 }
 
+/// The call a `return` hands back, when it returns the result of a function that exists on
+/// this side only (`return pick(p.a)` with `pick` new): that function's cases are this one's.
+fn returned_helper<'x>(
+    model: &'x Model,
+    e: &'x merak_behaviour::Entity,
+    o: &merak_behaviour::Output,
+    matched: &dyn Fn(&str) -> bool,
+) -> Option<(&'x merak_behaviour::Entity, &'x merak_behaviour::CallFact)> {
+    e.calls.iter().find_map(|c| {
+        let t = model.entities.get(&c.target).filter(|t| t.parent.is_none())?;
+        let calls_it = o.value.trim_start_matches("await ").contains(&format!("{}(", t.name.rsplit('.').next().unwrap_or(&t.name)));
+        (c.loc.file == o.loc.file && c.loc.line == o.loc.line && !matched(&c.target) && calls_it && o.value.ends_with(')')).then_some((t, c))
+    })
+}
+
+/// A function's outputs, with each `return helper(…)` of a helper on this side only replaced
+/// by the helper's own outputs in this function's names, under both conditions.
+fn inline_outputs(model: &Model, e: &merak_behaviour::Entity, matched: &dyn Fn(&str) -> bool) -> Vec<merak_behaviour::Output> {
+    fn walk(
+        model: &Model,
+        e: &merak_behaviour::Entity,
+        names: &Names,
+        outer: &[String],
+        matched: &dyn Fn(&str) -> bool,
+        depth: u32,
+        out: &mut Vec<merak_behaviour::Output>,
+    ) {
+        for o in &e.outputs {
+            let mut when: Vec<String> = outer.iter().cloned().chain(o.when.iter().map(|w| renamed(w, names))).collect();
+            when.sort();
+            when.dedup();
+            match returned_helper(model, e, o, matched).filter(|_| depth < 4) {
+                Some((t, c)) => walk(model, t, &call_names(t, c, names), &when, matched, depth + 1, out),
+                None => out.push(merak_behaviour::Output { when, value: renamed(&o.value, names), ..o.clone() }),
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(model, e, &Names::new(), &[], matched, 0, &mut out);
+    out
+}
+
 /// What a function renders, or a literal it returns, changed. Other return values are left to
 /// the rest of the model: `return repo.update(x)` → `const r = …; return r` is a refactor.
-fn output_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity, eb: &merak_behaviour::Entity) {
+type Side<'x> = (&'x Model, &'x merak_behaviour::Entity, &'x dyn Fn(&str) -> bool);
+
+fn output_change(out: &mut Builder, subject: &str, (ma, ea, matched_a): Side, (mb, eb, matched_b): Side) {
     let observable = |v: &str| v.starts_with('<') || matches!(v, "null" | "undefined" | "true" | "false") || v.starts_with('"') || v.parse::<f64>().is_ok();
-    let cases = |e: &merak_behaviour::Entity| -> Vec<String> {
-        let mut v: Vec<String> = e
-            .outputs
+    let cases = |(model, e, matched): Side| -> Vec<String> {
+        let mut v: Vec<String> = inline_outputs(model, e, matched)
             .iter()
             // What a function computes (`s := 0.25 * x; +6 when …`) is observable too.
             .filter(|o| o.formula || observable(&o.value))
@@ -996,7 +1039,7 @@ fn output_change(out: &mut Builder, subject: &str, ea: &merak_behaviour::Entity,
         v.sort();
         v
     };
-    let (ca, cb) = (cases(ea), cases(eb));
+    let (ca, cb) = (cases((ma, ea, matched_a)), cases((mb, eb, matched_b)));
     if ca == cb {
         return;
     }
@@ -1451,6 +1494,16 @@ fn inline_requires(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (
             let at = Pred::And(vec![outer.clone(), path]).simplify();
             let inner_names = call_names(t, c, names);
             let inner = |s: &str| rename(s, &inner_names);
+            // A helper whose result is returned: its early returns (`if (v === x) return "Ex"`)
+            // are the caller's.
+            if e.outputs.iter().any(|o| returned_helper(model, e, o, matched).is_some_and(|(h, hc)| h.id == t.id && hc.loc == c.loc)) {
+                for g in t.guards.iter().filter(|g| g.on_fail == merak_behaviour::OnFail::Return) {
+                    if let Some(r) = g.requires.map_operands(&inner) {
+                        let r = Pred::Or(vec![at.clone().negate(), r]).simplify();
+                        out.0.push(merak_behaviour::summary::expand_guard(model, &r).1);
+                    }
+                }
+            }
             for f in &t.fails {
                 if let Some(w) = f.when.map_operands(&inner) {
                     // Predicate functions by what they test, as the caller's own guards are.
