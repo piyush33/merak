@@ -401,7 +401,24 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         let relevant = |p: &Pred| p.field().is_none_or(|f| !state_fields.contains(f));
         let ga: Vec<_> = sa.requires.iter().filter(|(_, p, _)| relevant(p)).map(|(k, p, l)| (rename_key(&m, k), p, l)).collect();
         let gb: Vec<_> = sb.requires.iter().filter(|(_, p, _)| relevant(p)).collect();
+        // What each version requires in all: its own guards, and how the helpers it calls
+        // that the other version lacks fail, in its own terms. A guard moved into such a
+        // helper, or restated, is still required.
+        let (in_a, helpers_a) = inline_requires(a, ida, &|t| m.forward.contains_key(t));
+        let (in_b, helpers_b) = inline_requires(b, idb, &|t| m.backward.contains_key(t));
+        let all_a: Vec<Pred> = sa.requires.iter().map(|(_, p, _)| p.clone()).chain(in_a).collect();
+        let all_b: Vec<Pred> = sb.requires.iter().map(|(_, p, _)| p.clone()).chain(in_b).collect();
+        // Names that hold more than one value, here or in a helper inlined above.
+        let unstable: BTreeSet<String> = [(a, ida), (b, idb)]
+            .into_iter()
+            .map(|(md, id)| (md, id.to_string()))
+            .chain(helpers_a.into_iter().map(|h| (a, h)))
+            .chain(helpers_b.into_iter().map(|h| (b, h)))
+            .filter_map(|(md, id)| md.entities.get(&id))
+            .flat_map(|e| e.reassigned.iter().cloned())
+            .collect();
         let mut consumed_b = BTreeSet::new();
+        let mut removed: Vec<(&Pred, &Loc)> = vec![];
         for (ka, pa, la) in &ga {
             if let Some((i, (_, pb, lb))) = gb.iter().enumerate().find(|(_, (kb, _, _))| kb == ka) {
                 consumed_b.insert(i);
@@ -418,11 +435,28 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
                 auth_change(&mut out, idb, pa, pb, la, lb);
                 continue;
             }
-            out.push("GUARD_REMOVED", Layer::Behaviour, idb.clone(), Some(pa.render()), None, vec![(*la).clone()], vec![]);
+            removed.push((pa, la));
         }
-        for (i, (_, pb, lb)) in gb.iter().enumerate() {
-            if !consumed_b.contains(&i) {
-                out.push("GUARD_ADDED", Layer::Behaviour, idb.clone(), None, Some(pb.render()), vec![], vec![lb.clone()]);
+        let added: Vec<(&Pred, &Loc)> = gb.iter().enumerate().filter(|(i, _)| !consumed_b.contains(i)).map(|(_, (_, p, l))| (p, l)).collect();
+        // A guard the other version still implies is not gone, nor one it already implied
+        // new (moved into a helper, split, restated, or one side of a strengthening)...
+        let gone: Vec<bool> = removed.iter().map(|(p, _)| !still_required(&all_b, p, &unstable)).collect();
+        let new: Vec<bool> = added.iter().map(|(p, _)| !still_required(&all_a, p, &unstable)).collect();
+        // ...except the looser form of a guard that is reported gone: the pair says what it
+        // became (`comment set` → `comment or reason set`).
+        let shares = |x: &Pred, y: &Pred| {
+            let kx: BTreeSet<String> = x.atom_keys().into_iter().collect();
+            y.atom_keys().iter().any(|k| kx.contains(k))
+        };
+        for (i, (pa, la)) in removed.iter().enumerate() {
+            if gone[i] {
+                out.push("GUARD_REMOVED", Layer::Behaviour, idb.clone(), Some(pa.render()), None, vec![(*la).clone()], vec![]);
+            }
+        }
+        for (i, (pb, lb)) in added.iter().enumerate() {
+            let looser = removed.iter().zip(&gone).any(|((pa, _), g)| *g && shares(pa, pb));
+            if new[i] || looser {
+                out.push("GUARD_ADDED", Layer::Behaviour, idb.clone(), None, Some(pb.render()), vec![], vec![(*lb).clone()]);
             }
         }
 
@@ -1319,6 +1353,156 @@ fn inline_shapes(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (Ve
     let mut out = (vec![], vec![]);
     walk(model, id, &[], false, None, matched, &mut BTreeSet::from([id.to_string()]), &mut out);
     out
+}
+
+/// Whether the requirements `all` of a version imply `p`: it is still checked there. Only the
+/// conjuncts linked to `p` take part, through atoms they share, transitively (fewer
+/// conjuncts imply less, so this stays sound and small).
+///
+/// An atom links only when it names one value: not one that reads a local the function
+/// assigns more than once (`unstable`), since `err ∈ {null}` at one check says nothing
+/// about the `err` of another.
+fn still_required(all: &[Pred], p: &Pred, unstable: &BTreeSet<String>) -> bool {
+    let linkable = |ops: &[String]| ops.iter().all(|o| roots(o).iter().all(|r| !unstable.contains(r)));
+    let keys = |q: &Pred| -> Vec<String> { q.atom_operands().into_iter().filter(|(_, ops)| linkable(ops)).map(|(k, _)| k).collect() };
+    let mut flat = vec![];
+    for q in all {
+        match q {
+            Pred::And(qs) => flat.extend(qs.iter().cloned()),
+            q => flat.push(q.clone()),
+        }
+    }
+    let mut linked: BTreeSet<String> = keys(p).into_iter().collect();
+    let mut near: Vec<Pred> = vec![];
+    loop {
+        let (take, rest): (Vec<Pred>, Vec<Pred>) = flat.into_iter().partition(|q| keys(q).iter().any(|k| linked.contains(k)));
+        flat = rest;
+        if take.is_empty() {
+            break;
+        }
+        linked.extend(take.iter().flat_map(&keys));
+        near.extend(take);
+    }
+    if near.is_empty() {
+        return false;
+    }
+    // Conjuncts that contradict each other imply anything: that is no evidence.
+    let near = Pred::And(near);
+    near.implies(&Pred::False) == Some(false) && near.implies(p) == Some(true)
+}
+
+/// The root names an operand reads: `dto` and `len` in `len(dto.items)`, none in a string.
+fn roots(s: &str) -> Vec<String> {
+    let found = std::cell::RefCell::new(vec![]);
+    rewrite_roots(s, &|w: &str| {
+        found.borrow_mut().push(w.to_string());
+        Some(w.to_string())
+    });
+    found.into_inner()
+}
+
+/// What `id` requires through the functions it calls that exist on this side only (`matched`
+/// is false): each way such a helper fails, with the caller's arguments in place of its
+/// parameters and under the condition of the call, negated. Helpers of helpers too.
+fn inline_requires(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (Vec<Pred>, BTreeSet<String>) {
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        model: &Model,
+        id: &str,
+        outer: &Pred,
+        subst: &dyn Fn(&str) -> Option<String>,
+        matched: &dyn Fn(&str) -> bool,
+        seen: &mut BTreeSet<String>,
+        out: &mut (Vec<Pred>, BTreeSet<String>),
+    ) {
+        let Some(e) = model.entities.get(id) else { return };
+        for c in &e.calls {
+            if c.caught || c.spawned || matched(&c.target) {
+                continue;
+            }
+            let Some(t) = model.entities.get(&c.target).filter(|t| t.parent.is_none()) else { continue };
+            // Each call counts under its own condition; `seen` only stops recursion.
+            if seen.contains(&c.target) || seen.len() > 8 {
+                continue;
+            }
+            let Some(path) = c.path.map_operands(subst) else { continue };
+            let at = Pred::And(vec![outer.clone(), path]).simplify();
+            // The helper's parameters by name, each with what this call passes, in the
+            // terms of `id`'s outermost caller.
+            let args: BTreeMap<String, Option<String>> = t
+                .params
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| {
+                    let name = p.split(": ").next().unwrap_or(p).trim_end_matches('?').trim_start_matches("...");
+                    let arg = c.args.get(i).filter(|a| !a.contains('…') && !a.contains("<fn")).and_then(|a| rewrite_roots(a, subst));
+                    is_ident(name).then(|| (name.to_string(), arg))
+                })
+                .collect();
+            let inner = |s: &str| {
+                rewrite_roots(s, &|x: &str| match args.get(x) {
+                    Some(arg) => arg.clone(),
+                    None => Some(x.to_string()),
+                })
+            };
+            for f in &t.fails {
+                if let Some(w) = f.when.map_operands(&inner) {
+                    // Predicate functions by what they test, as the caller's own guards are.
+                    let fails = Pred::And(vec![at.clone(), w]).simplify();
+                    out.0.push(merak_behaviour::summary::expand_guard(model, &fails).1.negate());
+                }
+            }
+            out.1.insert(c.target.clone());
+            seen.insert(c.target.clone());
+            walk(model, &c.target, &at, &inner, matched, seen, out);
+            seen.remove(&c.target);
+        }
+    }
+    let mut out = (vec![], BTreeSet::new());
+    walk(model, id, &Pred::True, &|s: &str| Some(s.to_string()), matched, &mut BTreeSet::from([id.to_string()]), &mut out);
+    out
+}
+
+fn is_ident(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$') && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// `s` with each root name (an identifier not after a `.`, outside quotes) rewritten by `f`;
+/// `None` when `f` cannot rewrite one.
+fn rewrite_roots(s: &str, f: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+    while i < chars.len() {
+        let ch = chars[i];
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            i += 1;
+        } else if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+            out.push(ch);
+            i += 1;
+        } else if ch.is_alphabetic() || ch == '_' || ch == '$' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if start > 0 && chars[start - 1] == '.' {
+                out.push_str(&word);
+            } else {
+                out.push_str(&f(&word)?);
+            }
+        } else {
+            out.push(ch);
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// Items only in `a`, and only in `b`, comparing shapes as multisets (locations ignored).

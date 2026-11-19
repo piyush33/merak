@@ -135,6 +135,110 @@ impl Pred {
     }
 }
 
+impl Pred {
+    pub fn always() -> Pred {
+        Pred::True
+    }
+
+    pub fn is_true(&self) -> bool {
+        *self == Pred::True
+    }
+
+    /// The predicate with each operand rewritten by `f` (a helper's parameter replaced by
+    /// what its caller passes). `None` when `f` cannot rewrite one.
+    pub fn map_operands(&self, f: &dyn Fn(&str) -> Option<String>) -> Option<Pred> {
+        let all = |ps: &[Pred]| ps.iter().map(|p| p.map_operands(f)).collect::<Option<Vec<_>>>();
+        Some(match self {
+            Pred::In { field, values } => Pred::In { field: f(field)?, values: values.clone() },
+            Pred::NotIn { field, values } => Pred::NotIn { field: f(field)?, values: values.clone() },
+            Pred::Truthy(x) => Pred::Truthy(f(x)?),
+            Pred::Falsy(x) => Pred::Falsy(f(x)?),
+            Pred::Compare { left, op, right } => Pred::compare(f(left)?, op, f(right)?),
+            Pred::Opaque { text, negated } => Pred::Opaque { text: f(text)?, negated: *negated },
+            Pred::And(ps) => Pred::And(all(ps)?).simplify(),
+            Pred::Or(ps) => Pred::Or(all(ps)?).simplify(),
+            other => other.clone(),
+        })
+    }
+
+    /// Whether every way `self` holds, `other` holds too. Atoms are taken as independent
+    /// (`f ∈ {A}` and `f ∈ {A, B}` are unrelated), so a `true` is sound and a `false` may be
+    /// an implication this cannot see. `None` when there are too many atoms to check.
+    pub fn implies(&self, other: &Pred) -> Option<bool> {
+        let mut atoms = vec![];
+        self.atoms(&mut atoms);
+        other.atoms(&mut atoms);
+        atoms.sort();
+        atoms.dedup();
+        if atoms.len() > 16 {
+            return None;
+        }
+        Some((0u32..1 << atoms.len()).all(|bits| {
+            let v = |k: &str| atoms.binary_search_by(|a| a.as_str().cmp(k)).is_ok_and(|i| bits >> i & 1 == 1);
+            !self.eval(&v) || other.eval(&v)
+        }))
+    }
+
+    /// An atom as a key and whether the predicate asserts it (`true`) or its negation.
+    fn atom(&self) -> Option<(String, bool)> {
+        Some(match self {
+            Pred::In { field, values } => (format!("{field} ∈ {}", render_set(values)), true),
+            Pred::NotIn { field, values } => (format!("{field} ∈ {}", render_set(values)), false),
+            Pred::Truthy(f) => (format!("{f} is set"), true),
+            Pred::Falsy(f) => (format!("{f} is set"), false),
+            Pred::Call { entity, negated } => (format!("{entity}()"), !negated),
+            Pred::Opaque { text, negated } => (text.clone(), !negated),
+            Pred::Compare { left, op, right } => match op.as_str() {
+                "<" => (format!("{left} < {right}"), true),
+                "<=" => (format!("{right} < {left}"), false),
+                "==" => (format!("{left} == {right}"), true),
+                _ => (format!("{left} == {right}"), false),
+            },
+            _ => return None,
+        })
+    }
+
+    /// The operands each atom reads, by atom key: `dto.query` for `dto.query is set`.
+    pub fn atom_operands(&self) -> Vec<(String, Vec<String>)> {
+        match self {
+            Pred::And(ps) | Pred::Or(ps) => ps.iter().flat_map(Pred::atom_operands).collect(),
+            p => {
+                let ops = match p {
+                    Pred::In { field, .. } | Pred::NotIn { field, .. } | Pred::Truthy(field) | Pred::Falsy(field) => vec![field.clone()],
+                    Pred::Compare { left, right, .. } => vec![left.clone(), right.clone()],
+                    Pred::Opaque { text, .. } => vec![text.clone()],
+                    _ => vec![],
+                };
+                p.atom().map(|(k, _)| (k, ops)).into_iter().collect()
+            }
+        }
+    }
+
+    /// The atoms the predicate is built from, by key.
+    pub fn atom_keys(&self) -> Vec<String> {
+        let mut out = vec![];
+        self.atoms(&mut out);
+        out
+    }
+
+    fn atoms(&self, out: &mut Vec<String>) {
+        match self {
+            Pred::And(ps) | Pred::Or(ps) => ps.iter().for_each(|p| p.atoms(out)),
+            p => out.extend(p.atom().map(|(k, _)| k)),
+        }
+    }
+
+    fn eval(&self, v: &dyn Fn(&str) -> bool) -> bool {
+        match self {
+            Pred::True => true,
+            Pred::False => false,
+            Pred::And(ps) => ps.iter().all(|p| p.eval(v)),
+            Pred::Or(ps) => ps.iter().any(|p| p.eval(v)),
+            p => p.atom().is_some_and(|(k, pos)| v(&k) == pos),
+        }
+    }
+}
+
 pub fn render_set(values: &BTreeSet<String>) -> String {
     format!("{{{}}}", values.iter().cloned().collect::<Vec<_>>().join(", "))
 }
@@ -251,5 +355,19 @@ mod tests {
             Pred::Or(vec![Pred::In { field: "User.role".into(), values: set(&["ADMIN"]) }, Pred::In { field: "User.role".into(), values: set(&["MANAGER"]) }])
                 .simplify();
         assert_eq!(p.render(), "User.role ∈ {ADMIN, MANAGER}");
+    }
+}
+
+#[cfg(test)]
+mod implies_tests {
+    use super::Pred;
+
+    #[test]
+    fn a_check_split_in_two_still_implies_the_whole() {
+        let t = |s: &str| Pred::Truthy(s.into());
+        let f = |s: &str| Pred::Falsy(s.into());
+        let b = Pred::And(vec![Pred::Or(vec![Pred::False, t("q"), f("a"), t("e")]), Pred::Or(vec![Pred::False, t("q"), t("a")])]);
+        assert_eq!(b.implies(&Pred::Or(vec![t("q"), t("e")])), Some(true));
+        assert_eq!(b.implies(&t("q")), Some(false));
     }
 }

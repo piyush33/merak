@@ -1057,8 +1057,9 @@ impl<'s> Lowerer<'s> {
             None => vec![],
         };
         // `if err != nil { …; return err }`: only the calls before the hand-on remain,
-        // run when the error is set.
-        if let (Some(var), true) = (self.error_check(&test), otherwise.is_empty()) {
+        // run when the error is set. An `else` (`} else if ch != nil {`) is what follows
+        // when the call succeeded, as the code after a plain hand-on is.
+        if let Some(var) = self.error_check(&test) {
             if let Some(ir::Stmt::Return(..) | ir::Stmt::Throw(..)) = then.last() {
                 // Any return that mentions the error hands it on: `%w`, `%v`, a custom wrap.
                 if self.propagated(n).is_some_and(|v| v == var) {
@@ -1066,6 +1067,7 @@ impl<'s> Lowerer<'s> {
                     if !rest.is_empty() {
                         out.push(ir::Stmt::If { test: self.name_errors(test), then: rest, otherwise: vec![], loc });
                     }
+                    out.extend(otherwise);
                     return out;
                 }
             }

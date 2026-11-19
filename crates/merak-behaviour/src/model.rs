@@ -47,6 +47,21 @@ pub struct CallFact {
     /// Each argument that is a parameter of the caller, by index: passed on, not built here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arg_params: Vec<Option<usize>>,
+    /// The condition the call runs under (guards and alternatives); `True`: always.
+    #[serde(default = "Pred::always", skip_serializing_if = "Pred::is_true")]
+    pub path: Pred,
+    /// Inside a `try` with a handler: what the callee throws stays in this function.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub caught: bool,
+}
+
+/// When a function fails: a `throw` (in Go, a returned new error) that leaves it, and the
+/// condition on its inputs it is reached under. Callers fail under the same condition, with
+/// their arguments for its parameters: a check moved into a helper is still a check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FailFact {
+    pub when: Pred,
+    pub loc: Loc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -227,6 +242,13 @@ pub struct Entity {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<Output>,
     pub throws: bool,
+    /// Where it fails, and when (see [`FailFact`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fails: Vec<FailFact>,
+    /// Locals (and parameters) that hold more than one value over a run (`err`, reused for
+    /// each call): conditions on them at two places may be about different values.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reassigned: BTreeSet<String>,
     pub subscriptions: Vec<Subscription>,
     pub routes: Vec<Route>,
     pub unknowns: Vec<Unknown>,

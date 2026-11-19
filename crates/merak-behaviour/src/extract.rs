@@ -340,6 +340,8 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
         steps: HashMap::new(),
         loops: vec![],
         closure_writes: closure_writes(ix, &f.body),
+        answers: is_predicate_fn(f),
+        go: f.loc.file.ends_with(".go"),
         made_by: HashMap::new(),
         ctes: scope_ctes(ix, f),
         records: BTreeSet::new(),
@@ -385,6 +387,8 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
                 })
                 .collect(),
             throws: false,
+            fails: vec![],
+            reassigned: BTreeSet::new(),
             subscriptions: vec![],
             routes: vec![],
             unknowns: vec![],
@@ -399,6 +403,17 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
     w.stmts(&f.body, true);
     w.cur = 0;
     w.decorators(f);
+    let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+    // A local changed in place (`fields[k] = v`) holds another value afterwards too.
+    let mut mutated = vec![];
+    each_expr(&f.body, &mut |e| {
+        if let Expr::Assign { target, .. } = e {
+            if let Expr::Member { .. } | Expr::Index { .. } = target.as_ref() {
+                mutated.extend(root_ident(target));
+            }
+        }
+    });
+    w.e.reassigned = w.cd.reassigned(&params).into_iter().chain(w.closure_writes.iter().cloned()).chain(mutated).collect();
     if is_predicate_fn(f) {
         let returns: Vec<(&Expr, &Loc)> = f
             .body
@@ -473,6 +488,10 @@ struct Walker<'a, 'p> {
     /// Conditions already derived, by node and guard side.
     runs_memo: std::cell::RefCell<HashMap<(usize, bool), Pred>>,
     cur: usize,
+    /// The function answers a yes/no question: its returns are the answer.
+    answers: bool,
+    /// Go source: returned errors are already `throw`s.
+    go: bool,
     consumed_closures: BTreeSet<String>,
     /// What this function builds, when it assembles a string clause: `⟨a⟩ AND ⟨b, each c in cs⟩`.
     clause: Option<String>,
@@ -659,6 +678,9 @@ impl Walker<'_, '_> {
             }
             Stmt::Throw(e, loc) => {
                 self.e.throws = true;
+                if !self.cd.caught(self.cur) {
+                    self.e.fails.push(FailFact { when: self.full_path(), loc: loc.clone() });
+                }
                 // The error thrown is part of the guard that throws it, not a call shape.
                 match e {
                     Expr::New { args, loc: nloc, .. } => args.iter().for_each(|a| self.expr(a, nloc)),
@@ -857,7 +879,17 @@ impl Walker<'_, '_> {
                 // A closure used as a value (not registered as a handler/route) is
                 // assumed to run on behalf of this entity.
                 if !self.consumed_closures.contains(id) => {
-                    self.e.calls.push(CallFact { target: id.clone(), loc: loc.clone(), conditional: true, spawned: self.spawn_depth > 0, args: vec![], arg_skeletons: vec![], arg_params: vec![] });
+                    self.e.calls.push(CallFact {
+                        target: id.clone(),
+                        loc: loc.clone(),
+                        conditional: true,
+                        spawned: self.spawn_depth > 0,
+                        args: vec![],
+                        arg_skeletons: vec![],
+                        arg_params: vec![],
+                        path: self.full_path(),
+                        caught: self.cd.caught(self.cur),
+                    });
                     // By its name within this entity, so the conditions it is used under count.
                     // By kind, not position: inserting a sibling renumbers `useMemo#4` to `#5`.
                     let name = id.strip_prefix(&format!("{}.", self.e.id)).unwrap_or(id);
@@ -899,6 +931,8 @@ impl Walker<'_, '_> {
                     args,
                     arg_skeletons,
                     arg_params,
+                    path: self.full_path(),
+                    caught: self.cd.caught(self.cur),
                 });
             }
             Callee::External(api) if self.cat.is_filter(&api) => {
@@ -1004,6 +1038,12 @@ impl Walker<'_, '_> {
         format!("{target}({})", c.args.iter().map(arg).collect::<Vec<_>>().join(", "))
     }
 
+    /// The whole condition the statement being walked runs under: its checks and its
+    /// alternatives.
+    fn full_path(&self) -> Pred {
+        clean(all(vec![self.runs_under(self.cur, true, &mut vec![]).0, self.runs_under(self.cur, false, &mut vec![]).0]))
+    }
+
     /// The conditions the statement being walked runs under, rendered for a call shape:
     /// the alternatives it sits in (`guards: false`) or the checks it requires (`true`).
     fn conditions(&self, guards: bool) -> Vec<String> {
@@ -1073,13 +1113,19 @@ impl Walker<'_, '_> {
                 continue;
             }
             // When the passing side ends the function too, the branch picks between two
-            // endings (two error messages, two results): not a check.
+            // endings: two failures (two error messages), or, when the other side does not
+            // reject, two results (`if found { return x }; …; return y`). Not a check.
             let passing = if arm == Arm::Then { then } else { otherwise };
-            if if passing.is_empty() {
-                self.cd.rest_ends(n)
+            let jumps = passing.iter().any(|s| matches!(s, Stmt::Jump(_)));
+            let (ends, fails) = if passing.is_empty() {
+                (self.cd.rest_ends(n), self.cd.rest_throws(n))
             } else {
-                always_ends(passing) || self.cd.rest_ends(n) && !passing.iter().any(|s| matches!(s, Stmt::Jump(_)))
-            } {
+                (always_ends(passing) || self.cd.rest_ends(n) && !jumps, always_throws(passing) || self.cd.rest_throws(n) && !jumps)
+            };
+            // A predicate's returns are its answers (`return a.isSales()`), never a rejection.
+            // In Go a failure is always a `throw` (the front end makes returned errors one).
+            let rejecting = if self.go { matches!(exit_side.last(), Some(Stmt::Throw(..))) } else { rejects(exit_side.last()) };
+            if fails || ends && (self.answers || !rejecting) {
                 continue;
             }
             // In a loop, returning a found item or a flag ends a search, not a rejection.
@@ -2263,6 +2309,16 @@ fn each_expr<'e>(stmts: &'e [Stmt], f: &mut dyn FnMut(&'e Expr)) {
 }
 
 /// The names assigned inside the closures of a body, at any depth.
+/// The local an expression starts from: `fields` in `fields[k].x`.
+fn root_ident(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Ident(n) => Some(n.clone()),
+        Expr::Member { object, .. } => root_ident(object),
+        Expr::Index { object, .. } => root_ident(object),
+        _ => None,
+    }
+}
+
 fn closure_writes(ix: &Index, body: &[Stmt]) -> HashSet<String> {
     let mut out = HashSet::new();
     let mut todo: Vec<String> = vec![];
@@ -2301,6 +2357,15 @@ fn always_ends(stmts: &[Stmt]) -> bool {
         Some(Stmt::Return(..) | Stmt::Throw(..)) => true,
         Some(Stmt::If { then, otherwise, .. }) => !otherwise.is_empty() && always_ends(then) && always_ends(otherwise),
         Some(Stmt::Block(b)) => always_ends(b),
+        _ => false,
+    }
+}
+
+fn always_throws(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Throw(..)) => true,
+        Some(Stmt::If { then, otherwise, .. }) => !otherwise.is_empty() && always_throws(then) && always_throws(otherwise),
+        Some(Stmt::Block(b)) => always_throws(b),
         _ => false,
     }
 }

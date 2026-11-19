@@ -44,8 +44,12 @@ pub struct ControlDeps {
     guard_edges: HashSet<(usize, Arm)>,
     /// Nodes inside a loop body.
     in_loop: HashSet<usize>,
-    /// `if` nodes after which the function always ends (`if (c) { return a }; return b`).
+    /// Nodes inside a `try` body with a handler: what they throw is caught here.
+    caught: HashSet<usize>,
+    /// `if` nodes after which the function always ends (`if (c) { return a }; return b`), and
+    /// those after which it always fails (`if (c) { throw a }; throw b`).
     rest_ends: HashSet<usize>,
+    rest_throws: HashSet<usize>,
     /// Reaching definitions: per node, the assignments of each local that can reach its
     /// entry, by the node that makes them.
     reaching: std::cell::OnceCell<Reaching>,
@@ -70,12 +74,14 @@ impl ControlDeps {
             node_of: HashMap::new(),
             guard_edges: HashSet::new(),
             in_loop: HashSet::new(),
+            caught: HashSet::new(),
             rest_ends: HashSet::new(),
+            rest_throws: HashSet::new(),
             defines: vec![vec![], vec![]],
             loops: 0,
             catch: vec![],
         };
-        let first = b.list(body, EXIT, EXIT, false);
+        let first = b.list(body, EXIT, EXIT, (false, false));
         // Augmented entry: the whole body is control dependent on entering the function.
         b.succ[ENTRY] = vec![(first, Arm::Plain), (EXIT, Arm::Plain)];
         let deps = control_deps(&b.succ);
@@ -84,7 +90,9 @@ impl ControlDeps {
             deps,
             guard_edges: b.guard_edges,
             in_loop: b.in_loop,
+            caught: b.caught,
             rest_ends: b.rest_ends,
+            rest_throws: b.rest_throws,
             reaching: std::cell::OnceCell::new(),
             succ: b.succ,
             defines: b.defines,
@@ -113,9 +121,30 @@ impl ControlDeps {
         self.rest_ends.contains(&n)
     }
 
+    pub fn rest_throws(&self, n: usize) -> bool {
+        self.rest_throws.contains(&n)
+    }
+
     /// Whether the node sits inside a loop body.
     pub fn in_loop(&self, n: usize) -> bool {
         self.in_loop.contains(&n)
+    }
+
+    /// Locals that hold more than one value over a run: assigned at two places, or in a
+    /// loop. `params`: assigning a parameter at all gives it a second value.
+    pub fn reassigned(&self, params: &[String]) -> std::collections::BTreeSet<String> {
+        let mut count: HashMap<&str, u32> = params.iter().map(|p| (p.as_str(), 1)).collect();
+        for (n, vars) in self.defines.iter().enumerate() {
+            for v in vars {
+                *count.entry(v.as_str()).or_default() += if self.in_loop(n) { 2 } else { 1 };
+            }
+        }
+        count.into_iter().filter(|(_, c)| *c > 1).map(|(v, _)| v.to_string()).collect()
+    }
+
+    /// Node `n` is inside a `try` body with a handler: an exception there stays here.
+    pub fn caught(&self, n: usize) -> bool {
+        self.caught.contains(&n)
     }
 
     /// Whether taking the edge passes a required check (the branch's other side ends the function).
@@ -129,7 +158,9 @@ struct Builder {
     node_of: HashMap<*const Stmt, usize>,
     guard_edges: HashSet<(usize, Arm)>,
     in_loop: HashSet<usize>,
+    caught: HashSet<usize>,
     rest_ends: HashSet<usize>,
+    rest_throws: HashSet<usize>,
     /// Per node: the locals it assigns.
     defines: Vec<Vec<String>>,
     loops: u32,
@@ -139,6 +170,17 @@ struct Builder {
 
 /// Whether a statement list always ends the function: it ends in a `return` or
 /// `throw`, or in an `if`/`else` (or block) whose every side does.
+/// Whether a statement list always ends the function by failing: every way through it
+/// ends in a `throw`.
+fn always_throws(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Throw(..)) => true,
+        Some(Stmt::If { then, otherwise, .. }) => !otherwise.is_empty() && always_throws(then) && always_throws(otherwise),
+        Some(Stmt::Block(b)) => always_throws(b),
+        _ => false,
+    }
+}
+
 fn always_exits(stmts: &[Stmt]) -> bool {
     match stmts.last() {
         Some(Stmt::Return(..) | Stmt::Throw(..)) => true,
@@ -157,23 +199,27 @@ impl Builder {
         if self.loops > 0 {
             self.in_loop.insert(n);
         }
+        if !self.catch.is_empty() {
+            self.caught.insert(n);
+        }
         n
     }
 
     /// Lower a statement list that continues at `next`; `jump` is where a break/continue
     /// goes. Returns the list's entry node (`next` when it is empty).
-    /// `next_ends`: whatever follows the list always ends the function.
-    fn list(&mut self, stmts: &[Stmt], next: usize, jump: usize, next_ends: bool) -> usize {
+    /// `next_ends`: whatever follows the list always ends the function, and always fails.
+    fn list(&mut self, stmts: &[Stmt], next: usize, jump: usize, next_ends: (bool, bool)) -> usize {
         let mut at = next;
         for (i, s) in stmts.iter().enumerate().rev() {
             let rest = &stmts[i + 1..];
-            let rest_ends = if rest.is_empty() { next_ends } else { always_exits(rest) };
-            at = self.stmt(s, at, jump, rest_ends);
+            let rest_ends = if rest.is_empty() { next_ends.0 } else { always_exits(rest) };
+            let rest_throws = if rest.is_empty() { next_ends.1 } else { always_throws(rest) };
+            at = self.stmt(s, at, jump, (rest_ends, rest_throws));
         }
         at
     }
 
-    fn stmt(&mut self, s: &Stmt, next: usize, jump: usize, rest_ends: bool) -> usize {
+    fn stmt(&mut self, s: &Stmt, next: usize, jump: usize, rest_ends: (bool, bool)) -> usize {
         let n = self.alloc(s);
         let succ = match s {
             Stmt::Expr(..) | Stmt::Let { .. } => vec![(next, Arm::Plain)],
@@ -194,8 +240,11 @@ impl Builder {
                     }
                     _ => {}
                 }
-                if rest_ends {
+                if rest_ends.0 {
                     self.rest_ends.insert(n);
+                }
+                if rest_ends.1 {
+                    self.rest_throws.insert(n);
                 }
                 let t = self.list(then, next, jump, rest_ends);
                 let e = self.list(otherwise, next, jump, rest_ends);
@@ -204,18 +253,18 @@ impl Builder {
             Stmt::Loop { body, .. } => {
                 // The loop node is its header: each pass enters the body or leaves.
                 self.loops += 1;
-                let b = self.list(body, n, n, false);
+                let b = self.list(body, n, n, (false, false));
                 self.loops -= 1;
                 vec![(b, Arm::Plain), (next, Arm::Plain)]
             }
             Stmt::Try { body, handler, finalizer, .. } => {
                 let fin = self.list(finalizer, next, jump, rest_ends);
-                let h = self.list(handler, fin, jump, false);
+                let h = self.list(handler, fin, jump, (false, false));
                 let has_handler = !handler.is_empty();
                 if has_handler {
                     self.catch.push(h);
                 }
-                let b = self.list(body, fin, jump, false);
+                let b = self.list(body, fin, jump, (false, false));
                 if has_handler {
                     self.catch.pop();
                     vec![(b, Arm::Plain), (h, Arm::Plain)]

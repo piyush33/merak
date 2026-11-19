@@ -708,3 +708,19 @@ fn a_value_built_by_a_loop_is_compared_by_how_it_is_built() {
     assert!(skip.after.as_deref().is_some_and(|a| a.contains("for each it in items: append(out, it.Name) when")), "{skip:#?}");
     assert!(output(&src("out := make([]string, 0, len(items))", "")).is_none(), "a capacity hint is not a change");
 }
+
+/// `err` is reused for every call: a check of one call's error says nothing about another's,
+/// so a new error check is a new check even when an old one reads the same.
+#[test]
+fn a_reused_err_does_not_stand_for_another_check() {
+    let src = |extra: &str| {
+        format!(
+            "package app\n\nimport \"errors\"\n\nvar ErrA = errors.New(\"a\")\n\nfunc load() (int, error) {{ return 1, nil }}\nfunc save() (int, error) {{ return 1, nil }}\n\nfunc Run() error {{\n\tn, err := load()\n\tif err != nil && !errors.Is(err, ErrA) {{\n\t\treturn errors.New(\"load\")\n\t}}\n\t_ = n\n{extra}\treturn nil\n}}\n"
+        )
+    };
+    let before = files(&[("app.go", &src(""))]);
+    let after = files(&[("app.go", &src("\tm, err := save()\n\tif err != nil && !errors.Is(err, ErrA) {\n\t\treturn errors.New(\"save\")\n\t}\n\t_ = m\n"))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let k: Vec<&str> = t.ops.iter().map(|o| o.kind.as_str()).collect();
+    assert!(k.contains(&"GUARD_ADDED") || k.iter().any(|k| k.contains("GUARD")), "{:#?}", t.ops);
+}

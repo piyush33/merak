@@ -961,3 +961,41 @@ fn a_local_changed_by_a_closure_has_no_single_value() {
     let outputs: Vec<&str> = m.entities["src/a.ts::count"].outputs.iter().map(|o| o.value.as_str()).collect();
     assert_eq!(outputs, ["n"]);
 }
+
+/// A check moved into a helper the function now calls is still a check of the function:
+/// the helper fails under the same condition, with the caller's argument for its parameter.
+#[test]
+fn a_check_moved_into_a_helper_is_still_required() {
+    let before = "export class Svc {\n  run(dto: { query?: string; id?: string }) {\n    let v;\n    if (dto.query) {\n      v = 1;\n    } else if (dto.id) {\n      v = 2;\n    } else {\n      throw new Error('query or id');\n    }\n    return this.go(v);\n  }\n  go(v: number) { return v; }\n}\n";
+    let after = "export class Svc {\n  run(input: { query?: string; id?: string }) {\n    const v = this.pick(input);\n    return this.go(v);\n  }\n  pick(dto: { query?: string; id?: string }) {\n    if (dto.query) {\n      return 1;\n    }\n    if (dto.id) {\n      return 2;\n    }\n    throw new Error('query or id');\n  }\n  go(v: number) { return v; }\n}\n";
+    let a: merak_cli::source::Files = [("src/a.ts".to_string(), before.to_string())].into_iter().collect();
+    let b: merak_cli::source::Files =
+        [("src/a.ts".to_string(), after.replace("run(input", "run(dto").replace("this.pick(input)", "this.pick(dto)"))].into_iter().collect();
+    let t = merak_cli::diff(&a, &b).unwrap();
+    assert!(!t.ops.iter().any(|o| o.kind == "GUARD_REMOVED"), "{:#?}", t.ops);
+
+    // Renamed at the call: the helper's parameter is the caller's argument.
+    let b: merak_cli::source::Files = [("src/a.ts".to_string(), after.to_string())].into_iter().collect();
+    let a2: merak_cli::source::Files = [("src/a.ts".to_string(), before.replace("dto", "input"))].into_iter().collect();
+    let t = merak_cli::diff(&a2, &b).unwrap();
+    assert!(!t.ops.iter().any(|o| o.kind == "GUARD_REMOVED"), "{:#?}", t.ops);
+}
+
+/// A check made looser is reported as the old check gone and the new one in its place, not
+/// as a check removed outright; a check made stricter, as the stricter one added.
+#[test]
+fn a_loosened_check_shows_what_it_became() {
+    let src = |cond: &str| {
+        format!("export function reject(comment: string, reason: string) {{\n  if ({cond}) {{\n    throw new Error('say why');\n  }}\n  return 1;\n}}\n")
+    };
+    let run = |a: &str, b: &str| {
+        let fa: merak_cli::source::Files = [("src/a.ts".to_string(), src(a))].into_iter().collect();
+        let fb: merak_cli::source::Files = [("src/a.ts".to_string(), src(b))].into_iter().collect();
+        let t = merak_cli::diff(&fa, &fb).unwrap();
+        let mut k: Vec<String> = t.ops.iter().filter(|o| o.kind.starts_with("GUARD")).map(|o| o.kind.clone()).collect();
+        k.sort();
+        k
+    };
+    assert_eq!(run("!comment", "!comment && !reason"), ["GUARD_ADDED", "GUARD_REMOVED"]);
+    assert_eq!(run("!comment && !reason", "!comment"), ["GUARD_ADDED"]);
+}
