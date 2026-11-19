@@ -1024,6 +1024,8 @@ fn skips_change(
     // A loop moved into a helper that exists on one side only still filters for this function.
     let (own_a, own_b) = (a.entities[ida].skips.iter().collect::<Vec<_>>(), b.entities[idb].skips.iter().collect::<Vec<_>>());
     let (sa, sb) = (inline_skips(a, ida, matched_a, Some(&own_b)), inline_skips(b, idb, matched, Some(&own_a)));
+    let (sa, sb): (Vec<&merak_behaviour::SkipFact>, Vec<&merak_behaviour::SkipFact>) =
+        (sa.iter().map(|(_, s)| s).collect(), sb.iter().map(|(_, s)| s).collect());
     let (ta, tb): (BTreeSet<String>, BTreeSet<String>) = (sa.iter().map(|s| text(s)).collect(), sb.iter().map(|s| text(s)).collect());
     for s in sb.iter().filter(|s| !ta.contains(&text(s))) {
         out.push("SKIP_ADDED", Layer::Behaviour, subject, None, Some(text(s)), vec![], vec![s.loc.clone()]);
@@ -1073,8 +1075,15 @@ fn filters_to_memory(ops: &mut [Op], b: &Model, idb: &str, matched: &dyn Fn(&str
     // What it passes on to new code, by name.
     let passed: BTreeSet<&str> = e.calls.iter().filter(|c| !matched(&c.target)).flat_map(|c| c.args.iter().map(String::as_str)).collect();
     let skips = inline_skips(b, idb, matched, None);
-    let Some(s) = skips.iter().find(|s| s.over.split_once(" in ").is_some_and(|(_, over)| passed.contains(over))) else { return };
-    let owner = b.entities.values().find(|x| x.skips.iter().any(|y| std::ptr::eq(y, *s))).map(|x| short(&x.id).to_string()).unwrap_or_default();
+    // As the helper names it: what it is passed is what the caller passes.
+    let Some((owner, s)) = skips.iter().find(|(o, s)| {
+        let s = b.entities.get(o).and_then(|e| e.skips.iter().find(|y| y.loc == s.loc)).unwrap_or(s);
+        s.over.split_once(" in ").is_some_and(|(_, over)| passed.contains(over))
+    }) else {
+        return;
+    };
+    let s = b.entities.get(owner).and_then(|e| e.skips.iter().find(|y| y.loc == s.loc)).unwrap_or(s);
+    let owner = short(owner).to_string();
     for o in ops.iter_mut().filter(|o| matches!(o.kind.as_str(), "QUERY_FILTER_REMOVED" | "QUERY_FILTER_CHANGED")) {
         o.kind = "QUERY_FILTER_MOVED_TO_MEMORY".into();
         o.note = Some(format!("`{owner}`, over each {}", s.over));
@@ -1084,23 +1093,31 @@ fn filters_to_memory(ops: &mut [Op], b: &Model, idb: &str, matched: &dyn Fn(&str
 /// Loop filters of `id` and of the functions it calls that exist on this side only. `other`: the
 /// loop filters the other version has itself; a helper's count only over the same items (the
 /// loop moved into it), not loops the function never had. `None`: all of them.
-pub(crate) fn inline_skips<'x>(
-    model: &'x Model,
+pub(crate) fn inline_skips(
+    model: &Model,
     id: &str,
     matched: &dyn Fn(&str) -> bool,
     other: Option<&[&merak_behaviour::SkipFact]>,
-) -> Vec<&'x merak_behaviour::SkipFact> {
+) -> Vec<(String, merak_behaviour::SkipFact)> {
+    // A helper's loop in the caller's names: `it in input.items` called as `persist(dto)` is
+    // `it in dto.items`.
     let overs: Option<BTreeSet<&str>> = other.map(|o| o.iter().map(|s| s.over.as_str()).collect());
     let mut out = vec![];
     let mut seen = BTreeSet::from([id.to_string()]);
-    let mut stack = vec![id.to_string()];
-    while let Some(cur) = stack.pop() {
+    let mut stack = vec![(id.to_string(), Names::new())];
+    while let Some((cur, names)) = stack.pop() {
         let Some(e) = model.entities.get(&cur) else { continue };
         let own = cur == id;
-        out.extend(e.skips.iter().filter(|s| own || overs.as_ref().is_none_or(|o| o.contains(s.over.as_str()))));
+        for s in &e.skips {
+            let s = merak_behaviour::SkipFact { over: renamed(&s.over, &names), when: renamed(&s.when, &names), loc: s.loc.clone() };
+            if own || overs.as_ref().is_none_or(|o| o.contains(s.over.as_str())) {
+                out.push((cur.clone(), s));
+            }
+        }
         for c in &e.calls {
-            if !matched(&c.target) && model.entities.get(&c.target).is_some_and(|t| t.parent.is_none()) && seen.insert(c.target.clone()) {
-                stack.push(c.target.clone());
+            let Some(t) = model.entities.get(&c.target).filter(|t| t.parent.is_none()) else { continue };
+            if !matched(&c.target) && seen.insert(c.target.clone()) {
+                stack.push((c.target.clone(), call_names(t, c, &names)));
             }
         }
     }
@@ -1329,29 +1346,34 @@ fn inline_shapes(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (Ve
         outer: &[String],
         inlined: bool,
         via: Option<&CallShape>,
+        names: &Names,
         matched: &dyn Fn(&str) -> bool,
         seen: &mut BTreeSet<String>,
         out: &mut (Vec<CallShape>, Vec<Option<CallShape>>),
     ) {
         let Some(e) = model.entities.get(id) else { return };
         for c in &e.call_shapes {
-            let mut when: Vec<String> = c.when.iter().chain(outer).chain(c.guards.iter().filter(|_| inlined)).cloned().collect();
+            // In the caller's names: a helper's `input.x is set` is the caller's `dto.x is set`.
+            let own = c.when.iter().chain(c.guards.iter().filter(|_| inlined)).map(|w| renamed(w, names));
+            let mut when: Vec<String> = own.chain(outer.iter().cloned()).collect();
             when.sort();
             when.dedup();
             match &c.target {
                 Some(t) if !matched(t) && model.entities.contains_key(t) && seen.insert(t.clone()) => {
                     let at = via.cloned().unwrap_or_else(|| CallShape { when: when.clone(), ..c.clone() });
-                    walk(model, t, &when, true, Some(&at), matched, seen, out)
+                    let fact = e.calls.iter().find(|f| &f.target == t && f.loc == c.loc);
+                    let inner = fact.map(|f| call_names(&model.entities[t], f, names)).unwrap_or_default();
+                    walk(model, t, &when, true, Some(&at), &inner, matched, seen, out)
                 }
                 _ => {
-                    out.0.push(CallShape { when, ..c.clone() });
+                    out.0.push(CallShape { when, shape: renamed(&c.shape, names), ..c.clone() });
                     out.1.push(via.cloned());
                 }
             }
         }
     }
     let mut out = (vec![], vec![]);
-    walk(model, id, &[], false, None, matched, &mut BTreeSet::from([id.to_string()]), &mut out);
+    walk(model, id, &[], false, None, &Names::new(), matched, &mut BTreeSet::from([id.to_string()]), &mut out);
     out
 }
 
@@ -1410,7 +1432,7 @@ fn inline_requires(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (
         model: &Model,
         id: &str,
         outer: &Pred,
-        subst: &dyn Fn(&str) -> Option<String>,
+        names: &Names,
         matched: &dyn Fn(&str) -> bool,
         seen: &mut BTreeSet<String>,
         out: &mut (Vec<Pred>, BTreeSet<String>),
@@ -1425,26 +1447,10 @@ fn inline_requires(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (
             if seen.contains(&c.target) || seen.len() > 8 {
                 continue;
             }
-            let Some(path) = c.path.map_operands(subst) else { continue };
+            let Some(path) = c.path.map_operands(&|s: &str| rename(s, names)) else { continue };
             let at = Pred::And(vec![outer.clone(), path]).simplify();
-            // The helper's parameters by name, each with what this call passes, in the
-            // terms of `id`'s outermost caller.
-            let args: BTreeMap<String, Option<String>> = t
-                .params
-                .iter()
-                .enumerate()
-                .filter_map(|(i, p)| {
-                    let name = p.split(": ").next().unwrap_or(p).trim_end_matches('?').trim_start_matches("...");
-                    let arg = c.args.get(i).filter(|a| !a.contains('…') && !a.contains("<fn")).and_then(|a| rewrite_roots(a, subst));
-                    is_ident(name).then(|| (name.to_string(), arg))
-                })
-                .collect();
-            let inner = |s: &str| {
-                rewrite_roots(s, &|x: &str| match args.get(x) {
-                    Some(arg) => arg.clone(),
-                    None => Some(x.to_string()),
-                })
-            };
+            let inner_names = call_names(t, c, names);
+            let inner = |s: &str| rename(s, &inner_names);
             for f in &t.fails {
                 if let Some(w) = f.when.map_operands(&inner) {
                     // Predicate functions by what they test, as the caller's own guards are.
@@ -1454,13 +1460,44 @@ fn inline_requires(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (
             }
             out.1.insert(c.target.clone());
             seen.insert(c.target.clone());
-            walk(model, &c.target, &at, &inner, matched, seen, out);
+            walk(model, &c.target, &at, &inner_names, matched, seen, out);
             seen.remove(&c.target);
         }
     }
     let mut out = (vec![], BTreeSet::new());
-    walk(model, id, &Pred::True, &|s: &str| Some(s.to_string()), matched, &mut BTreeSet::from([id.to_string()]), &mut out);
+    walk(model, id, &Pred::True, &Names::new(), matched, &mut BTreeSet::from([id.to_string()]), &mut out);
     out
+}
+
+/// A helper's parameters by name, each with what a call passes there, in the terms of the
+/// function the helpers are inlined into (`None`: not expressible there, `{…}` or a closure).
+type Names = BTreeMap<String, Option<String>>;
+
+/// The names of `t`'s parameters at call `c`, its arguments read through `outer` (the names
+/// of the helper `c` is made from, when helpers nest).
+fn call_names(t: &merak_behaviour::Entity, c: &merak_behaviour::CallFact, outer: &Names) -> Names {
+    t.params
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let name = p.split(": ").next().unwrap_or(p).trim_end_matches('?').trim_start_matches("...");
+            let arg = c.args.get(i).filter(|a| !a.contains('…') && !a.contains("<fn")).and_then(|a| rename(a, outer));
+            is_ident(name).then(|| (name.to_string(), arg))
+        })
+        .collect()
+}
+
+/// `s` with each parameter of `names` replaced by its argument; `None` when one has none.
+fn rename(s: &str, names: &Names) -> Option<String> {
+    rewrite_roots(s, &|x: &str| match names.get(x) {
+        Some(arg) => arg.clone(),
+        None => Some(x.to_string()),
+    })
+}
+
+/// `s` renamed, or as written when it cannot be.
+fn renamed(s: &str, names: &Names) -> String {
+    rename(s, names).unwrap_or_else(|| s.to_string())
 }
 
 fn is_ident(s: &str) -> bool {

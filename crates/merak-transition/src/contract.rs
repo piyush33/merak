@@ -176,7 +176,7 @@ fn items(
     // those of a helper that exists on this side only (a loop moved out into it).
     let mut skip_seen = BTreeSet::new();
     let moved = crate::inline_skips(model, id, matched, skip_peer);
-    for s in scope.iter().filter_map(|k| model.entities.get(*k)).flat_map(|me| me.skips.iter()).chain(moved) {
+    for s in scope.iter().filter_map(|k| model.entities.get(*k)).flat_map(|me| me.skips.iter()).chain(moved.iter().map(|(_, s)| s)) {
         let text = format!("{}: skipped when {}", s.over, s.when);
         if skip_seen.insert((text.clone(), s.loc.clone())) {
             out.push(Item { row: "skips", key: text.clone(), text, loc: Some(s.loc.clone()), when: None });

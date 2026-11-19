@@ -999,3 +999,29 @@ fn a_loosened_check_shows_what_it_became() {
     assert_eq!(run("!comment", "!comment && !reason"), ["GUARD_ADDED", "GUARD_REMOVED"]);
     assert_eq!(run("!comment && !reason", "!comment"), ["GUARD_ADDED"]);
 }
+
+/// A loop or a guarded call moved into a helper that names its parameter differently
+/// (`persist(input)` called as `persist(dto)`) is the same behaviour: the helper's facts are
+/// read in the caller's names.
+#[test]
+fn a_helper_is_read_in_its_callers_names() {
+    let files = |s: &str| -> merak_cli::source::Files {
+        [("src/a.ts".to_string(), s.to_string()), ("src/n.ts".to_string(), "export function note(s: string) { return s.length; }\n".to_string())]
+            .into_iter()
+            .collect()
+    };
+    let before = "import { note } from './n';\nexport class Svc {\n  run(dto: { x?: string; items: string[] }) {\n    if (dto.x) {\n      note(dto.x);\n    }\n    for (const it of dto.items) {\n      if (it === '') continue;\n      note(it);\n    }\n    return 1;\n  }\n}\n";
+    let after = "import { note } from './n';\nexport class Svc {\n  run(dto: { x?: string; items: string[] }) {\n    this.persist(dto);\n    return 1;\n  }\n  persist(input: { x?: string; items: string[] }) {\n    if (input.x) {\n      note(input.x);\n    }\n    for (const it of input.items) {\n      if (it === '') continue;\n      note(it);\n    }\n  }\n}\n";
+    let only_new_helper = |a: &str, b: &str| {
+        let t = merak_cli::diff(&files(a), &files(b)).unwrap();
+        assert!(t.ops.iter().all(|o| matches!(o.kind.as_str(), "ENTITY_ADDED" | "PURE_REFACTOR")), "{:#?}", t.ops);
+    };
+    only_new_helper(before, after);
+    // The guarded call alone: its condition, in the caller's names.
+    let call_only = |s: &str| {
+        let i = s.find("    for (").unwrap_or(s.len());
+        let j = s[i..].find("    }\n").map_or(s.len(), |k| i + k + 6);
+        format!("{}{}", &s[..i], &s[j..])
+    };
+    only_new_helper(&call_only(before), &call_only(after));
+}
