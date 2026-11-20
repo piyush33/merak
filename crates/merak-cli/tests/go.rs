@@ -724,3 +724,20 @@ fn a_reused_err_does_not_stand_for_another_check() {
     let k: Vec<&str> = t.ops.iter().map(|o| o.kind.as_str()).collect();
     assert!(k.contains(&"GUARD_ADDED") || k.iter().any(|k| k.contains("GUARD")), "{:#?}", t.ops);
 }
+
+/// What a helper puts into a map its caller passes (`audit(updates, who)` writing
+/// `into["updated_by"]`) is part of the caller's record: moving that write into a new helper
+/// is a refactor, and writing another value there is still a change.
+#[test]
+fn a_helper_fills_its_callers_record() {
+    let before = "package app\n\nfunc Save(who string, name string) map[string]any {\n\tupdates := map[string]any{}\n\tupdates[\"name\"] = name\n\tupdates[\"updated_by\"] = who\n\treturn updates\n}\n";
+    let after = |v: &str| {
+        format!("package app\n\nfunc audit(into map[string]any, who string) {{\n\tinto[\"updated_by\"] = {v}\n}}\n\nfunc Save(who string, name string) map[string]any {{\n\tupdates := map[string]any{{}}\n\tupdates[\"name\"] = name\n\taudit(updates, who)\n\treturn updates\n}}\n")
+    };
+    let t = merak_cli::diff(&files(&[("app.go", before)]), &files(&[("app.go", &after("who"))])).unwrap();
+    assert!(t.ops.iter().all(|o| matches!(o.kind.as_str(), "ENTITY_ADDED" | "PURE_REFACTOR")), "{:#?}", t.ops);
+    let (fa, fb) = (files(&[("app.go", before)]), files(&[("app.go", &after("\"system\""))]));
+    let t = merak_cli::diff(&fa, &fb).unwrap();
+    let view = merak_cli::render(&t, "behaviour", "test", &fa, &fb);
+    assert!(view.contains("updates.updated_by := system"), "{view}");
+}

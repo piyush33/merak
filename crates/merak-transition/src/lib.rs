@@ -1556,6 +1556,42 @@ fn inline_requires(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (
     out
 }
 
+/// What a function puts into objects that outlive it, by where they come from: a record it
+/// builds (`updates.name := …`) or one its caller passed (`into.x := …`), with what helpers on
+/// this side only put into those objects through their parameters, in its names
+/// (`audit(updates)` writing `into.updated_by` is `updates.updated_by`).
+pub(crate) fn inline_writes(model: &Model, e: &merak_behaviour::Entity, matched: &dyn Fn(&str) -> bool) -> Vec<merak_behaviour::WriteFact> {
+    fn through(
+        model: &Model,
+        e: &merak_behaviour::Entity,
+        names: &Names,
+        matched: &dyn Fn(&str) -> bool,
+        depth: u32,
+        out: &mut Vec<merak_behaviour::WriteFact>,
+    ) {
+        for w in &e.mutates {
+            if let (Some(field), Some(value)) = (rename(&w.field, names), w.value.as_deref().map(|v| rename(v, names)).unwrap_or(Some(String::new()))) {
+                out.push(merak_behaviour::WriteFact { field, value: (!value.is_empty()).then_some(value), ..w.clone() });
+            }
+        }
+        if depth >= 4 {
+            return;
+        }
+        for c in e.calls.iter().filter(|c| !matched(&c.target)) {
+            if let Some(t) = model.entities.get(&c.target).filter(|t| t.parent.is_none()) {
+                through(model, t, &call_names(t, c, names), matched, depth + 1, out);
+            }
+        }
+    }
+    let mut out: Vec<merak_behaviour::WriteFact> = e.sets.clone();
+    let mut theirs = vec![];
+    through(model, e, &Names::new(), matched, 0, &mut theirs);
+    // A helper's write lands where its argument came from: this function's own record is a
+    // record write, like the rest of it.
+    out.extend(theirs);
+    out
+}
+
 /// A helper's parameters by name, each with what a call passes there, in the terms of the
 /// function the helpers are inlined into (`None`: not expressible there, `{…}` or a closure).
 pub(crate) type Names = BTreeMap<String, Option<String>>;

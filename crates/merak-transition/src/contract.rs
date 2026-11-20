@@ -249,15 +249,9 @@ fn items(
             out.push(Item { row: "post", key: w.field.clone(), text, loc: Some(w.loc.clone()), when: None });
         }
     }
-    // What it puts into a record it builds (`updates.zoho_item_id := gorm.Expr("COALESCE(…)", v)`).
-    for w in &e.sets {
-        let text = format!("{} := {}", w.field, w.value.as_deref().unwrap_or("…"));
-        if own.insert(text.clone()) {
-            out.push(Item { row: "post", key: w.field.clone(), text, loc: Some(w.loc.clone()), when: None });
-        }
-    }
-    // What it writes into what its caller passed: `into[singular(w)]`.
-    for w in &e.mutates {
+    // What it puts into a record it builds (`updates.zoho_item_id := gorm.Expr("COALESCE(…)", v)`)
+    // or into what its caller passed (`into[singular(w)]`), helpers on this side only included.
+    for w in crate::inline_writes(model, e, matched) {
         let text = match &w.value {
             Some(v) => format!("{} := {v}", w.field),
             None => format!("{} is written", w.field),

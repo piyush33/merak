@@ -769,27 +769,32 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         }
     }
     // Columns a new script sets, by table: `material_groups: title := Lighting, slug := lighting …`.
-    let sets: Vec<usize> =
-        (0..out.len()).filter(|&i| new && out[i].kind == "WRITES" && out[i].text.starts_with("sets ") && out[i].text.contains(" := ")).collect();
+    // `table.col` only: a key by index (`cns[models.X]`) is a value, not a column.
+    let column = |t: &str| -> Option<(String, String, String)> {
+        let t = t.strip_prefix("sets ")?;
+        let (field, value) = t.split_once(" := ")?;
+        if field.contains('[') {
+            return None;
+        }
+        let (table, col) = field.rsplit_once('.')?;
+        Some((table.to_string(), col.to_string(), value.to_string()))
+    };
+    let sets: Vec<usize> = (0..out.len()).filter(|&i| new && out[i].kind == "WRITES" && column(&out[i].text).is_some()).collect();
     if sets.len() > 2 {
-        let mut by_table: Vec<(String, Vec<String>)> = vec![];
+        let mut by_table: Vec<(String, Vec<String>, Vec<String>)> = vec![];
         for &i in &sets {
-            let t = out[i].text.trim_start_matches("sets ");
-            let (field, value) = t.split_once(" := ").unwrap_or((t, ""));
-            let (table, col) = field.rsplit_once('.').unwrap_or(("", field));
-            let value = if value.chars().count() > 30 { format!("{}…", value.chars().take(29).collect::<String>()) } else { value.to_string() };
-            match by_table.iter_mut().find(|(x, _)| x == table) {
-                Some((_, cs)) => cs.push(format!("{col} := {value}")),
-                None => by_table.push((table.to_string(), vec![format!("{col} := {value}")])),
+            let Some((table, col, value)) = column(&out[i].text) else { continue };
+            let value = if value.chars().count() > 30 { format!("{}…", value.chars().take(29).collect::<String>()) } else { value };
+            match by_table.iter_mut().find(|(x, _, _)| *x == table) {
+                Some((_, cs, _)) => cs.push(format!("{col} := {value}")),
+                None => by_table.push((table, vec![format!("{col} := {value}")], out[i].evidence.clone())),
             }
         }
         let first = sets[0];
-        for &i in sets[1..].iter().rev() {
+        for &i in sets.iter().rev() {
             out.remove(i);
         }
-        let ev = out[first].evidence.clone();
-        out.remove(first);
-        for (k, (table, cols)) in by_table.into_iter().enumerate() {
+        for (k, (table, cols, ev)) in by_table.into_iter().enumerate() {
             out.insert(
                 first + k,
                 Line {

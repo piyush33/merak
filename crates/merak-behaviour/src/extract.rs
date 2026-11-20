@@ -771,14 +771,14 @@ impl Walker<'_, '_> {
                         let v = self.ix.const_str(self.env, value);
                         self.e.writes.push(WriteFact { field, value: v, creation: false, loc: aloc.clone() });
                     } else if let Some(p) = self.param(object) {
-                        let v = self.ix.const_str(self.env, value);
+                        // The value as written, as for a record: the caller's object gets it.
+                        let v = self.ix.const_str(self.env, value).or_else(|| Some(clip_text(render(value))));
                         self.e.mutates.push(WriteFact { field: format!("{p}.{property}"), value: v, creation: false, loc: aloc.clone() });
                     } else if let Expr::Ident(r) = object.as_ref() {
                         // A record built key by key: the value as written, so `COALESCE(col, ?)`
                         // and a plain value read apart.
                         if self.records.contains(r) {
-                            let text = render(value);
-                            let text = if text.chars().count() > 200 { format!("{}…", text.chars().take(199).collect::<String>()) } else { text };
+                            let text = clip_text(render(value));
                             self.e.sets.push(WriteFact { field: format!("{r}.{property}"), value: Some(text), creation: false, loc: aloc.clone() });
                         }
                     }
@@ -787,7 +787,7 @@ impl Walker<'_, '_> {
                 // `into[k] = v` where `into` is a parameter: the caller's map or slice changes.
                 if let Expr::Index { object, index } = target.as_ref() {
                     if let Some(p) = self.param(object) {
-                        let v = self.ix.const_str(self.env, value);
+                        let v = self.ix.const_str(self.env, value).or_else(|| Some(clip_text(render(value))));
                         self.e.mutates.push(WriteFact { field: format!("{p}[{}]", render(index)), value: v, creation: false, loc: aloc.clone() });
                     }
                 }
@@ -2334,6 +2334,15 @@ fn each_expr<'e>(stmts: &'e [Stmt], f: &mut dyn FnMut(&'e Expr)) {
 }
 
 /// The names assigned inside the closures of a body, at any depth.
+/// A written value as text, at most 200 characters.
+fn clip_text(text: String) -> String {
+    if text.chars().count() > 200 {
+        format!("{}…", text.chars().take(199).collect::<String>())
+    } else {
+        text
+    }
+}
+
 /// The local an expression starts from: `fields` in `fields[k].x`.
 fn root_ident(e: &Expr) -> Option<String> {
     match e {
