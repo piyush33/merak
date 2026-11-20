@@ -864,6 +864,29 @@ impl Walker<'_, '_> {
                 self.depth -= 1;
             }
             Expr::Jsx(j) => {
+                // `<FallbackImage src={…}/>` renders a component of this program: a call to it,
+                // so what it does (fetches, checks) is part of what this one does.
+                if j.tag.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    let mut parts = j.tag.split('.');
+                    let first = Expr::Ident(parts.next().unwrap_or_default().to_string());
+                    let callee = parts.fold(first, |o, p| Expr::Member { object: Box::new(o), property: p.to_string() });
+                    if let Callee::Internal(target) = self.ix.resolve_call(self.env, &callee) {
+                        if target != self.e.id {
+                            self.e.calls.push(CallFact {
+                                target,
+                                loc: loc.clone(),
+                                conditional: self.depth > 0,
+                                spawned: false,
+                                args: vec![],
+                                arg_skeletons: vec![],
+                                arg_params: vec![],
+                                path: self.full_path(),
+                                caught: self.cd.caught(self.cur),
+                                props: j.attrs.iter().filter(|(k, _)| k != "...").map(|(k, v)| (k.clone(), arg_text(v))).collect(),
+                            });
+                        }
+                    }
+                }
                 // `onMouseEnter={() => setActive(i)}`: the event and what it does.
                 for (k, v) in &j.attrs {
                     let is_event = k.len() > 2 && k.starts_with("on") && k[2..].starts_with(|c: char| c.is_ascii_uppercase());
@@ -889,6 +912,7 @@ impl Walker<'_, '_> {
                         arg_params: vec![],
                         path: self.full_path(),
                         caught: self.cd.caught(self.cur),
+                        props: vec![],
                     });
                     // By its name within this entity, so the conditions it is used under count.
                     // By kind, not position: inserting a sibling renumbers `useMemo#4` to `#5`.
@@ -933,6 +957,7 @@ impl Walker<'_, '_> {
                     arg_params,
                     path: self.full_path(),
                     caught: self.cd.caught(self.cur),
+                    props: vec![],
                 });
             }
             Callee::External(api) if self.cat.is_filter(&api) => {

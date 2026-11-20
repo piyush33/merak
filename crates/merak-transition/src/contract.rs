@@ -290,11 +290,15 @@ fn items(
         }
     }
     let chained = !std::ptr::eq(outputs, &e.outputs);
+    // Whose outputs these are: a component's markup moved into a new component reads as before.
+    let owner = model.entities.values().find(|x| std::ptr::eq(&x.outputs, outputs)).unwrap_or(e);
+    let names = crate::Names::new();
     for o in outputs {
         let case = if o.when.is_empty() { "otherwise".to_string() } else { format!("when {}", o.when.join(" ∧ ")) };
         let value = if chained { o.value.clone() } else { extracted(&o.value).unwrap_or_else(|| o.value.clone()) };
+        let value = crate::inline_jsx(model, owner, &value, &names, matched, 0);
         out.push(Item { row: "returns", key: case.clone(), text: format!("{case}: {value}"), loc: Some(o.loc.clone()), when: None });
-        for r in &o.renders {
+        for r in &crate::inline_renders(model, owner, &o.renders, &names, matched, 0) {
             let shown = if r.when.is_empty() { r.content.clone() } else { format!("{} if {}", r.content, r.when) };
             out.push(Item { row: "renders", key: format!("{case}|{shown}"), text: format!("{shown}: {}", r.style), loc: Some(o.loc.clone()), when: None });
         }

@@ -1014,7 +1014,12 @@ fn inline_outputs(model: &Model, e: &merak_behaviour::Entity, matched: &dyn Fn(&
             when.dedup();
             match returned_helper(model, e, o, matched).filter(|_| depth < 4) {
                 Some((t, c)) => walk(model, t, &call_names(t, c, names), &when, matched, depth + 1, out),
-                None => out.push(merak_behaviour::Output { when, value: renamed(&o.value, names), ..o.clone() }),
+                None => out.push(merak_behaviour::Output {
+                    when,
+                    value: inline_jsx(model, e, &renamed(&o.value, names), names, matched, 0),
+                    renders: inline_renders(model, e, &o.renders, names, matched, 0),
+                    ..o.clone()
+                }),
             }
         }
     }
@@ -1524,20 +1529,173 @@ fn inline_requires(model: &Model, id: &str, matched: &dyn Fn(&str) -> bool) -> (
 
 /// A helper's parameters by name, each with what a call passes there, in the terms of the
 /// function the helpers are inlined into (`None`: not expressible there, `{…}` or a closure).
-type Names = BTreeMap<String, Option<String>>;
+pub(crate) type Names = BTreeMap<String, Option<String>>;
 
 /// The names of `t`'s parameters at call `c`, its arguments read through `outer` (the names
 /// of the helper `c` is made from, when helpers nest).
 fn call_names(t: &merak_behaviour::Entity, c: &merak_behaviour::CallFact, outer: &Names) -> Names {
-    t.params
+    let usable = |a: &String| !a.contains('…') && !a.contains("<fn");
+    let mut names: Names = t
+        .params
         .iter()
         .enumerate()
         .filter_map(|(i, p)| {
             let name = p.split(": ").next().unwrap_or(p).trim_end_matches('?').trim_start_matches("...");
-            let arg = c.args.get(i).filter(|a| !a.contains('…') && !a.contains("<fn")).and_then(|a| rename(a, outer));
+            let arg = c.args.get(i).filter(|a| usable(a)).and_then(|a| rename(a, outer));
             is_ident(name).then(|| (name.to_string(), arg))
         })
-        .collect()
+        .collect();
+    // A rendered component: `function Title({ who, size = 2 }: …)` given `<Title who={member}/>`.
+    if let Some(first) = t.params.first().filter(|_| !c.props.is_empty()) {
+        for (prop, local) in destructured(first) {
+            let arg = c.props.iter().find(|(k, _)| *k == prop).map(|(_, v)| v).filter(|v| usable(v)).and_then(|v| rename(v, outer));
+            names.insert(local, arg);
+        }
+    }
+    names
+}
+
+/// The names a destructured parameter binds, each with the property it reads:
+/// `{ who, a: b, c = 1, ...rest }: T` → `(who, who)`, `(a, b)`, `(c, c)`.
+fn destructured(param: &str) -> Vec<(String, String)> {
+    let Some(body) = param.trim().strip_prefix('{') else { return vec![] };
+    let mut depth = 0;
+    let end = body.char_indices().find(|&(_, ch)| {
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' if depth > 0 => depth -= 1,
+            '}' => return true,
+            _ => {}
+        }
+        false
+    });
+    let Some((end, _)) = end else { return vec![] };
+    let mut out = vec![];
+    let (mut depth, mut start) = (0, 0);
+    let inner = &body[..end];
+    for (i, ch) in inner.char_indices().chain([(inner.len(), ',')]) {
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let item = inner[start..i].trim();
+                start = i + 1;
+                let item = item.split('=').next().unwrap_or(item).trim();
+                let (prop, local) = match item.split_once(':') {
+                    Some((p, l)) => (p.trim(), l.trim()),
+                    None => (item, item),
+                };
+                if is_ident(prop) && is_ident(local) {
+                    out.push((prop.to_string(), local.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The render of a component of this program, by its tag: `<Title who={member}/>` → the
+/// call that renders it (the one whose props the element shows, else the first).
+fn render_call<'x>(
+    model: &'x Model,
+    e: &'x merak_behaviour::Entity,
+    tag: &str,
+    element: &str,
+    matched: &dyn Fn(&str) -> bool,
+) -> Option<(&'x merak_behaviour::Entity, &'x merak_behaviour::CallFact)> {
+    let calls: Vec<(&merak_behaviour::Entity, &merak_behaviour::CallFact)> = e
+        .calls
+        .iter()
+        .filter(|c| !matched(&c.target))
+        .filter_map(|c| model.entities.get(&c.target).filter(|t| t.parent.is_none() && t.name.rsplit('.').next() == Some(tag)).map(|t| (t, c)))
+        .collect();
+    let shows = |c: &merak_behaviour::CallFact| c.props.iter().all(|(k, v)| element.contains(&format!("{k}={{{v}}}")) || element.contains(&format!("{k}={v}")));
+    calls.iter().find(|(_, c)| shows(c)).or(calls.first()).copied()
+}
+
+/// The one thing a component renders, when it renders one thing in all cases.
+fn sole_output(t: &merak_behaviour::Entity) -> Option<&merak_behaviour::Output> {
+    match t.outputs.as_slice() {
+        [o] if o.when.is_empty() && o.value.starts_with('<') => Some(o),
+        _ => None,
+    }
+}
+
+/// `value` with each `<Title …/>` of a component on this side only replaced by what it renders,
+/// in `e`'s names: markup moved into a new component is the same markup.
+pub(crate) fn inline_jsx(model: &Model, e: &merak_behaviour::Entity, value: &str, names: &Names, matched: &dyn Fn(&str) -> bool, depth: u32) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let tag: String = tail[1..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let after = &tail[1 + tag.len()..];
+        let element_end = (depth < 4 && tag.starts_with(|c: char| c.is_ascii_uppercase()) && after.starts_with([' ', '.', '/']))
+            .then(|| {
+                let mut d = 0;
+                tail.char_indices().find(|&(j, ch)| {
+                    match ch {
+                        '{' => d += 1,
+                        '}' => d -= 1,
+                        '>' if d == 0 => return true,
+                        _ => {}
+                    }
+                    let _ = j;
+                    false
+                })
+            })
+            .flatten()
+            .filter(|&(j, _)| tail[..j].ends_with('/'));
+        let replaced = element_end.and_then(|(j, _)| {
+            let element = &tail[..=j];
+            let (t, c) = render_call(model, e, &tag, element, matched)?;
+            let o = sole_output(t)?;
+            let inner = call_names(t, c, names);
+            Some((j, inline_jsx(model, t, &renamed(&o.value, &inner), &inner, matched, depth + 1)))
+        });
+        match replaced {
+            Some((j, text)) => {
+                out.push_str(&text);
+                rest = &tail[j + 1..];
+            }
+            None => {
+                out.push('<');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Rendered pieces with each `<Title>` of a component on this side only replaced by the pieces
+/// it renders, in `e`'s names and under both conditions.
+pub(crate) fn inline_renders(
+    model: &Model,
+    e: &merak_behaviour::Entity,
+    renders: &[merak_behaviour::Rendered],
+    names: &Names,
+    matched: &dyn Fn(&str) -> bool,
+    depth: u32,
+) -> Vec<merak_behaviour::Rendered> {
+    let mut out = vec![];
+    for r in renders {
+        let tag = r.content.strip_prefix('<').and_then(|x| x.strip_suffix('>')).filter(|t| t.starts_with(|c: char| c.is_ascii_uppercase()) && is_ident(t));
+        let child = tag.filter(|_| depth < 4).and_then(|t| render_call(model, e, t, "", matched)).and_then(|(t, c)| Some((t, c, sole_output(t)?)));
+        match child {
+            Some((t, c, o)) => {
+                let inner = call_names(t, c, names);
+                for x in inline_renders(model, t, &o.renders, &inner, matched, depth + 1) {
+                    let when = [renamed(&r.when, names), x.when].into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ∧ ");
+                    out.push(merak_behaviour::Rendered { when, ..x });
+                }
+            }
+            None => out.push(merak_behaviour::Rendered { content: renamed(&r.content, names), style: renamed(&r.style, names), when: renamed(&r.when, names) }),
+        }
+    }
+    out
 }
 
 /// `s` with each parameter of `names` replaced by its argument; `None` when one has none.

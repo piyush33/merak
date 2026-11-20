@@ -1041,3 +1041,18 @@ fn a_returned_helper_answers_for_its_caller() {
     let changed = t.ops.iter().find(|o| o.kind == "OUTPUT_CHANGED").unwrap_or_else(|| panic!("{:#?}", t.ops));
     assert!(changed.after.as_deref().is_some_and(|a| a.contains("\"Others\"")), "{changed:#?}");
 }
+
+/// Markup moved into a new component (`<Title who={member}/>` rendering `{who.name}`) is the
+/// same markup: the component is rendered in the parent's names. Changing it is a change.
+#[test]
+fn markup_moved_into_a_component_is_the_same_markup() {
+    let files = |s: &str| -> merak_cli::source::Files { [("src/a.tsx".to_string(), s.to_string())].into_iter().collect() };
+    let before = "export function Card({ member, busy }: { member: { name: string }; busy: boolean }) {\n  return (\n    <div className=\"card\">\n      {busy && <h2 className=\"title\">{member.name}</h2>}\n    </div>\n  );\n}\n";
+    let after = |class: &str| {
+        format!("export function Card({{ member, busy }}: {{ member: {{ name: string }}; busy: boolean }}) {{\n  return (\n    <div className=\"card\">\n      {{busy && <Title who={{member}} />}}\n    </div>\n  );\n}}\nfunction Title({{ who }}: {{ who: {{ name: string }} }}) {{\n  return <h2 className=\"{class}\">{{who.name}}</h2>;\n}}\n")
+    };
+    let t = merak_cli::diff(&files(before), &files(&after("title"))).unwrap();
+    assert!(t.ops.iter().all(|o| matches!(o.kind.as_str(), "ENTITY_ADDED" | "PURE_REFACTOR")), "{:#?}", t.ops);
+    let t = merak_cli::diff(&files(before), &files(&after("heading"))).unwrap();
+    assert!(t.ops.iter().any(|o| o.kind == "OUTPUT_CHANGED" && o.after.as_deref().is_some_and(|a| a.contains("h2.heading"))), "{:#?}", t.ops);
+}

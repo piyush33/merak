@@ -53,6 +53,10 @@ pub struct CallFact {
     /// Inside a `try` with a handler: what the callee throws stays in this function.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub caught: bool,
+    /// A rendered component's props, by name, as written (`who` → `member`): the arguments
+    /// of a render, which a component takes as one destructured parameter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub props: Vec<(String, String)>,
 }
 
 /// When a function fails: a `throw` (in Go, a returned new error) that leaves it, and the
