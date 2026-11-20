@@ -1056,3 +1056,26 @@ fn markup_moved_into_a_component_is_the_same_markup() {
     let t = merak_cli::diff(&files(before), &files(&after("heading"))).unwrap();
     assert!(t.ops.iter().any(|o| o.kind == "OUTPUT_CHANGED" && o.after.as_deref().is_some_and(|a| a.contains("h2.heading"))), "{:#?}", t.ops);
 }
+
+/// A handler map (`{ [T.A]: () => this.doA(), … }` dispatched by `handlers[t]()`): each entry
+/// is a function named after its key, so a new entry is a change of the function that holds
+/// the map, and moving the map into another function moves its handlers with it.
+#[test]
+fn a_handler_map_entry_is_a_call() {
+    let files = |s: &str| -> merak_cli::source::Files { [("src/a.ts".to_string(), s.to_string())].into_iter().collect() };
+    let src = |entries: &str, wrap: bool| {
+        let map = format!("    const handlers: Record<string, () => Promise<number>> = {{\n{entries}    }};\n    for (const t of types) {{\n      await handlers[t]();\n    }}\n");
+        let run = if wrap {
+            format!("  async run(types: T[]) {{\n    return this.inner(types);\n  }}\n  private async inner(types: T[]) {{\n{map}  }}\n")
+        } else {
+            format!("  async run(types: T[]) {{\n{map}  }}\n")
+        };
+        format!("enum T {{ A = 'a', B = 'b' }}\nexport class S {{\n{run}  async doA() {{ return 1; }}\n  async doB() {{ return 2; }}\n}}\n")
+    };
+    let one = "      [T.A]: () => this.doA(),\n";
+    let two = "      [T.A]: () => this.doA(),\n      [T.B]: () => this.doB(),\n";
+    let t = merak_cli::diff(&files(&src(one, false)), &files(&src(two, false))).unwrap();
+    assert!(t.ops.iter().any(|o| o.subject.ends_with("S.run") && o.after.as_deref().is_some_and(|a| a.contains("<fn B>"))), "{:#?}", t.ops);
+    let t = merak_cli::diff(&files(&src(two, false)), &files(&src(two, true))).unwrap();
+    assert!(!t.ops.iter().any(|o| matches!(o.kind.as_str(), "ENTITY_ADDED" | "ENTITY_REMOVED") && o.subject.contains(".A")), "{:#?}", t.ops);
+}

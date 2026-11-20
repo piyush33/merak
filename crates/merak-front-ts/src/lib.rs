@@ -666,8 +666,25 @@ impl<'s> Lowerer<'s> {
                 for p in &o.properties {
                     match p {
                         ObjectPropertyKind::ObjectProperty(p) => {
-                            if let Some(k) = property_key_name(&p.key) {
-                                props.push((k, self.expr(&p.value)));
+                            // `[SyncRequestType.AssetFacesV3]: () => …` (a handler map) keeps its
+                            // entry, keyed as written.
+                            let key = property_key_name(&p.key).or_else(|| p.key.as_expression().map(|e| format!("[{}]", self.text(e.span()))));
+                            if let Some(k) = key {
+                                // A function stored under a key is named after it: `AssetFacesV3`.
+                                let hint = k.trim_start_matches('[').trim_end_matches(']').rsplit('.').next().map(str::to_string);
+                                let value = match &p.value {
+                                    Expression::ArrowFunctionExpression(a) => {
+                                        let q = self.closure_name(hint);
+                                        ir::Expr::Closure(self.arrow(a, &q, false))
+                                    }
+                                    Expression::FunctionExpression(f) => {
+                                        let q = self.closure_name(hint);
+                                        let parent = self.scope.last().map(|p| self.entity_id(p));
+                                        ir::Expr::Closure(self.function(f, &q, None, ir::FunctionKind::Closure, false, parent))
+                                    }
+                                    v => self.expr(v),
+                                };
+                                props.push((k, value));
                             }
                         }
                         ObjectPropertyKind::SpreadProperty(s) => props.push(("...".into(), self.expr(&s.argument))),

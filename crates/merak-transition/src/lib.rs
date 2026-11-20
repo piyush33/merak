@@ -148,32 +148,61 @@ fn match_closures(a: &Model, b: &Model, m: &mut Matching) {
     // `Parent.useMemo#4` → `useMemo`: the kind of closure, without its position.
     let kind = |parent: &str, id: &str| id.strip_prefix(parent).unwrap_or(id).trim_start_matches('.').split('#').next().unwrap_or("").to_string();
     let mut queue: Vec<(String, String)> = m.forward.iter().map(|(x, y)| (x.clone(), y.clone())).collect();
-    while let Some((pa, pb)) = queue.pop() {
-        let (Some(ca), Some(cb)) = (kids_a.get(&pa), kids_b.get(&pb)) else { continue };
-        let mut groups: BTreeMap<String, (Vec<&String>, Vec<&String>)> = BTreeMap::new();
-        for id in ca {
-            groups.entry(kind(&pa, id)).or_default().0.push(id);
+    loop {
+        while let Some((pa, pb)) = queue.pop() {
+            let (Some(ca), Some(cb)) = (kids_a.get(&pa), kids_b.get(&pb)) else { continue };
+            let mut groups: BTreeMap<String, (Vec<&String>, Vec<&String>)> = BTreeMap::new();
+            for id in ca {
+                groups.entry(kind(&pa, id)).or_default().0.push(id);
+            }
+            for id in cb {
+                groups.entry(kind(&pb, id)).or_default().1.push(id);
+            }
+            for (_, (xs, mut ys)) in groups {
+                let mut rest = vec![];
+                for x in xs {
+                    match ys.iter().position(|y| b.entities[*y].body_hash == a.entities[x].body_hash) {
+                        Some(i) => {
+                            let y = ys.remove(i);
+                            m.forward.insert(x.clone(), y.clone());
+                            queue.push((x.clone(), y.clone()));
+                        }
+                        None => rest.push(x),
+                    }
+                }
+                // What's left changed in place: pair in source order.
+                for (x, y) in rest.into_iter().zip(ys) {
+                    m.forward.insert(x.clone(), y.clone());
+                    queue.push((x.clone(), y.clone()));
+                }
+            }
         }
-        for id in cb {
-            groups.entry(kind(&pb, id)).or_default().1.push(id);
-        }
-        for (_, (xs, mut ys)) in groups {
-            let mut rest = vec![];
-            for x in xs {
-                match ys.iter().position(|y| b.entities[*y].body_hash == a.entities[x].body_hash) {
-                    Some(i) => {
-                        let y = ys.remove(i);
+        // Closures moved with their code into another function (a handler map moved from
+        // `stream` into a new `streamInternal`): the same kind and the same body, the only one
+        // of its kind on each side.
+        {
+            let left = |model: &Model, matched: &dyn Fn(&str) -> bool| -> BTreeMap<(String, String), Vec<String>> {
+                let mut out: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+                for e in model.entities.values().filter(|e| !matched(&e.id)) {
+                    if let Some(p) = &e.parent {
+                        out.entry((kind(p, &e.id), e.body_hash.clone())).or_default().push(e.id.clone());
+                    }
+                }
+                out
+            };
+            let back: BTreeSet<String> = m.forward.values().cloned().collect();
+            let (la, lb) = (left(a, &|id| m.forward.contains_key(id)), left(b, &|id| back.contains(id)));
+            for (k, xs) in la {
+                if let (Some(ys), [x]) = (lb.get(&k), xs.as_slice()) {
+                    if let [y] = ys.as_slice() {
                         m.forward.insert(x.clone(), y.clone());
                         queue.push((x.clone(), y.clone()));
                     }
-                    None => rest.push(x),
                 }
             }
-            // What's left changed in place: pair in source order.
-            for (x, y) in rest.into_iter().zip(ys) {
-                m.forward.insert(x.clone(), y.clone());
-                queue.push((x.clone(), y.clone()));
-            }
+        }
+        if queue.is_empty() {
+            break;
         }
     }
 }
