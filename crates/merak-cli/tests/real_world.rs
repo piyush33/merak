@@ -1133,3 +1133,17 @@ fn a_passed_value_says_where_it_comes_from() {
     assert!(text.contains("`save` now gets ready instead of q.items"), "{text}");
     assert!(text.contains("`ready` is `q.items.filter(func(…))` (line 5)"), "{text}");
 }
+
+/// An effect that happens in a callee says how this function gets there: the calls on the way
+/// and where each is made.
+#[test]
+fn an_effect_in_a_callee_shows_the_calls_that_reach_it() {
+    let notify = "export async function send(u: User) {\n  await fetch(\"https://hooks.example.com/notify\", { method: \"POST\" });\n}\nexport async function notify(u: User) {\n  await send(u);\n}\n";
+    let handle =
+        |call: &str| format!("import {{ notify }} from './notify';\nexport async function handle(member: User) {{\n  {call}\n  return member.id;\n}}\n");
+    let before = files(&[("src/notify.ts", notify), ("src/handle.ts", &handle("console.info(member.id);"))]);
+    let after = files(&[("src/notify.ts", notify), ("src/handle.ts", &handle("await notify(member);"))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
+    assert!(text.contains("through `notify` (called at line 3) → `send` (called at notify.ts:5)"), "{text}");
+}

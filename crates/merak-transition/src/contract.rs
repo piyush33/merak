@@ -1153,6 +1153,57 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
             }
         }
     }
+    // How it gets there: an effect or write that happens in a callee, with the calls on the
+    // way from this function (the slice from the entry to the place it happens).
+    let kids = |model: &Model| -> BTreeMap<String, Vec<String>> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for id in model.entities.keys() {
+            out.entry(top_level(model, id)).or_default().push(id.clone());
+        }
+        out
+    };
+    let (kids_a, kids_b) = (kids(a), kids(b));
+    for c in contracts.values_mut() {
+        for x in c.clauses.iter_mut().filter(|x| matches!(x.row.as_str(), "effects" | "post") && matches!(x.mark, '+' | '-' | '~')) {
+            let (model, kids) = if x.mark == '-' { (a, &kids_a) } else { (b, &kids_b) };
+            let text = if x.mark == '-' { x.before.as_deref() } else { x.after.as_deref() }.unwrap_or("").to_string();
+            let roots: Vec<&str> = kids.get(&c.entity).map(|v| v.iter().map(String::as_str).collect()).unwrap_or_else(|| vec![c.entity.as_str()]);
+            let does: Box<dyn Fn(&merak_behaviour::Entity) -> bool> = if x.row == "effects" {
+                if text == "none found" {
+                    continue;
+                }
+                Box::new(move |e: &merak_behaviour::Entity| {
+                    e.effects.iter().any(|f| {
+                        let r = f.key.render();
+                        text == r || text.starts_with(&format!("{r} ")) || text.starts_with(&format!("{r} when "))
+                    })
+                })
+            } else {
+                let Some(field) = text.strip_suffix(" is written (by a callee)").map(str::to_string) else { continue };
+                Box::new(move |e: &merak_behaviour::Entity| e.writes.iter().any(|w| w.field == field))
+            };
+            if let Some(path) = merak_behaviour::sdg::call_path(model, &roots, &*does) {
+                // Each hop by the function it enters (a closure by the one it is in), and where
+                // the call is: a line of this file, or file and line elsewhere.
+                let mut hops: Vec<String> = vec![];
+                let mut last: Option<String> = None;
+                for (t, l) in &path {
+                    let fun = top_level(model, t);
+                    if fun == c.entity || last.as_deref() == Some(fun.as_str()) {
+                        continue;
+                    }
+                    let at =
+                        if l.file == c.loc.file { format!("line {}", l.line) } else { format!("{}:{}", l.file.rsplit('/').next().unwrap_or(&l.file), l.line) };
+                    hops.push(format!("`{}` (called at {at})", short(&fun)));
+                    last = Some(fun);
+                }
+                if hops.is_empty() {
+                    continue;
+                }
+                x.from.push(format!("via\t{}", hops.join(" → ")));
+            }
+        }
+    }
     // A handler that changes component state leads on to what reads that state.
     for c in contracts.values_mut() {
         for x in c.clauses.iter_mut().filter(|x| x.row == "handles" && matches!(x.mark, '+' | '-' | '~')) {

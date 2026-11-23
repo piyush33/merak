@@ -275,3 +275,46 @@ pub fn sets_state(model: &Model, component: &str, setter: &str) -> bool {
         })
         .any(|e| e.call_shapes.iter().any(|s| s.shape.starts_with(&call)) || e.handlers.iter().any(|h| h.does.contains(&call)))
 }
+
+/// The shortest chain of calls from `roots` (a function and the closures inside it) to a
+/// function for which `does` holds: each hop's callee and the line of the call. `None` when
+/// a root does it itself, or nothing reachable does: the slice from an entry to an effect.
+pub fn call_path(model: &Model, roots: &[&str], does: &dyn Fn(&Entity) -> bool) -> Option<Vec<(String, merak_ir::Loc)>> {
+    if roots.iter().filter_map(|r| model.entities.get(*r)).any(does) {
+        return None;
+    }
+    let mut prev: BTreeMap<String, (String, merak_ir::Loc)> = BTreeMap::new();
+    let mut seen: BTreeSet<String> = roots.iter().map(|r| r.to_string()).collect();
+    let mut frontier: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
+    for _ in 0..8 {
+        let mut next = vec![];
+        for cur in &frontier {
+            let Some(e) = model.entities.get(cur) else { continue };
+            for c in &e.calls {
+                if !seen.insert(c.target.clone()) {
+                    continue;
+                }
+                prev.insert(c.target.clone(), (cur.clone(), c.loc.clone()));
+                if model.entities.get(&c.target).is_some_and(does) {
+                    let mut path = vec![];
+                    let mut at = c.target.clone();
+                    while let Some((from, loc)) = prev.get(&at) {
+                        path.push((at.clone(), loc.clone()));
+                        if roots.contains(&from.as_str()) {
+                            break;
+                        }
+                        at = from.clone();
+                    }
+                    path.reverse();
+                    return Some(path);
+                }
+                next.push(c.target.clone());
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    None
+}

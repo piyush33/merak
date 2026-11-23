@@ -594,6 +594,11 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         // What depends on the value written: the decisions elsewhere that test it.
         // Where a passed value comes from: how each local in it is built, and on which lines.
         for f in &x.from {
+            // The calls on the way to where it happens.
+            if let Some(path) = f.strip_prefix("via\t") {
+                detail.push(format!("through {path}"));
+                continue;
+            }
             let (what, lines) = f.split_once('\t').unwrap_or((f, ""));
             let (name, built) = what.split_once(" = ").unwrap_or((what, ""));
             let mut built = built.to_string();
