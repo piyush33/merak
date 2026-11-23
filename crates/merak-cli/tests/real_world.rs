@@ -1147,3 +1147,16 @@ fn an_effect_in_a_callee_shows_the_calls_that_reach_it() {
     let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
     assert!(text.contains("through `notify` (called at line 3) → `send` (called at notify.ts:5)"), "{text}");
 }
+
+/// `const { repo } = deps` binds `repo` to `deps.repo`, so calls through it resolve; and a
+/// read the function makes itself is its own even when a check it calls makes the same read.
+#[test]
+fn destructured_names_keep_their_calls() {
+    let src = "import { PrismaClient } from '@prisma/client';\nconst prisma = new PrismaClient();\nexport class Repo {\n  async get(k: string) {\n    return await prisma.meta.findFirst({ where: { k } });\n  }\n}\nexport interface Deps { repo: Repo }\nexport async function check(deps: Deps) {\n  const { repo } = deps;\n  const v = await repo.get(\"x\");\n  if (!v) {\n    throw new Error(\"missing\");\n  }\n}\nexport async function handle(deps: Deps, r: Repo) {\n  await check(deps);\n  return await r.get(\"y\");\n}\n";
+    let m = merak_cli::model(&files(&[("s.ts", src)])).unwrap();
+    let calls: Vec<&str> = m.entities["s.ts::check"].calls.iter().map(|c| c.target.as_str()).collect();
+    assert_eq!(calls, ["s.ts::Repo.get"]);
+    let effects: Vec<String> = m.effects_outside_checks("s.ts::handle").iter().map(|(k, _)| k.render()).collect();
+    assert!(m.validators.contains("s.ts::check"), "{:?}", m.validators);
+    assert_eq!(effects, ["db_read meta"], "its own read, though `check` reads there too");
+}

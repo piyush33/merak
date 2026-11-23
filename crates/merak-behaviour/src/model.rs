@@ -565,8 +565,35 @@ impl Model {
             .filter_map(|v| self.summaries.get(v))
             .chain(self.entities.values().filter(|e| e.access.iter().any(|a| a.dynamic())).filter_map(|e| self.summaries.get(&e.id)).filter(|x| read_only(x)))
             .collect();
-        let in_checks =
+        let check_ids: BTreeSet<&str> = s
+            .validations
+            .keys()
+            .map(String::as_str)
+            .chain(
+                self.entities
+                    .values()
+                    .filter(|e| e.access.iter().any(|a| a.dynamic()))
+                    .filter(|e| self.summaries.get(&e.id).is_some_and(read_only))
+                    .map(|e| e.id.as_str()),
+            )
+            .collect();
+        let at_checks =
             |k: &EffectKey, i: &EffectInfo| i.evidence.iter().all(|l| checks.iter().any(|cs| cs.effects.get(k).is_some_and(|ci| ci.evidence.contains(l))));
+        // Inside checks only when every way it is reached goes through one: a read the
+        // function also makes itself, through the same repository method, is its own.
+        fn through(model: &Model, id: &str, k: &EffectKey, checks: &BTreeSet<&str>, seen: &mut BTreeSet<String>) -> bool {
+            if checks.contains(id) {
+                return true;
+            }
+            if !seen.insert(id.to_string()) {
+                return true;
+            }
+            let Some(i) = model.summaries.get(id).and_then(|s| s.effects.get(k)) else { return true };
+            i.via.iter().all(|v| v != "direct" && !v.starts_with("event:") && through(model, v, k, checks, seen))
+        }
+        let in_checks = |k: &EffectKey, i: &EffectInfo| {
+            at_checks(k, i) && i.via.iter().all(|v| v != "direct" && !v.starts_with("event:") && through(self, v, k, &check_ids, &mut BTreeSet::new()))
+        };
         let mut out: Vec<(&EffectKey, &EffectInfo)> = s.effects.iter().filter(|(k, i)| !in_checks(k, i)).collect();
         out.sort_by_key(|(k, _)| (!crate::summary::WRITE_EFFECTS.contains(&k.kind.as_str()), k.render()));
         out

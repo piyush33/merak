@@ -536,6 +536,43 @@ impl<'s> Lowerer<'s> {
                                 out.push(ir::Stmt::Let { name, ty: None, init: Some(init), loc: dloc.clone() });
                             }
                         }
+                        // `const { data, error: err, n = 1 } = await load(id)`: each name from its
+                        // property. A plain name or path is read directly (`props.a`); anything
+                        // else is evaluated once, under a name that is its source text.
+                        BindingPattern::ObjectPattern(op) if d.init.is_some() => {
+                            let init_ast = d.init.as_ref().unwrap();
+                            let init = self.expr(init_ast);
+                            let plain = |e: &ir::Expr| -> bool {
+                                fn walk(e: &ir::Expr) -> bool {
+                                    match e {
+                                        ir::Expr::Ident(_) | ir::Expr::This => true,
+                                        ir::Expr::Member { object, .. } => walk(object),
+                                        _ => false,
+                                    }
+                                }
+                                walk(e)
+                            };
+                            let whole = if plain(&init) {
+                                init
+                            } else {
+                                let name = self.text(init_ast.span());
+                                out.push(ir::Stmt::Let { name: name.clone(), ty: None, init: Some(init), loc: dloc.clone() });
+                                ir::Expr::Ident(name)
+                            };
+                            for p in &op.properties {
+                                let (Some(key), false) = (p.key.static_name(), p.computed) else { continue };
+                                let local = match &p.value {
+                                    BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+                                    BindingPattern::AssignmentPattern(ap) => match &ap.left {
+                                        BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+                                        _ => continue,
+                                    },
+                                    _ => continue,
+                                };
+                                let init = ir::Expr::Member { object: Box::new(whole.clone()), property: key.to_string() };
+                                out.push(ir::Stmt::Let { name: local, ty: None, init: Some(init), loc: dloc.clone() });
+                            }
+                        }
                         _ => {
                             if let Some(e) = &d.init {
                                 out.push(ir::Stmt::Expr(self.expr(e), dloc));
