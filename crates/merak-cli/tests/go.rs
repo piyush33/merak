@@ -741,3 +741,14 @@ fn a_helper_fills_its_callers_record() {
     let view = merak_cli::render(&t, "behaviour", "test", &fa, &fb);
     assert!(view.contains("updates.updated_by := system"), "{view}");
 }
+
+/// A changed write leads on to what depends on it: the checks elsewhere that test the field.
+#[test]
+fn a_changed_write_names_the_checks_that_read_it() {
+    let after = edit("internal/orders/service.go", "o.Status = StatusPaid", "o.Status = StatusCancelled");
+    let t = merak_cli::diff(&shop(), &after).unwrap();
+    let view = merak_cli::render(&t, "behaviour", "test", &shop(), &after);
+    let line = view.lines().find(|l| l.contains("read by")).unwrap_or_else(|| panic!("{view}"));
+    assert!(line.contains("`Service.Cancel`"), "Cancel checks the status Pay writes: {view}");
+    assert!(!line.contains("`Service.Pay`"), "its own check is not downstream: {view}");
+}

@@ -111,3 +111,52 @@ fn bounded(p: Pred) -> Pred {
         p
     }
 }
+
+/// A decision that reads a field: a check (`check`) or a branch some work runs under, with
+/// the condition as written there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldUse {
+    pub entity: String,
+    pub check: bool,
+    pub cond: String,
+    pub loc: merak_ir::Loc,
+}
+
+/// The data half's first edge: for each typed field (`Order.Status`), the decisions anywhere
+/// in the program that test it, so a changed write leads to what depends on the value.
+pub fn decisions(model: &Model) -> BTreeMap<String, Vec<FieldUse>> {
+    fn leaves<'p>(p: &'p Pred, out: &mut Vec<&'p Pred>) {
+        match p {
+            Pred::And(ps) | Pred::Or(ps) => ps.iter().for_each(|q| leaves(q, out)),
+            Pred::True | Pred::False => {}
+            q => out.push(q),
+        }
+    }
+    let typed = |f: &str| {
+        f.split_once('.').is_some_and(|(t, rest)| {
+            t.starts_with(|c: char| c.is_ascii_uppercase()) && !rest.is_empty() && rest.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
+    };
+    let mut out: BTreeMap<String, Vec<FieldUse>> = BTreeMap::new();
+    for e in model.entities.values() {
+        let mut found: Vec<(&Pred, bool, &merak_ir::Loc)> = e.guards.iter().map(|g| (&g.requires, true, &g.loc)).collect();
+        found.extend(e.calls.iter().map(|c| (&c.path, false, &c.loc)));
+        found.extend(e.effects.iter().map(|f| (&f.path, false, &f.loc)));
+        let mut seen = BTreeSet::new();
+        for (p, check, loc) in found {
+            let mut ls = vec![];
+            leaves(p, &mut ls);
+            for leaf in ls {
+                for (_, ops) in leaf.atom_operands() {
+                    for f in ops.iter().filter(|f| typed(f)) {
+                        let cond = leaf.render();
+                        if seen.insert((f.clone(), cond.clone())) {
+                            out.entry(f.clone()).or_default().push(FieldUse { entity: e.id.clone(), check, cond, loc: loc.clone() });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}

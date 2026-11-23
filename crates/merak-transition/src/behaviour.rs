@@ -586,7 +586,13 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
             out.push(Line { glyph: '?', kind: "CALLS", text, detail: vec![], evidence, places: 1, work: None });
             continue;
         }
-        let (mut text, detail) = phrase(x, new);
+        let (mut text, mut detail) = phrase(x, new);
+        // What depends on the value written: the decisions elsewhere that test it.
+        if !x.read_by.is_empty() {
+            let more = x.read_by.len().saturating_sub(3);
+            let shown: Vec<String> = x.read_by.iter().take(3).map(|r| plain(r)).collect();
+            detail.push(format!("read by {}{}", shown.join(" · "), if more > 0 { format!(" and {more} more") } else { String::new() }));
+        }
         if x.row == "passes" {
             if let Some(g) = x.tag.as_deref().and_then(|t| t.strip_prefix("now through ")).filter(|g| fresh.contains(*g)) {
                 text = text.replacen(&format!("through `{g}`"), &format!("through new `{g}`"), 1);

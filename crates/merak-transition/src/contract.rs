@@ -62,6 +62,10 @@ pub struct Clause {
     pub evidence_before: Option<Loc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_after: Option<Loc>,
+    /// For a changed write: the decisions elsewhere that test the field written, `Ship`
+    /// (`Order.Status ∈ {paid}`), so the change leads on to what depends on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_by: Vec<String>,
 }
 
 impl ContractDiff {
@@ -397,6 +401,7 @@ fn clause(row: &str, mark: char, a: Option<&Item>, b: Option<&Item>) -> Clause {
         when: b.or(a).and_then(|i| i.when.clone()),
         evidence_before: a.and_then(|i| i.loc.clone()),
         evidence_after: b.and_then(|i| i.loc.clone()),
+        read_by: vec![],
     }
 }
 
@@ -777,6 +782,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     when: None,
                     evidence_before: op.evidence_before.first().cloned(),
                     evidence_after: op.evidence_after.first().cloned(),
+                    read_by: vec![],
                 });
                 c.ops.push(op.id.clone());
                 continue;
@@ -806,6 +812,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     when: None,
                     evidence_before: op.evidence_before.first().cloned(),
                     evidence_after: op.evidence_after.first().cloned(),
+                    read_by: vec![],
                 };
                 attach(&mut contracts, &mut program, owner, cl, &op.id);
                 continue;
@@ -822,6 +829,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     when: None,
                     evidence_before: None,
                     evidence_after: op.evidence_after.first().cloned(),
+                    read_by: vec![],
                 };
                 attach(&mut contracts, &mut program, owner, cl, &op.id);
                 continue;
@@ -849,6 +857,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     when: None,
                     evidence_before: None,
                     evidence_after: op.evidence_after.first().cloned(),
+                    read_by: vec![],
                 };
                 attach(&mut contracts, &mut program, owner, cl, &op.id);
                 continue;
@@ -870,6 +879,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                         // The op's evidence is the function itself, not where it reads.
                         evidence_before: None,
                         evidence_after: None,
+                        read_by: vec![],
                     };
                     attach(&mut contracts, &mut program, owner, cl, &op.id);
                     continue;
@@ -923,6 +933,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     when: op.note.clone(),
                     evidence_before: op.evidence_before.first().cloned(),
                     evidence_after: op.evidence_after.first().cloned(),
+                    read_by: vec![],
                 };
                 if let Some(c) = owner.as_ref().and_then(|o| contracts.get_mut(o)) {
                     // In place of the item that otherwise reads as unchanged.
@@ -944,6 +955,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     when: None,
                     evidence_before: op.evidence_before.first().cloned(),
                     evidence_after: op.evidence_after.first().cloned(),
+                    read_by: vec![],
                 };
                 attach(&mut contracts, &mut program, owner, cl, &op.id);
                 continue;
@@ -995,6 +1007,7 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                 when: None,
                 evidence_before: op.evidence_before.first().cloned(),
                 evidence_after: op.evidence_after.first().cloned(),
+                read_by: vec![],
             };
             program.push((cl, op.id.clone()));
         }
@@ -1102,6 +1115,31 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
             }
         }
     }
+    // A changed write leads on to the decisions elsewhere that test the field.
+    let changed_field = |x: &Clause| -> Option<String> {
+        if x.row != "post" || !matches!(x.mark, '+' | '-' | '~') {
+            return None;
+        }
+        let t = x.after.as_deref().or(x.before.as_deref())?;
+        Some(t.split([' ', ':']).next()?.to_string())
+    };
+    if contracts.values().any(|c| c.clauses.iter().any(|x| changed_field(x).is_some())) {
+        let index = merak_behaviour::sdg::decisions(b);
+        for c in contracts.values_mut() {
+            for x in c.clauses.iter_mut() {
+                let Some(uses) = changed_field(x).and_then(|f| index.get(&f)) else { continue };
+                let mut names: Vec<String> = vec![];
+                for u in uses.iter().filter(|u| top_level(b, &u.entity) != c.entity) {
+                    let name = short(&top_level(b, &u.entity)).to_string();
+                    let shown = format!("`{name}` ({})", u.cond);
+                    if !names.iter().any(|n| n.starts_with(&format!("`{name}` "))) {
+                        names.push(shown);
+                    }
+                }
+                x.read_by = names;
+            }
+        }
+    }
     let mut out: Vec<ContractDiff> = contracts.into_values().collect();
     out.extend(schemas.into_values());
     if !program.is_empty() {
@@ -1174,6 +1212,7 @@ fn passes(a: &Model, b: &Model, m: &Matching, ida: &str, idb: &str) -> Vec<Claus
                     when: None,
                     evidence_before: Some(cb.loc.clone()),
                     evidence_after: Some(ca.loc.clone()),
+                    read_by: vec![],
                 });
                 for tok in new.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
                     if !tok.is_empty() && !tok.contains('.') && tok.starts_with(|c: char| c.is_alphabetic()) && !locals.contains(&tok.to_string()) {
@@ -1218,6 +1257,7 @@ fn passes(a: &Model, b: &Model, m: &Matching, ida: &str, idb: &str) -> Vec<Claus
             when: None,
             evidence_before: was.first().map(|(_, l)| l.clone()),
             evidence_after: now.first().map(|(_, l)| l.clone()),
+            read_by: vec![],
         });
     }
     out
