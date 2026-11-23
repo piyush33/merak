@@ -9,6 +9,7 @@
 //! and `calls` (changes Merak cannot type).
 
 use crate::{closures_by_parent, inline_filters, is_auth_pred, rewritten_into, short, Layer, Matching, Op};
+use merak_behaviour::pred::Pred;
 use merak_behaviour::{EntityKind, Model};
 use merak_ir::Loc;
 use serde::{Deserialize, Serialize};
@@ -318,51 +319,17 @@ fn items(
     out
 }
 
-/// The conditions under which `id` reaches effect `k`: the path conditions of each call on
-/// the way (`onQuery` → `goToLink` when `isMapsLink(v) ∨ coordsFromText(v)`, `ready`), and of
-/// the call that does it. `None` when it always happens.
+/// The conditions under which `id` reaches effect `k`, through every call on the way, in
+/// its own names (`onQuery` → `goToLink` when `isMapsLink(v) ∨ coordsFromText(v)`, `ready`).
+/// `None` when it always happens.
 fn effect_when(model: &Model, id: &str, k: &merak_behaviour::EffectKey) -> Option<String> {
-    let has = |t: &str| model.summaries.get(t).is_some_and(|s| s.effects.contains_key(k));
-    // Where the target is passed in: a callee sending its parameter to the same kind of place.
-    let passes = |t: &str| model.summaries.get(t).is_some_and(|s| s.by_param.values().flatten().any(|x| x.kind == k.kind && x.method == k.method));
-    let mut conds: Vec<String> = vec![];
-    let mut cur = id.to_string();
-    let mut seen = BTreeSet::new();
-    while seen.insert(cur.clone()) {
-        let e = model.entities.get(&cur)?;
-        // Done where it happens: an effect of its own, or the call that names the target.
-        if let Some(f) = e.effects.iter().find(|f| &f.key == k) {
-            if let Some(s) = e.call_shapes.iter().find(|s| s.effect && s.loc == f.loc) {
-                conds.extend(s.when.iter().cloned());
-            }
-            break;
-        }
-        // A real call first; of functions it only refers to (`<fn goToLink>`), the one nothing
-        // calls (the `onChange` handler), not one reached through it, so its conditions count.
-        let called = |t: &str| model.entities.values().any(|x| x.call_shapes.iter().any(|s| s.target.as_deref() == Some(t) && !s.shape.starts_with("<fn ")));
-        let rank = |s: &&merak_behaviour::CallShape| match (s.shape.starts_with("<fn "), s.target.as_deref().is_some_and(called)) {
-            (false, _) => 0,
-            (true, false) => 1,
-            (true, true) => 2,
-        };
-        let mut hops: Vec<&merak_behaviour::CallShape> = e.call_shapes.iter().filter(|s| s.target.as_deref().is_some_and(has)).collect();
-        hops.sort_by_key(rank);
-        let next = hops.first().copied().or_else(|| e.call_shapes.iter().find(|s| s.target.as_deref().is_some_and(passes)));
-        let Some(s) = next else { break };
-        conds.extend(s.when.iter().cloned());
-        let t = s.target.clone().unwrap_or_default();
-        if !has(&t) {
-            break;
-        }
-        cur = t;
-    }
-    let mut out: Vec<String> = vec![];
-    for c in conds {
-        if !out.contains(&c) {
-            out.push(c);
-        }
-    }
-    (!out.is_empty()).then(|| out.join(" ∧ "))
+    let r = model.summaries.get(id)?.reach.get(k)?;
+    let parts: Vec<String> = match &r.when {
+        Pred::True => return None,
+        Pred::And(ps) => ps.iter().map(Pred::render).collect(),
+        p => vec![p.render()],
+    };
+    Some(parts.join(" ∧ "))
 }
 
 /// The function an output returns the result of, when it exists on this side only:
@@ -940,6 +907,30 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
                     }
                     c.ops.push(op.id.clone());
                 }
+                continue;
+            }
+            // An effect that now happens under another condition: its `effects` item says so.
+            "EFFECT_CONDITION_CHANGED" => {
+                let owner = Some(top_level(b, &op.subject)).filter(|o| contracts.contains_key(o));
+                let key = op.after.as_deref().unwrap_or("").split(" when ").next().unwrap_or("").trim_end_matches(" always").to_string();
+                let cl = Clause {
+                    row: "effects".into(),
+                    mark: '~',
+                    before: op.before.clone(),
+                    after: op.after.clone(),
+                    tag: Some("happens under another condition".into()),
+                    // What the condition gained and lost (see the op's note).
+                    when: op.note.clone(),
+                    evidence_before: op.evidence_before.first().cloned(),
+                    evidence_after: op.evidence_after.first().cloned(),
+                };
+                if let Some(c) = owner.as_ref().and_then(|o| contracts.get_mut(o)) {
+                    // In place of the item that otherwise reads as unchanged.
+                    c.clauses.retain(|x| {
+                        !(x.row == "effects" && x.mark == ' ' && x.after.as_deref().is_some_and(|a| a == key || a.starts_with(&format!("{key} "))))
+                    });
+                }
+                attach(&mut contracts, &mut program, owner, cl, &op.id);
                 continue;
             }
             "UNCLASSIFIED_CHANGE" => {

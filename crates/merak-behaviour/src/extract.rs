@@ -881,6 +881,7 @@ impl Walker<'_, '_> {
                                 arg_skeletons: vec![],
                                 arg_params: vec![],
                                 path: self.full_path(),
+                                when: self.alt_path(),
                                 caught: self.cd.caught(self.cur),
                                 props: j.attrs.iter().filter(|(k, _)| k != "...").map(|(k, v)| (k.clone(), arg_text(v))).collect(),
                             });
@@ -911,6 +912,7 @@ impl Walker<'_, '_> {
                         arg_skeletons: vec![],
                         arg_params: vec![],
                         path: self.full_path(),
+                        when: self.alt_path(),
                         caught: self.cd.caught(self.cur),
                         props: vec![],
                     });
@@ -956,6 +958,7 @@ impl Walker<'_, '_> {
                     arg_skeletons,
                     arg_params,
                     path: self.full_path(),
+                    when: self.alt_path(),
                     caught: self.cd.caught(self.cur),
                     props: vec![],
                 });
@@ -1067,6 +1070,11 @@ impl Walker<'_, '_> {
     /// alternatives.
     fn full_path(&self) -> Pred {
         clean(all(vec![self.runs_under(self.cur, true, &mut vec![]).0, self.runs_under(self.cur, false, &mut vec![]).0]))
+    }
+
+    /// The alternatives alone the statement being walked runs under, without its checks.
+    fn alt_path(&self) -> Pred {
+        clean(self.runs_under(self.cur, false, &mut vec![]).0)
     }
 
     /// The conditions the statement being walked runs under, rendered for a call shape:
@@ -1337,7 +1345,15 @@ impl Walker<'_, '_> {
                     self.e.unknowns.push(Unknown { question: format!("effect target of `{api}` is not a constant"), loc: c.loc.clone() });
                 }
                 let payload = if key.kind == "http" { self.request_body(api, c) } else { None };
-                self.e.effects.push(EffectFact { key, api: api.to_string(), payload, loc: c.loc.clone(), from_param });
+                self.e.effects.push(EffectFact {
+                    key,
+                    api: api.to_string(),
+                    payload,
+                    loc: c.loc.clone(),
+                    from_param,
+                    when: self.alt_path(),
+                    path: self.full_path(),
+                });
             }
             Found::Subscribe(event, idx) => {
                 if let Some(handler) = self.handler_arg(c, idx) {
@@ -1374,7 +1390,15 @@ impl Walker<'_, '_> {
         let Some(mut flow) = text.as_deref().and_then(|q| crate::sqlflow::analyze_with(q, &value, &is_var)) else {
             self.e.unknowns.push(Unknown { question: format!("SQL of `{api}` is not a constant"), loc: c.loc.clone() });
             let key = EffectKey { kind: "db_query".into(), target: "<dynamic>".into(), method: None };
-            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone(), from_param: None });
+            self.e.effects.push(EffectFact {
+                key,
+                api: api.to_string(),
+                payload: None,
+                loc: c.loc.clone(),
+                from_param: None,
+                when: self.alt_path(),
+                path: self.full_path(),
+            });
             return;
         };
         // Text that says nothing SQL can read (not a statement at all) is not an effect to drop.
@@ -1386,14 +1410,30 @@ impl Walker<'_, '_> {
         if flow.reads.is_empty() && flow.writes.is_empty() && flow.ddl.is_empty() && !quiet.contains(&first.as_str()) {
             self.e.unknowns.push(Unknown { question: format!("SQL of `{api}` could not be read"), loc: c.loc.clone() });
             let key = EffectKey { kind: "db_query".into(), target: "<dynamic>".into(), method: None };
-            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone(), from_param: None });
+            self.e.effects.push(EffectFact {
+                key,
+                api: api.to_string(),
+                payload: None,
+                loc: c.loc.clone(),
+                from_param: None,
+                when: self.alt_path(),
+                path: self.full_path(),
+            });
             return;
         }
         flow.filters = flow.filters.into_iter().map(&fill).collect();
         flow.columns = std::mem::take(&mut flow.columns).into_iter().map(|(k, v)| (k, fill(v))).collect();
         let mut push = |kind: &str, target: &str, method: Option<String>| {
             let key = EffectKey { kind: kind.into(), target: target.into(), method };
-            self.e.effects.push(EffectFact { key, api: api.to_string(), payload: None, loc: c.loc.clone(), from_param: None });
+            self.e.effects.push(EffectFact {
+                key,
+                api: api.to_string(),
+                payload: None,
+                loc: c.loc.clone(),
+                from_param: None,
+                when: self.alt_path(),
+                path: self.full_path(),
+            });
         };
         for t in &flow.writes {
             push(if flow.deletes.contains(t) { "db_delete" } else { "db_write" }, t, None);
@@ -2160,7 +2200,7 @@ fn split_conds(p: Pred) -> Vec<String> {
 }
 
 /// Conjunction with `true` dropped and `false` absorbing.
-fn all(ps: Vec<Pred>) -> Pred {
+pub(crate) fn all(ps: Vec<Pred>) -> Pred {
     let mut out = vec![];
     for p in ps {
         match p {
@@ -2180,7 +2220,7 @@ fn all(ps: Vec<Pred>) -> Pred {
 /// Disjunction of conjunctions, simplified the way path conditions merge where
 /// control flow rejoins: `false` dropped and `true` absorbing; `A ∨ (A ∧ B)` is `A`;
 /// `(A ∧ c) ∨ (A ∧ ¬c)` is `A`; conjuncts common to every term are factored out.
-fn any(ps: Vec<Pred>) -> Pred {
+pub(crate) fn any(ps: Vec<Pred>) -> Pred {
     let mut terms: Vec<Vec<Pred>> = vec![];
     for p in ps {
         match p {
@@ -2405,7 +2445,7 @@ fn always_throws(stmts: &[Stmt]) -> bool {
 }
 
 /// A predicate with constants folded away (`false ∨ x` is `x`, `true ∧ x` is `x`).
-fn clean(p: Pred) -> Pred {
+pub(crate) fn clean(p: Pred) -> Pred {
     match p {
         Pred::And(ps) => all(ps.into_iter().map(clean).collect()),
         Pred::Or(ps) => any(ps.into_iter().map(clean).collect()),

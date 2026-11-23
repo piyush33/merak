@@ -165,6 +165,13 @@ pub fn compute(model: &mut Model) {
         }
     }
 
+    // 5. When each effect is reached, through the calls on the way.
+    for (id, reach) in crate::sdg::compute(model, &sums) {
+        if let Some(s) = sums.get_mut(&id) {
+            s.reach = reach;
+        }
+    }
+
     model.summaries = sums;
     model.validators = validators;
     model.state_machines = state_machines(model);

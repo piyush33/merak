@@ -319,6 +319,12 @@ fn touches(cs: &[&ContractDiff]) -> Option<String> {
     for c in cs {
         for x in c.clauses.iter().filter(|x| x.row == "effects" && x.mark != '-') {
             let Some(a) = x.after.as_deref().filter(|a| *a != "none found") else { continue };
+            // What it touches, not when: a changed condition has its own line.
+            let a = if x.mark == '~' && x.tag.as_deref() == Some("happens under another condition") {
+                a.split(" when ").next().unwrap_or(a).trim_end_matches(" always")
+            } else {
+                a
+            };
             let it = item("effects", a);
             if !seen.insert(it.clone()) {
                 continue;
@@ -1218,6 +1224,22 @@ fn phrase(x: &Clause, new: bool) -> (String, Vec<String>) {
             }
         }
         ("effects", '-') => format!("no longer: {}", item("effects", x.before.as_deref().unwrap_or(""))),
+        // An effect under another condition: what it does, and what its condition gained or
+        // lost (`writes asset_face now only when ids.size = 1`).
+        ("effects", '~') if x.tag.as_deref() == Some("happens under another condition") => {
+            let key = |t: &str| t.split(" when ").next().unwrap_or(t).trim_end_matches(" always").to_string();
+            let when = |t: &str| t.split_once(" when ").map(|(_, w)| plain(w)).unwrap_or_else(|| "always".into());
+            let raw = x.before.as_deref().unwrap_or("");
+            let it = item("effects", &key(raw));
+            let delta = x.when.as_deref().unwrap_or("under another condition");
+            // A plain gain or loss says it all; anything else shows both conditions.
+            let lines = if delta.starts_with("only when") || delta.starts_with("no longer only when") {
+                vec![]
+            } else {
+                vec![format!("was  when {}", when(raw)), format!("now  when {}", when(x.after.as_deref().unwrap_or("")))]
+            };
+            return (format!("{it} now {}", plain(delta).trim_start_matches("now ")), lines);
+        }
         ("effects", '~') => {
             let tag = x.tag.clone().unwrap_or_default();
             return (

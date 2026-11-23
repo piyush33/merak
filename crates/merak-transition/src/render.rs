@@ -117,6 +117,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "EFFECT_ADDED",
             "EFFECT_REMOVED",
             "EFFECT_CHANGED",
+            "EFFECT_CONDITION_CHANGED",
             "EFFECT_MADE_ASYNC",
             "EFFECT_MADE_SYNC",
             "EVENT_HANDLER_ADDED",
@@ -361,6 +362,11 @@ fn sentence(op: &Op) -> String {
                 }
                 _ => format!("{n} changed what it sends: `{b}` → `{a}`."),
             }
+        }
+        "EFFECT_CONDITION_CHANGED" => {
+            let when = |s: &str| s.split_once(" when ").map(|(_, w)| format!("only when `{w}`")).unwrap_or_else(|| "always".into());
+            let what = b.split(" when ").next().unwrap_or(b).trim_end_matches(" always");
+            format!("{n} {} {}, not {}.", effect(what), when(a), when(b))
         }
         "EFFECT_MADE_ASYNC" => format!("{n} now {} later, via {}, instead of right away.", effect(strip_mode(a)), via(a)),
         "EFFECT_MADE_SYNC" => format!("{n} now {} right away instead of later via {}.", effect(strip_mode(a)), via(b)),

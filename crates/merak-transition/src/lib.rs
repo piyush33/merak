@@ -9,6 +9,7 @@ pub mod contract;
 pub mod render;
 
 use merak_behaviour::infer;
+use merak_behaviour::names::{call_names, is_ident, rename, renamed, rewrite_roots, Names};
 use merak_behaviour::pred::{render_set, Pred};
 use merak_behaviour::{AccessFact, CallShape, EffectInfo, EffectKey, Model, Origin, QueryFilter};
 use merak_ir::Loc;
@@ -502,6 +503,8 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
         }
 
         // Effects reached (transitively, including through event handlers).
+        let outside_a: BTreeSet<&EffectKey> = a.effects_outside_checks(ida).into_iter().map(|(k, _)| k).collect();
+        let outside_b: BTreeSet<&EffectKey> = b.effects_outside_checks(idb).into_iter().map(|(k, _)| k).collect();
         for (k, ib) in &sb.effects {
             match sa.effects.get(k) {
                 None => {
@@ -542,7 +545,29 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
                         ib.evidence.iter().cloned().collect(),
                     );
                 }
-                Some(_) => {}
+                // When it happens, through every call on the way: a condition added or dropped
+                // in a helper is this function's too. A check that moved (into a helper, or
+                // into an alternative) leaves the whole condition alone; a check added or
+                // dropped leaves the alternatives alone, and its guard op says it.
+                Some(_) => {
+                    // What it changes outside, not what it reads.
+                    let seen = outside_a.contains(k) && outside_b.contains(k) && merak_behaviour::summary::WRITE_EFFECTS.contains(&k.kind.as_str());
+                    if let (true, Some(ra), Some(rb)) = (seen, sa.reach.get(k), sb.reach.get(k)) {
+                        if !same_pred(&ra.when, &rb.when) && !same_pred(&ra.path, &rb.path) {
+                            let show = |p: &Pred| if p.is_true() { format!("{} always", k.render()) } else { format!("{} when {}", k.render(), p.render()) };
+                            out.push(
+                                "EFFECT_CONDITION_CHANGED",
+                                Layer::Behaviour,
+                                idb.clone(),
+                                Some(show(&ra.when)),
+                                Some(show(&rb.when)),
+                                sa.effects[k].evidence.iter().cloned().collect(),
+                                ib.evidence.iter().cloned().collect(),
+                            )
+                            .note = Some(condition_delta(&ra.when, &rb.when));
+                        }
+                    }
+                }
             }
         }
         for (k, ia) in &sa.effects {
@@ -597,6 +622,27 @@ pub fn diff(a: &Model, b: &Model) -> Transition {
     // ------------------------------------------------------------ behaviour: new code
     // An added entity is described by what it does, not only that it exists, unless it
     // was extracted: every caller existed before and behaves as it did.
+    // A changed condition is said where it changes: callers that only inherit it from a
+    // function they reach (whose op lists the routes it affects) say nothing more.
+    let conditions: Vec<(String, String)> = out
+        .ops
+        .iter()
+        .filter(|o| o.kind == "EFFECT_CONDITION_CHANGED")
+        .map(|o| (o.subject.clone(), effect_of_condition(o.after.as_deref().unwrap_or(""))))
+        .collect();
+    if conditions.len() > 1 {
+        let inherited: BTreeSet<(String, String)> = conditions
+            .iter()
+            .filter(|(x, k)| {
+                let below = reached(b, x);
+                conditions.iter().any(|(y, k2)| k2 == k && y != x && below.contains(y))
+            })
+            .cloned()
+            .collect();
+        out.ops.retain(|o| {
+            o.kind != "EFFECT_CONDITION_CHANGED" || !inherited.contains(&(o.subject.clone(), effect_of_condition(o.after.as_deref().unwrap_or(""))))
+        });
+    }
     let changed_behaviour: BTreeSet<&str> = out.ops.iter().filter(|o| o.layer != Layer::Structural).map(|o| o.subject.as_str()).collect();
     let mut callers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for e in b.entities.values() {
@@ -1592,74 +1638,6 @@ pub(crate) fn inline_writes(model: &Model, e: &merak_behaviour::Entity, matched:
     out
 }
 
-/// A helper's parameters by name, each with what a call passes there, in the terms of the
-/// function the helpers are inlined into (`None`: not expressible there, `{…}` or a closure).
-pub(crate) type Names = BTreeMap<String, Option<String>>;
-
-/// The names of `t`'s parameters at call `c`, its arguments read through `outer` (the names
-/// of the helper `c` is made from, when helpers nest).
-fn call_names(t: &merak_behaviour::Entity, c: &merak_behaviour::CallFact, outer: &Names) -> Names {
-    let usable = |a: &String| !a.contains('…') && !a.contains("<fn");
-    let mut names: Names = t
-        .params
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| {
-            let name = p.split(": ").next().unwrap_or(p).trim_end_matches('?').trim_start_matches("...");
-            let arg = c.args.get(i).filter(|a| usable(a)).and_then(|a| rename(a, outer));
-            is_ident(name).then(|| (name.to_string(), arg))
-        })
-        .collect();
-    // A rendered component: `function Title({ who, size = 2 }: …)` given `<Title who={member}/>`.
-    if let Some(first) = t.params.first().filter(|_| !c.props.is_empty()) {
-        for (prop, local) in destructured(first) {
-            let arg = c.props.iter().find(|(k, _)| *k == prop).map(|(_, v)| v).filter(|v| usable(v)).and_then(|v| rename(v, outer));
-            names.insert(local, arg);
-        }
-    }
-    names
-}
-
-/// The names a destructured parameter binds, each with the property it reads:
-/// `{ who, a: b, c = 1, ...rest }: T` → `(who, who)`, `(a, b)`, `(c, c)`.
-fn destructured(param: &str) -> Vec<(String, String)> {
-    let Some(body) = param.trim().strip_prefix('{') else { return vec![] };
-    let mut depth = 0;
-    let end = body.char_indices().find(|&(_, ch)| {
-        match ch {
-            '{' | '[' | '(' => depth += 1,
-            '}' | ']' | ')' if depth > 0 => depth -= 1,
-            '}' => return true,
-            _ => {}
-        }
-        false
-    });
-    let Some((end, _)) = end else { return vec![] };
-    let mut out = vec![];
-    let (mut depth, mut start) = (0, 0);
-    let inner = &body[..end];
-    for (i, ch) in inner.char_indices().chain([(inner.len(), ',')]) {
-        match ch {
-            '{' | '[' | '(' => depth += 1,
-            '}' | ']' | ')' => depth -= 1,
-            ',' if depth == 0 => {
-                let item = inner[start..i].trim();
-                start = i + 1;
-                let item = item.split('=').next().unwrap_or(item).trim();
-                let (prop, local) = match item.split_once(':') {
-                    Some((p, l)) => (p.trim(), l.trim()),
-                    None => (item, item),
-                };
-                if is_ident(prop) && is_ident(local) {
-                    out.push((prop.to_string(), local.to_string()));
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// The render of a component of this program, by its tag: `<Title who={member}/>` → the
 /// call that renders it (the one whose props the element shows, else the first).
 fn render_call<'x>(
@@ -1763,59 +1741,65 @@ pub(crate) fn inline_renders(
     out
 }
 
-/// `s` with each parameter of `names` replaced by its argument; `None` when one has none.
-fn rename(s: &str, names: &Names) -> Option<String> {
-    rewrite_roots(s, &|x: &str| match names.get(x) {
-        Some(arg) => arg.clone(),
-        None => Some(x.to_string()),
-    })
+/// What a condition gained and lost, in a few words: `only when c` for a conjunction that
+/// gained `c`, `now depends on x, no longer on y` when either side is a disjunction.
+fn condition_delta(before: &Pred, after: &Pred) -> String {
+    let conj = |p: &Pred| -> Option<Vec<Pred>> {
+        match p {
+            Pred::True => Some(vec![]),
+            Pred::And(ps) if !ps.iter().any(|q| matches!(q, Pred::Or(_))) => Some(ps.clone()),
+            Pred::And(_) | Pred::Or(_) => None,
+            q => Some(vec![q.clone()]),
+        }
+    };
+    let join = |ps: Vec<&Pred>| ps.iter().map(|p| p.render()).collect::<Vec<_>>().join(" ∧ ");
+    if let (Some(cb), Some(ca)) = (conj(before), conj(after)) {
+        let gained: Vec<&Pred> = ca.iter().filter(|p| !cb.contains(p)).collect();
+        let lost: Vec<&Pred> = cb.iter().filter(|p| !ca.contains(p)).collect();
+        return match (gained.is_empty(), lost.is_empty()) {
+            (false, true) => format!("only when {}", join(gained)),
+            (true, false) => format!("no longer only when {}", join(lost)),
+            (false, false) => format!("when {}, not when {}", join(gained), join(lost)),
+            _ => "under another condition".into(),
+        };
+    }
+    let (kb, ka): (BTreeSet<String>, BTreeSet<String>) = (before.atom_keys().into_iter().collect(), after.atom_keys().into_iter().collect());
+    let gained: Vec<&String> = ka.difference(&kb).collect();
+    let lost: Vec<&String> = kb.difference(&ka).collect();
+    let list = |xs: &[&String]| xs.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(", ");
+    match (gained.is_empty(), lost.is_empty()) {
+        (false, true) => format!("now also depends on {}", list(&gained)),
+        (true, false) => format!("no longer depends on {}", list(&lost)),
+        (false, false) => format!("now depends on {}, not {}", list(&gained), list(&lost)),
+        _ => "under another condition".into(),
+    }
 }
 
-/// `s` renamed, or as written when it cannot be.
-fn renamed(s: &str, names: &Names) -> String {
-    rename(s, names).unwrap_or_else(|| s.to_string())
+/// `db_write t when c` → `db_write t`.
+fn effect_of_condition(s: &str) -> String {
+    s.split(" when ").next().unwrap_or(s).trim_end_matches(" always").to_string()
 }
 
-fn is_ident(s: &str) -> bool {
-    s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$') && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-}
-
-/// `s` with each root name (an identifier not after a `.`, outside quotes) rewritten by `f`;
-/// `None` when `f` cannot rewrite one.
-fn rewrite_roots(s: &str, f: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    let mut quote: Option<char> = None;
-    while i < chars.len() {
-        let ch = chars[i];
-        if let Some(q) = quote {
-            out.push(ch);
-            if ch == q {
-                quote = None;
+/// The functions `id` reaches through calls and the handlers of events it emits, without itself.
+fn reached(model: &Model, id: &str) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![id.to_string()];
+    while let Some(cur) = stack.pop() {
+        let Some(e) = model.entities.get(&cur) else { continue };
+        let emitted = e.effects.iter().filter(|f| f.key.kind == "event_emit").map(|f| f.key.target.as_str());
+        let handlers = emitted.flat_map(|ev| model.subscriptions.iter().filter(move |s| s.event == ev).map(|s| s.handler.clone()));
+        for t in e.calls.iter().map(|c| c.target.clone()).chain(handlers) {
+            if t != id && seen.insert(t.clone()) {
+                stack.push(t);
             }
-            i += 1;
-        } else if matches!(ch, '"' | '\'' | '`') {
-            quote = Some(ch);
-            out.push(ch);
-            i += 1;
-        } else if ch.is_alphabetic() || ch == '_' || ch == '$' {
-            let start = i;
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$') {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            if start > 0 && chars[start - 1] == '.' {
-                out.push_str(&word);
-            } else {
-                out.push_str(&f(&word)?);
-            }
-        } else {
-            out.push(ch);
-            i += 1;
         }
     }
-    Some(out)
+    seen
+}
+
+/// Two conditions that hold in the same cases (as far as independent atoms can tell).
+fn same_pred(a: &Pred, b: &Pred) -> bool {
+    a == b || a.render() == b.render() || (a.implies(b) == Some(true) && b.implies(a) == Some(true))
 }
 
 /// Items only in `a`, and only in `b`, comparing shapes as multisets (locations ignored).

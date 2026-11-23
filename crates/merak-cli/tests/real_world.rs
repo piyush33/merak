@@ -1079,3 +1079,40 @@ fn a_handler_map_entry_is_a_call() {
     let t = merak_cli::diff(&files(&src(two, false)), &files(&src(two, true))).unwrap();
     assert!(!t.ops.iter().any(|o| matches!(o.kind.as_str(), "ENTITY_ADDED" | "ENTITY_REMOVED") && o.subject.contains(".A")), "{:#?}", t.ops);
 }
+
+/// When a request happens is a property of the call graph: a helper's condition is its
+/// caller's, read in the caller's names. Moving a check from the caller into the helper
+/// changes nothing for the caller; a condition the helper gains is said once, at the helper.
+#[test]
+fn a_helpers_condition_is_its_callers_in_its_callers_names() {
+    let notify = |cond: &str| {
+        if cond.is_empty() {
+            "export async function notify(u: User) {\n  await fetch(\"https://hooks.example.com/notify\", { method: \"POST\" });\n  console.info(u.id);\n  return u.id;\n}\n".to_string()
+        } else {
+            format!("export async function notify(u: User) {{\n  if ({cond}) {{\n    await fetch(\"https://hooks.example.com/notify\", {{ method: \"POST\" }});\n  }}\n  console.info(u.id);\n  return u.id;\n}}\n")
+        }
+    };
+    let handle =
+        |call: &str| format!("import {{ notify }} from './notify';\nexport async function handle(member: User) {{\n  {call}\n  return member.id;\n}}\n");
+
+    // The check moves from the caller into the helper.
+    let before = files(&[("src/notify.ts", &notify("")), ("src/handle.ts", &handle("if (member.optedIn) {\n    await notify(member);\n  }"))]);
+    let after = files(&[("src/notify.ts", &notify("u.optedIn")), ("src/handle.ts", &handle("await notify(member);"))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let at: Vec<(&str, &str)> =
+        t.ops.iter().filter(|o| o.kind == "EFFECT_CONDITION_CHANGED").map(|o| (o.subject.as_str(), o.after.as_deref().unwrap_or(""))).collect();
+    assert!(!at.iter().any(|(s, _)| s.ends_with("handle")), "the caller sends under the same condition: {at:?}");
+    assert!(at.iter().any(|(s, a)| s.ends_with("notify") && a.contains("u.optedIn")), "the helper now sends only sometimes: {at:?}");
+
+    // The helper gains a condition (and the caller changes too): the op is the helper's, and
+    // the caller reads the condition as its own.
+    let before = files(&[("src/notify.ts", &notify("")), ("src/handle.ts", &handle("await notify(member);"))]);
+    let after = files(&[("src/notify.ts", &notify("u.optedIn")), ("src/handle.ts", &handle("console.info(member.id);\n  await notify(member);"))]);
+    let t = merak_cli::diff(&before, &after).unwrap();
+    let subjects: Vec<&str> = t.ops.iter().filter(|o| o.kind == "EFFECT_CONDITION_CHANGED").map(|o| o.subject.as_str()).collect();
+    assert_eq!(subjects.len(), 1, "{subjects:?}");
+    assert!(subjects[0].ends_with("notify"), "{subjects:?}");
+    let m = merak_cli::model(&after).unwrap();
+    let reach: Vec<String> = m.summaries["src/handle.ts::handle"].reach.values().map(|r| r.when.render()).collect();
+    assert_eq!(reach, ["member.optedIn is set"], "the caller's request, in its names");
+}

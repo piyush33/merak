@@ -50,6 +50,9 @@ pub struct CallFact {
     /// The condition the call runs under (guards and alternatives); `True`: always.
     #[serde(default = "Pred::always", skip_serializing_if = "Pred::is_true")]
     pub path: Pred,
+    /// The part of `path` that is not the function's own checks: the alternatives it sits in.
+    #[serde(default = "Pred::always", skip_serializing_if = "Pred::is_true")]
+    pub when: Pred,
     /// Inside a `try` with a handler: what the callee throws stays in this function.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub caught: bool,
@@ -101,6 +104,12 @@ pub struct EffectFact {
     /// each caller's argument says where it really goes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_param: Option<usize>,
+    /// The alternatives it happens under (the function's own checks left out), and the whole
+    /// condition with them, as for a call.
+    #[serde(default = "Pred::always", skip_serializing_if = "Pred::is_true")]
+    pub when: Pred,
+    #[serde(default = "Pred::always", skip_serializing_if = "Pred::is_true")]
+    pub path: Pred,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -375,6 +384,17 @@ pub struct Summary {
     /// passing a known string there reaches that target instead.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_param: BTreeMap<usize, BTreeSet<EffectKey>>,
+    /// When each effect happens, as a condition on this function's inputs (see [`Reach`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "pairs")]
+    pub reach: BTreeMap<EffectKey, Reach>,
+}
+
+/// The condition under which a function reaches an effect, through every call on the way:
+/// `when` the alternatives alone, `path` with the checks on the way as well.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reach {
+    pub when: Pred,
+    pub path: Pred,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
