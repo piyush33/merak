@@ -47,6 +47,9 @@ pub struct CallFact {
     /// Each argument that is a parameter of the caller, by index: passed on, not built here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arg_params: Vec<Option<usize>>,
+    /// Where the locals its arguments read come from (see [`Source`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<Source>,
     /// The condition the call runs under (guards and alternatives); `True`: always.
     #[serde(default = "Pred::always", skip_serializing_if = "Pred::is_true")]
     pub path: Pred,
@@ -60,6 +63,15 @@ pub struct CallFact {
     /// of a render, which a component takes as one destructured parameter.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub props: Vec<(String, String)>,
+}
+
+/// A local an argument reads, and how it is built by the time of the call: the definitions
+/// that reach the call, in order, with their lines.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Source {
+    pub name: String,
+    pub built: String,
+    pub lines: Vec<u32>,
 }
 
 /// When a function fails: a `throw` (in Go, a returned new error) that leaves it, and the

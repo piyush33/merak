@@ -286,8 +286,12 @@ fn sentence(blocks: &[(&ContractDiff, Vec<Line>, Vec<String>)]) -> Vec<String> {
                     lead.push(format!("`{g}` {}.", what.join("; ")));
                 }
             }
+            // What it builds to hand on: only a local the passed value reads (the slice).
             for b in ls.iter().filter(|b| b.kind == "BUILDS") {
-                lead.push(format!("`{}` {}.", c.name, b.text));
+                let local = b.text.strip_prefix("builds ").and_then(|t| t.split_whitespace().next()).unwrap_or("").trim_matches('`');
+                if !local.is_empty() && merak_behaviour::sdg::mentions(&l.text, local) {
+                    lead.push(format!("`{}` {}.", c.name, b.text));
+                }
             }
         }
     }
@@ -588,6 +592,24 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         }
         let (mut text, mut detail) = phrase(x, new);
         // What depends on the value written: the decisions elsewhere that test it.
+        // Where a passed value comes from: how each local in it is built, and on which lines.
+        for f in &x.from {
+            let (what, lines) = f.split_once('\t').unwrap_or((f, ""));
+            let (name, built) = what.split_once(" = ").unwrap_or((what, ""));
+            let mut built = built.to_string();
+            while let Some(i) = built.find("<fn ") {
+                let Some(j) = built[i..].find('>').map(|j| j + i) else { break };
+                built.replace_range(i..=j, "func(…)");
+            }
+            let at = if lines.is_empty() {
+                String::new()
+            } else if lines.contains(", ") {
+                format!(" (lines {lines})")
+            } else {
+                format!(" (line {lines})")
+            };
+            detail.push(format!("`{name}` is {}{at}", if built.contains("; ") { format!("built as `{built}`") } else { format!("`{built}`") }));
+        }
         // State a handler changes, and what reads it (`active` → the row's class).
         if x.row == "handles" && !x.read_by.is_empty() {
             let mut by: Vec<(String, Vec<String>)> = vec![];

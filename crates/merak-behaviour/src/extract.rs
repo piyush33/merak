@@ -568,7 +568,7 @@ impl Walker<'_, '_> {
                 if init.is_none() {
                     // `var out []T`: starts empty.
                     let zero = if matches!(ty, Some(ir::TypeRef::Array(_))) { "[]" } else { "unset" };
-                    self.step(name, zero.into(), format!("= {zero}"));
+                    self.step(name, zero.into(), format!("= {zero}"), loc.line);
                 }
                 if let Some(init) = init {
                     let m = self.makers(init);
@@ -579,7 +579,7 @@ impl Walker<'_, '_> {
                     if text.chars().count() <= 300 {
                         self.def_vals.insert((self.cur, name.clone()), value);
                     }
-                    self.step(name, slice_lit(&text), format!("= {text}"));
+                    self.step(name, slice_lit(&text), format!("= {text}"), loc.line);
                     self.defs.insert(name.clone(), text);
                     self.expr(init, loc);
                     // `const order: Order = { status: …, … }` constructs a record.
@@ -759,9 +759,9 @@ impl Walker<'_, '_> {
                     match value.as_ref() {
                         Expr::Binary { op: op @ (ir::BinOp::Add | ir::BinOp::Sub), left, right } if matches!(left.as_ref(), Expr::Ident(l) if l == x) => {
                             let sign = if *op == ir::BinOp::Add { "+" } else { "−" };
-                            self.step(x, plain, format!("{sign}{}", render(&self.inline_consts(right))));
+                            self.step(x, plain, format!("{sign}{}", render(&self.inline_consts(right))), aloc.line);
                         }
-                        _ => self.step(x, slice_lit(&plain), format!("= {plain}")),
+                        _ => self.step(x, slice_lit(&plain), format!("= {plain}"), aloc.line),
                     }
                     let step = match value.as_ref() {
                         Expr::Binary { op: op @ (ir::BinOp::Add | ir::BinOp::Sub), left, right } if matches!(left.as_ref(), Expr::Ident(l) if l == x) => {
@@ -895,6 +895,7 @@ impl Walker<'_, '_> {
                                 args: vec![],
                                 arg_skeletons: vec![],
                                 arg_params: vec![],
+                        sources: vec![],
                                 path: self.full_path(),
                                 when: self.alt_path(),
                                 caught: self.cd.caught(self.cur),
@@ -932,6 +933,7 @@ impl Walker<'_, '_> {
                         args: vec![],
                         arg_skeletons: vec![],
                         arg_params: vec![],
+                        sources: vec![],
                         path: self.full_path(),
                         when: self.alt_path(),
                         caught: self.cd.caught(self.cur),
@@ -970,6 +972,7 @@ impl Walker<'_, '_> {
                 let args = c.args.iter().map(arg_text).collect();
                 let arg_skeletons = c.args.iter().map(|a| self.ix.string_skeleton(self.env, a).filter(|s| s != "…")).collect();
                 let arg_params = c.args.iter().map(|a| self.param_index(a)).collect();
+                let sources = self.sources(&c.args);
                 self.e.calls.push(CallFact {
                     target,
                     loc: loc.clone(),
@@ -978,6 +981,7 @@ impl Walker<'_, '_> {
                     args,
                     arg_skeletons,
                     arg_params,
+                    sources,
                     path: self.full_path(),
                     when: self.alt_path(),
                     caught: self.cd.caught(self.cur),
@@ -1109,8 +1113,8 @@ impl Walker<'_, '_> {
     /// negation). `guards` keeps only the function's guard edges, otherwise only the rest.
     /// Record the assignment of `name` at the statement being walked as a step of how it
     /// is built: `plain` is its value alone, `step` the change it makes (`+x`, `= v`).
-    fn step(&mut self, name: &str, plain: String, change: String) {
-        let step = Step { seq: self.steps.len(), plain, change, over: self.loops.last().cloned(), when: self.conditions(false) };
+    fn step(&mut self, name: &str, plain: String, change: String, line: u32) {
+        let step = Step { seq: self.steps.len(), line, plain, change, over: self.loops.last().cloned(), when: self.conditions(false) };
         self.steps.insert((self.cur, name.to_string()), step);
     }
 
@@ -1744,6 +1748,33 @@ impl Walker<'_, '_> {
     }
 
     /// The index of the parameter an expression names (`url` in `fetchWithAuth(url, …)`).
+    /// Where the locals a call's arguments read come from: each one's definitions that reach
+    /// the call, in order (`lookupPaths` ← `[...paths, ...paths.map(…)]`), with their lines.
+    /// The backward slice of what is passed, one local deep.
+    fn sources(&self, args: &[Expr]) -> Vec<Source> {
+        let mut names = vec![];
+        args.iter().for_each(|a| collect_idents(a, &mut names));
+        let mut out: Vec<Source> = vec![];
+        for n in names {
+            if out.iter().any(|s| s.name == n) || self.closure_writes.contains(&n) {
+                continue;
+            }
+            let reaching = self.cd.reaching(self.cur, &n);
+            let Some(steps) = reaching.iter().map(|d| self.steps.get(&(*d, n.clone()))).collect::<Option<Vec<&Step>>>() else { continue };
+            if steps.is_empty() {
+                continue;
+            }
+            // Nothing to say: a bare declaration (a call may fill it through a pointer) or a
+            // literal too large to show.
+            let Some(built) = self.chain(&n).filter(|b| *b != n && !matches!(b.as_str(), "unset" | "{…}" | "[…]" | "[]")) else { continue };
+            let mut lines: Vec<u32> = steps.iter().map(|s| s.line).collect();
+            lines.sort();
+            lines.dedup();
+            out.push(Source { name: n, built: clip_text(built), lines });
+        }
+        out
+    }
+
     fn param_index(&self, e: &Expr) -> Option<usize> {
         let Expr::Ident(n) = e else { return None };
         if self.defs.contains_key(n) {
@@ -2188,6 +2219,7 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
 /// value so far (`+x`, `= v`), `over` the loop it repeats in, `when` its condition.
 struct Step {
     seq: usize,
+    line: u32,
     plain: String,
     change: String,
     over: Option<String>,

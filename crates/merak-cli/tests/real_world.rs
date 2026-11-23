@@ -1119,3 +1119,17 @@ fn a_helpers_condition_is_its_callers_in_its_callers_names() {
     let reach: Vec<String> = m.summaries["src/handle.ts::handle"].reach.values().map(|r| r.when.render()).collect();
     assert_eq!(reach, ["member.optedIn is set"], "the caller's request, in its names");
 }
+
+/// A call that now gets something else says where that comes from: how the local it passes
+/// is built, and on which line (the backward slice of the argument).
+#[test]
+fn a_passed_value_says_where_it_comes_from() {
+    let src = |arg: &str| {
+        format!("function save(rows: Row[]) {{\n  return rows.length;\n}}\nexport function handle(q: Query) {{\n  const ready = q.items.filter((x) => x.ok);\n  return save({arg});\n}}\n")
+    };
+    let (b, a) = (files(&[("h.ts", &src("q.items"))]), files(&[("h.ts", &src("ready"))]));
+    let t = merak_cli::diff(&b, &a).unwrap();
+    let text = merak_cli::render(&t, "behaviour", "test", &b, &a);
+    assert!(text.contains("`save` now gets ready instead of q.items"), "{text}");
+    assert!(text.contains("`ready` is `q.items.filter(func(…))` (line 5)"), "{text}");
+}
