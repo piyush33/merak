@@ -374,6 +374,8 @@ pub fn extract_entity(ix: &Index, cat: &Catalog, envs: &Envs, f: &ir::Function) 
             mutates: vec![],
             sets: vec![],
             handlers: vec![],
+            binds: vec![],
+            state: vec![],
             guards: vec![],
             returns: None,
             returns_at: None,
@@ -549,6 +551,19 @@ impl Walker<'_, '_> {
                     self.records.insert(name.clone());
                 } else {
                     self.records.remove(name);
+                }
+                // `const [active, setActive] = useState(-1)` (lowered as `[active, setActive]`):
+                // a piece of component state and the function that changes it.
+                if let (Some(Expr::Call(c)), Some(inner)) = (init, name.strip_prefix('[').and_then(|n| n.strip_suffix(']'))) {
+                    let hook = match &c.callee {
+                        Expr::Ident(n) => n.as_str(),
+                        Expr::Member { property, .. } => property.as_str(),
+                        _ => "",
+                    };
+                    let parts: Vec<&str> = inner.split(", ").collect();
+                    if matches!(hook, "useState" | "useReducer") && parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                        self.e.state.push(StateCell { value: parts[0].to_string(), setter: parts[1].to_string(), loc: loc.clone() });
+                    }
                 }
                 if init.is_none() {
                     // `var out []T`: starts empty.
@@ -894,6 +909,12 @@ impl Walker<'_, '_> {
                     if is_event && !j.tag.is_empty() {
                         let does = self.handler_does(v);
                         self.e.handlers.push(HandlerFact { element: format!("<{}>", j.tag), event: k.clone(), does, loc: loc.clone() });
+                    }
+                    // A value computed from data (`className={`… ${i === active ? "a" : "b"}`}`):
+                    // what the element shows depends on it, so state it reads leads here.
+                    let computed = !matches!(v, Expr::Str(_) | Expr::Num(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined | Expr::Closure(_));
+                    if !is_event && computed && k != "key" && k != "..." && !j.tag.is_empty() {
+                        self.e.binds.push(HandlerFact { element: format!("<{}>", j.tag), event: k.clone(), does: clip_text(render(v)), loc: loc.clone() });
                     }
                 }
                 j.attrs.iter().for_each(|(_, v)| self.expr(v, loc));

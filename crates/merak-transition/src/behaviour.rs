@@ -588,7 +588,27 @@ fn lines(t: &Transition, c: &ContractDiff, changing: &BTreeSet<&str>, fresh: &BT
         }
         let (mut text, mut detail) = phrase(x, new);
         // What depends on the value written: the decisions elsewhere that test it.
-        if !x.read_by.is_empty() {
+        // State a handler changes, and what reads it (`active` → the row's class).
+        if x.row == "handles" && !x.read_by.is_empty() {
+            let mut by: Vec<(String, Vec<String>)> = vec![];
+            for r in &x.read_by {
+                let (cell, what) = r.split_once('\t').unwrap_or(("", r));
+                match by.iter_mut().find(|(c, _)| c == cell) {
+                    Some((_, ws)) => ws.push(what.to_string()),
+                    None => by.push((cell.to_string(), vec![what.to_string()])),
+                }
+            }
+            for (cell, ws) in by {
+                let unset = ws.iter().any(|w| w == "!unset");
+                let ws: Vec<String> = ws.into_iter().filter(|w| w != "!unset").collect();
+                let more = ws.len().saturating_sub(3);
+                let shown: Vec<&str> = ws.iter().take(3).map(String::as_str).collect();
+                detail.push(format!("{cell} is read by {}{}", shown.join(" · "), if more > 0 { format!(" and {more} more") } else { String::new() }));
+                if unset {
+                    detail.push(format!("nothing sets {cell} now, so it keeps its first value"));
+                }
+            }
+        } else if !x.read_by.is_empty() {
             let more = x.read_by.len().saturating_sub(3);
             let shown: Vec<String> = x.read_by.iter().take(3).map(|r| plain(r)).collect();
             detail.push(format!("read by {}{}", shown.join(" · "), if more > 0 { format!(" and {more} more") } else { String::new() }));

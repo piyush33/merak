@@ -516,6 +516,26 @@ impl<'s> Lowerer<'s> {
                             };
                             out.push(ir::Stmt::Let { name, ty, init, loc: dloc });
                         }
+                        // `const [active, setActive] = useState(-1)`: the tuple once, under a name
+                        // that spells the pattern, then each name from its position.
+                        BindingPattern::ArrayPattern(ap) if d.init.is_some() && ap.rest.is_none() => {
+                            let names: Vec<Option<String>> = ap
+                                .elements
+                                .iter()
+                                .map(|el| match el {
+                                    Some(BindingPattern::BindingIdentifier(id)) => Some(id.name.as_str().to_string()),
+                                    _ => None,
+                                })
+                                .collect();
+                            let tuple = format!("[{}]", names.iter().map(|n| n.clone().unwrap_or_default()).collect::<Vec<_>>().join(", "));
+                            let init = d.init.as_ref().map(|e| self.expr(e));
+                            out.push(ir::Stmt::Let { name: tuple.clone(), ty: None, init, loc: dloc.clone() });
+                            for (i, n) in names.into_iter().enumerate() {
+                                let Some(name) = n else { continue };
+                                let init = ir::Expr::Index { object: Box::new(ir::Expr::Ident(tuple.clone())), index: Box::new(ir::Expr::Num(i as f64)) };
+                                out.push(ir::Stmt::Let { name, ty: None, init: Some(init), loc: dloc.clone() });
+                            }
+                        }
                         _ => {
                             if let Some(e) = &d.init {
                                 out.push(ir::Stmt::Expr(self.expr(e), dloc));

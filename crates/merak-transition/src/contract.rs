@@ -1140,6 +1140,32 @@ pub(crate) fn build(a: &Model, b: &Model, m: &Matching, ops: &[Op]) -> Vec<Contr
             }
         }
     }
+    // A handler that changes component state leads on to what reads that state.
+    for c in contracts.values_mut() {
+        for x in c.clauses.iter_mut().filter(|x| x.row == "handles" && matches!(x.mark, '+' | '-' | '~')) {
+            let model = if x.mark == '-' { a } else { b };
+            let does = x.after.as_deref().or(x.before.as_deref()).unwrap_or("");
+            let cells =
+                model.entities.values().filter(|e| e.id == c.entity || top_level(model, &e.id) == c.entity).flat_map(|e| e.state.iter().map(move |s| (e, s)));
+            for (owner, cell) in cells {
+                if !does.contains(&format!("{}(", cell.setter)) {
+                    continue;
+                }
+                let readers = merak_behaviour::sdg::state_readers(model, &owner.id, &cell.value);
+                for r in &readers {
+                    x.read_by.push(format!("`{}`\t{r}", cell.value));
+                }
+                // The last thing that changed it is gone: it keeps its first value now.
+                if x.mark == '-'
+                    && !readers.is_empty()
+                    && b.entities.get(&owner.id).is_some_and(|o| o.state.iter().any(|st| st.value == cell.value))
+                    && !merak_behaviour::sdg::sets_state(b, &owner.id, &cell.setter)
+                {
+                    x.read_by.push(format!("`{}`\t!unset", cell.value));
+                }
+            }
+        }
+    }
     let mut out: Vec<ContractDiff> = contracts.into_values().collect();
     out.extend(schemas.into_values());
     if !program.is_empty() {

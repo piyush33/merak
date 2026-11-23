@@ -160,3 +160,118 @@ pub fn decisions(model: &Model) -> BTreeMap<String, Vec<FieldUse>> {
     }
     out
 }
+
+/// Whether `text` reads the name `x` (not as a field `.x`, or part of a word).
+pub fn mentions(text: &str, x: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    text.match_indices(x).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + x.len()..].chars().next();
+        !before.is_some_and(|c| ident(c) || c == '.' || c == '-') && !after.is_some_and(ident)
+    })
+}
+
+/// What reads a component's state value `x`, in the component and the functions inside it:
+/// computed attributes, shown content, conditions, props passed down, handlers.
+pub fn state_readers(model: &Model, component: &str, x: &str) -> Vec<String> {
+    let inside = |id: &str| {
+        let mut cur = Some(id.to_string());
+        while let Some(c) = cur {
+            if c == component {
+                return true;
+            }
+            cur = model.entities.get(&c).and_then(|e| e.parent.clone());
+        }
+        false
+    };
+    let mut out: Vec<String> = vec![];
+    let mut add = |s: String| {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    for e in model.entities.values().filter(|e| inside(&e.id)) {
+        // A component's props are read below, from its render; markup's own attributes here.
+        for b in e.binds.iter().filter(|b| mentions(&b.does, x) && !b.element.trim_start_matches('<').starts_with(|c: char| c.is_ascii_uppercase())) {
+            let v = holes(&b.does, x).unwrap_or_else(|| if b.does.starts_with('`') { b.does.clone() } else { format!("`{}`", b.does) });
+            add(format!("{} {} {v}", b.element, b.event));
+        }
+        for o in &e.outputs {
+            for r in o.renders.iter().filter(|r| mentions(&r.content, x) || mentions(&r.when, x)) {
+                let when = if r.when.is_empty() { String::new() } else { format!(" when `{}`", r.when) };
+                add(format!("{} shows `{}`{when}", r.style.split('.').next().unwrap_or(&r.style), r.content));
+            }
+            if o.when.iter().any(|w| mentions(w, x)) {
+                add(format!("what it shows when `{}`", o.when.join(" ∧ ")));
+            }
+        }
+        for c in e.calls.iter().filter(|c| !c.props.is_empty()) {
+            for (k, v) in c.props.iter().filter(|(_, v)| mentions(v, x)) {
+                let comp = c.target.rsplit("::").next().unwrap_or(&c.target);
+                add(format!("<{comp}> {k}={{{v}}}"));
+            }
+        }
+        for s in e.call_shapes.iter().filter(|s| s.when.iter().any(|w| mentions(w, x))) {
+            add(format!("`{}` when `{}`", s.shape, s.when.join(" ∧ ")));
+        }
+        for h in e.handlers.iter().filter(|h| mentions(&h.does, x)) {
+            add(format!("{} on {} `{}`", h.element, h.event, h.does));
+        }
+    }
+    out
+}
+
+/// The parts of a template that read `x`: `` `flex ${on ? "a" : "b"}` `` → `` `${on ? "a" : "b"}` ``.
+fn holes(text: &str, x: &str) -> Option<String> {
+    let t = text.strip_prefix('`')?.strip_suffix('`')?;
+    let mut out = vec![];
+    let mut rest = t;
+    while let Some(i) = rest.find("${") {
+        let mut depth = 0;
+        let mut end = None;
+        for (j, ch) in rest[i..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        let hole = &rest[i..=end];
+        if mentions(hole, x) {
+            out.push(hole.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    (!out.is_empty()).then(|| format!("`{}`", out.join(" … ")))
+}
+
+/// Whether anything in the component (or inside it) still calls `setter`.
+pub fn sets_state(model: &Model, component: &str, setter: &str) -> bool {
+    let call = format!("{setter}(");
+    model
+        .entities
+        .values()
+        .filter(|e| {
+            e.id == component
+                || e.parent.is_some() && {
+                    let mut cur = e.parent.clone();
+                    let mut hit = false;
+                    while let Some(c) = cur {
+                        if c == component {
+                            hit = true;
+                            break;
+                        }
+                        cur = model.entities.get(&c).and_then(|x| x.parent.clone());
+                    }
+                    hit
+                }
+        })
+        .any(|e| e.call_shapes.iter().any(|s| s.shape.starts_with(&call)) || e.handlers.iter().any(|h| h.does.contains(&call)))
+}

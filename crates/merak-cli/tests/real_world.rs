@@ -907,6 +907,9 @@ fn a_removed_row_handler_and_a_template_class_are_named() {
     let t = merak_cli::diff(&before, &after).unwrap();
     let text = merak_cli::render(&t, "behaviour", "test", &before, &after);
     assert!(text.contains("each <button> no longer reacts to mouse enter (it ran setActive(i))"), "{text}");
+    // What the handler changed, what reads it, and that nothing changes it any more.
+    assert!(text.contains("`active` is read by <button> className `${i === active ? \"bg-gray-50\" : \"bg-white\"}`"), "{text}");
+    assert!(text.contains("nothing sets `active` now, so it keeps its first value"), "{text}");
     assert!(text.contains("hover:bg-gray-50"), "{text}");
     assert!(!text.contains("? CALLS"), "{text}");
 }

@@ -166,6 +166,15 @@ pub struct Output {
     pub formula: bool,
 }
 
+/// A piece of component state (`const [active, setActive] = useState(-1)`): its value and
+/// the function that changes it. Changing it renders the component again with the new value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateCell {
+    pub value: String,
+    pub setter: String,
+    pub loc: Loc,
+}
+
 /// An event an element handles, and what its handler does (`setActive(i)`, or the calls it makes).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HandlerFact {
@@ -239,6 +248,14 @@ pub struct Entity {
     /// fresh map): the column assignments an update applies, with the value as written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<WriteFact>,
+    /// Attributes its markup computes from data: `<button>` `className` from
+    /// `i === active ? "bg-gray-50" : "bg-white"` (the attribute in `event`, the value in `does`).
+    /// Not compared; what reads a piece of state is found here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binds: Vec<HandlerFact>,
+    /// Component state it keeps: `active`, changed by `setActive`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state: Vec<StateCell>,
     /// Events its markup handles: `<button>` on `onMouseEnter` runs `setActive(i)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handlers: Vec<HandlerFact>,
